@@ -250,7 +250,7 @@ export async function runDoctor(
   };
 }
 
-function listenerUrls(input: string): { mcpUrl: string; healthUrl: string } {
+export function listenerUrls(input: string): { mcpUrl: string; healthUrl: string } {
   const mcp = new URL(input);
   if (mcp.pathname === "" || mcp.pathname === "/") {
     mcp.pathname = "/mcp";
@@ -262,7 +262,7 @@ function listenerUrls(input: string): { mcpUrl: string; healthUrl: string } {
   return { mcpUrl: mcp.href, healthUrl: health.href };
 }
 
-async function parseHttpBody(response: Response): Promise<unknown> {
+export async function parseHttpBody(response: Response): Promise<unknown> {
   const contentType = response.headers.get("content-type") ?? "";
   if (contentType.includes("application/json")) {
     return response.json();

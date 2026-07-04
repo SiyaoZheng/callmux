@@ -9,7 +9,7 @@ const execFileAsync = promisify(execFile);
 
 const MANAGED_MARKER = "callmux-managed-daemon";
 const DEFAULT_DAEMON_NAME = "callmux";
-const DEFAULT_PORT = 4860;
+export const DEFAULT_PORT = 4860;
 
 export type DaemonAction =
   | "install"

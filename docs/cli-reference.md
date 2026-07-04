@@ -16,6 +16,7 @@
 | `callmux doctor [--json]` | Validate config + probe all servers |
 | `callmux doctor --url <url> [--cwd <path>] [--header Name:Value] [--json]` | Smoke-test a running shared listener |
 | `callmux bridge --url <url> [--cwd <path>] [--header Name:Value]` | Stdio bridge to a shared listener |
+| `callmux call <tool> [json] [--file <path>] [--url <url>] [--output-format <fmt>]` | Call one tool on a running shared listener |
 | `callmux client status [claude\|codex]` | Check client configuration state |
 | `callmux client attach <client> [--yes]` | Write command-mode callmux into client config |
 | `callmux client attach <client> --url <url> [--yes]` | Write shared listener URL into client config |
@@ -95,6 +96,16 @@ callmux doctor
 ```bash
 callmux doctor --url http://localhost:4860/mcp --cwd "$PWD"
 ```
+
+### Call a Tool on a Running Listener
+
+```bash
+callmux call github__search_issues '{"query":"is:open"}'
+callmux call github__create_issue --file payload.json --url http://localhost:4860/mcp
+callmux call callmux_parallel '{"calls":[{"tool":"github__issue_read","arguments":{"number":1}}]}'
+```
+
+Defaults to `http://127.0.0.1:4860/mcp` when `--url` is omitted. Non-zero exit code on a tool error (`isError: true`) or a transport/HTTP failure. Meta-tools (`callmux_parallel`, `callmux_batch`, `callmux_pipeline`, ...) are reachable the same way as proxied downstream tools.
 
 ### Attach a Client
 

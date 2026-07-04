@@ -53,9 +53,12 @@ import {
   detectDaemonEnvironment,
   executeDaemonPlan,
   formatDaemonPlan,
+  DEFAULT_PORT,
   type DaemonAction,
   type DaemonScope,
 } from "../daemon.js";
+import { callListenerTool, extractListenerToolPayload } from "../listener-client.js";
+import { formatToolText, isOutputFormat, type OutputFormat } from "../output-format.js";
 import { runSetup } from "../setup.js";
 import {
   renderAgentInstructions,
@@ -85,6 +88,8 @@ Usage:
   callmux --config <path>                    Explicit config file
   callmux --listen <port>                    Shared server mode (SSE/HTTP)
   callmux bridge --url <listener-url>        Stdio bridge to shared HTTP listener with cwd header
+  callmux call <tool> [json] [--file <path>] [--url <listener-url>]
+                                              Call one tool against a running listener (tools/call)
   callmux [options] -- <command> [args...]   Single-server mode
   callmux setup [--config <path>]            Interactive setup wizard
   callmux init [--config <path>] [--force]
@@ -136,6 +141,14 @@ Bridge Options:
   --cwd <path>          Project cwd to send as x-callmux-cwd (default: process cwd)
   --header Name:Value   Extra HTTP header for the shared listener (repeatable)
   --call-timeout <ms>   Timeout for forwarded tool calls (default: SDK default)
+
+Call Options:
+  --url <listener-url>  Shared Streamable HTTP MCP endpoint (default: http://127.0.0.1:4860/mcp)
+  --cwd <path>          Project cwd to send as x-callmux-cwd (default: process cwd)
+  --header Name:Value   Extra HTTP header for the shared listener, e.g. Authorization (repeatable)
+  --file <path>         Read the JSON args payload from a file instead of the command line
+  --call-timeout <ms>   Timeout for the forwarded tool call
+  --output-format <fmt> Render the result as json, toon, or auto (default: json)
 
 Daemon Options:
   --port <n>            Listener port for install (default: 4860)
@@ -265,6 +278,9 @@ Examples:
   callmux --listen 4860
   callmux --listen 4860 --config callmux.json
   callmux bridge --url http://localhost:4860/mcp
+  callmux call github__search_issues '{"query":"is:open"}'
+  callmux call callmux_parallel '{"calls":[{"tool":"github__issue_read","arguments":{"number":1}}]}'
+  callmux call github__create_issue --file payload.json --url http://localhost:4860/mcp
   callmux --config callmux.json
   callmux --cache 60 -- node my-mcp-server.js
   callmux --cache 60 --cache-allow get_*,list_* -- npx -y @modelcontextprotocol/server-github
@@ -892,6 +908,101 @@ async function handleBridgeCommand(args: string[]): Promise<void> {
   await bridge.start(transport);
 }
 
+async function handleCallCommand(args: string[]): Promise<void> {
+  const toolName = args[0];
+  if (!toolName) {
+    throw new Error(
+      "Usage: callmux call <tool> [json] [--file <path>] [--url <listener-url>] [--cwd <path>] [--header Name:Value] [--call-timeout <ms>] [--output-format json|toon|auto]"
+    );
+  }
+
+  let url: string | undefined;
+  let cwd = process.cwd();
+  let callTimeoutMs: number | undefined;
+  let filePath: string | undefined;
+  let outputFormat: OutputFormat | undefined;
+  const headers: Record<string, string> = {};
+  const positionals: string[] = [];
+
+  for (let i = 1; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--url" && i + 1 < args.length) {
+      url = args[++i];
+    } else if (arg === "--cwd" && i + 1 < args.length) {
+      cwd = resolve(args[++i]);
+    } else if (arg === "--header" && i + 1 < args.length) {
+      const raw = args[++i];
+      const separator = raw.indexOf(":");
+      if (separator <= 0) {
+        throw new Error("--header must use Name:Value format");
+      }
+      headers[raw.slice(0, separator).trim()] = raw.slice(separator + 1).trim();
+    } else if (arg === "--call-timeout" && i + 1 < args.length) {
+      callTimeoutMs = Number(args[++i]);
+      if (!Number.isInteger(callTimeoutMs) || callTimeoutMs < 0) {
+        throw new Error("--call-timeout must be a non-negative integer");
+      }
+    } else if (arg === "--file" && i + 1 < args.length) {
+      filePath = args[++i];
+    } else if (arg === "--output-format" && i + 1 < args.length) {
+      const value = args[++i];
+      if (!isOutputFormat(value)) {
+        throw new Error("--output-format must be one of: json, toon, auto");
+      }
+      outputFormat = value;
+    } else if (arg.startsWith("--")) {
+      throw new Error(`Unknown call option "${arg}"`);
+    } else {
+      positionals.push(arg);
+    }
+  }
+
+  if (positionals.length > 1) {
+    throw new Error("Usage: callmux call <tool> [json] — only one JSON payload argument is allowed");
+  }
+  if (positionals.length > 0 && filePath) {
+    throw new Error("Provide the JSON payload as an argument or via --file, not both");
+  }
+
+  const payloadText = filePath
+    ? await readFile(resolve(filePath), "utf-8")
+    : (positionals[0] ?? "{}");
+
+  let toolArgs: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(payloadText);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("payload must be a JSON object");
+    }
+    toolArgs = parsed;
+  } catch (error) {
+    throw new Error(
+      `Invalid JSON payload: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+
+  const listenerUrl = url ?? `http://127.0.0.1:${DEFAULT_PORT}/mcp`;
+
+  const outcome = await callListenerTool(listenerUrl, toolName, toolArgs, {
+    cwd,
+    ...(Object.keys(headers).length > 0 ? { headers } : {}),
+    ...(callTimeoutMs !== undefined ? { timeoutMs: callTimeoutMs } : {}),
+  });
+
+  if (!outcome.ok || !outcome.result) {
+    console.error(`Error: ${outcome.error ?? "call failed"}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const payload = extractListenerToolPayload(outcome.result);
+  console.log(formatToolText(payload, { format: outputFormat }));
+
+  if (outcome.result.isError) {
+    process.exitCode = 1;
+  }
+}
+
 function handleInstructionsCommand(args: string[]): void {
   let profile: AgentInstructionsProfile = "generic";
   let mode: AgentInstructionsMode = "standard";
@@ -1140,6 +1251,11 @@ async function main(): Promise<void> {
 
   if (args[0] === "bridge") {
     await handleBridgeCommand(args.slice(1));
+    return;
+  }
+
+  if (args[0] === "call") {
+    await handleCallCommand(args.slice(1));
     return;
   }
 

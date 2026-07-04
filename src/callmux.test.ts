@@ -241,6 +241,24 @@ async function getFreePort(): Promise<number> {
   return address.port;
 }
 
+async function runCallmuxCli(
+  args: string[]
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  const child = spawn(
+    process.execPath,
+    [join(process.cwd(), "dist-test", "bin", "callmux.js"), ...args],
+    { stdio: ["ignore", "pipe", "pipe"] }
+  );
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+  child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+  const code = await new Promise<number | null>((resolve) => {
+    child.once("close", (exitCode) => resolve(exitCode));
+  });
+  return { code, stdout, stderr };
+}
+
 async function waitFor(
   predicate: () => Promise<boolean>,
   timeoutMs = 5000,
@@ -14078,5 +14096,187 @@ test("listener leaves event store file absent when event store is disabled", asy
     await listener?.close();
     await upstream.close();
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ─── `callmux call` CLI verb ──────────────────────────────────
+
+test("callmux call forwards a tool call to a running listener (happy path)", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "callmux-call-cwd-"));
+  const upstream = new UpstreamManager();
+  const cache = new CallCache(0, undefined, {}, 100);
+  let listener: CallmuxListener | undefined;
+
+  try {
+    const serverConfig = fakeMcpServer("fake", {
+      FAKE_MCP_TOOLS: JSON.stringify([{ name: "get_item", description: "Get a fake item" }]),
+    });
+    await upstream.connect({ fake: serverConfig });
+
+    listener = new CallmuxListener({
+      port: 0,
+      host: "127.0.0.1",
+      config: { servers: { fake: serverConfig } },
+      upstream,
+      cache,
+      allTools: [],
+      maxConcurrency: 10,
+    });
+    await listener.start();
+    const port = listenerPort(listener);
+
+    const { code, stdout, stderr } = await runCallmuxCli([
+      "call",
+      "fake__get_item",
+      JSON.stringify({ id: 42 }),
+      "--url", `http://127.0.0.1:${port}/mcp`,
+      "--cwd", cwd,
+    ]);
+
+    assert.equal(code, 0, stderr);
+    const payload = JSON.parse(stdout);
+    assert.equal(payload.tool, "get_item");
+    assert.deepEqual(payload.arguments, { id: 42 });
+  } finally {
+    await listener?.close();
+    await upstream.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("callmux call reads the JSON payload from --file", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "callmux-call-file-"));
+  const upstream = new UpstreamManager();
+  const cache = new CallCache(0, undefined, {}, 100);
+  let listener: CallmuxListener | undefined;
+
+  try {
+    const serverConfig = fakeMcpServer("fake", {
+      FAKE_MCP_TOOLS: JSON.stringify([{ name: "get_item", description: "Get a fake item" }]),
+    });
+    await upstream.connect({ fake: serverConfig });
+
+    listener = new CallmuxListener({
+      port: 0,
+      host: "127.0.0.1",
+      config: { servers: { fake: serverConfig } },
+      upstream,
+      cache,
+      allTools: [],
+      maxConcurrency: 10,
+    });
+    await listener.start();
+    const port = listenerPort(listener);
+
+    const payloadPath = join(cwd, "payload.json");
+    await writeFile(payloadPath, JSON.stringify({ id: 7 }));
+
+    const { code, stdout, stderr } = await runCallmuxCli([
+      "call",
+      "fake__get_item",
+      "--file", payloadPath,
+      "--url", `http://127.0.0.1:${port}/mcp`,
+      "--cwd", cwd,
+    ]);
+
+    assert.equal(code, 0, stderr);
+    const payload = JSON.parse(stdout);
+    assert.deepEqual(payload.arguments, { id: 7 });
+  } finally {
+    await listener?.close();
+    await upstream.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("callmux call exits non-zero when the downstream tool reports an error", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "callmux-call-error-"));
+  const upstream = new UpstreamManager();
+  const cache = new CallCache(0, undefined, {}, 100);
+  let listener: CallmuxListener | undefined;
+
+  try {
+    const serverConfig = fakeMcpServer("fake", {
+      FAKE_MCP_TOOLS: JSON.stringify([{ name: "get_item", description: "Get a fake item" }]),
+      FAKE_MCP_CALL_MODE: "tool_error",
+      FAKE_MCP_TOOL_ERROR_MESSAGE: "boom",
+    });
+    await upstream.connect({ fake: serverConfig });
+
+    listener = new CallmuxListener({
+      port: 0,
+      host: "127.0.0.1",
+      config: { servers: { fake: serverConfig } },
+      upstream,
+      cache,
+      allTools: [],
+      maxConcurrency: 10,
+    });
+    await listener.start();
+    const port = listenerPort(listener);
+
+    const { code, stdout } = await runCallmuxCli([
+      "call",
+      "fake__get_item",
+      "{}",
+      "--url", `http://127.0.0.1:${port}/mcp`,
+      "--cwd", cwd,
+    ]);
+
+    assert.equal(code, 1);
+    assert.match(stdout, /boom/);
+  } finally {
+    await listener?.close();
+    await upstream.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("callmux call callmux_parallel fans out raw meta-tool calls", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "callmux-call-parallel-"));
+  const upstream = new UpstreamManager();
+  const cache = new CallCache(0, undefined, {}, 100);
+  let listener: CallmuxListener | undefined;
+
+  try {
+    const serverConfig = fakeMcpServer("fake", {
+      FAKE_MCP_TOOLS: JSON.stringify([{ name: "get_item", description: "Get a fake item" }]),
+    });
+    await upstream.connect({ fake: serverConfig });
+
+    listener = new CallmuxListener({
+      port: 0,
+      host: "127.0.0.1",
+      config: { servers: { fake: serverConfig } },
+      upstream,
+      cache,
+      allTools: [],
+      maxConcurrency: 10,
+    });
+    await listener.start();
+    const port = listenerPort(listener);
+
+    const { code, stdout, stderr } = await runCallmuxCli([
+      "call",
+      "callmux_parallel",
+      JSON.stringify({
+        calls: [
+          { tool: "fake__get_item", arguments: { id: 1 } },
+          { tool: "fake__get_item", arguments: { id: 2 } },
+        ],
+      }),
+      "--url", `http://127.0.0.1:${port}/mcp`,
+      "--cwd", cwd,
+    ]);
+
+    assert.equal(code, 0, stderr);
+    const payload = JSON.parse(stdout);
+    assert.equal(payload.status, "completed");
+    assert.equal(payload.succeeded, 2);
+    assert.equal(payload.failed, 0);
+  } finally {
+    await listener?.close();
+    await upstream.close();
+    await rm(cwd, { recursive: true, force: true });
   }
 });
