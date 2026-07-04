@@ -58,6 +58,7 @@ import {
   type DaemonScope,
 } from "../daemon.js";
 import { callListenerTool, extractListenerToolPayload, listenerRequest } from "../listener-client.js";
+import { getManagedClientTokenPath, resolveClientToken, withBearerToken, writeManagedClientToken } from "../cli-auth.js";
 import { formatToolText, isOutputFormat, type OutputFormat } from "../output-format.js";
 import { runSetup } from "../setup.js";
 import {
@@ -117,7 +118,7 @@ Usage:
   callmux server remove <name> [--config <path>]
   callmux server list [--config <path>] [--json]
   callmux client print <claude|codex> [--config <path>] [--name <id>] [--url <listener-url>] [--bridge]
-  callmux client attach <claude|codex> [--config <path>] [--name <id>] [--url <listener-url>] [--bridge] [--file <path>] [--dry-run] [--yes] [--json]
+  callmux client attach <claude|codex> [--config <path>] [--name <id>] [--url <listener-url>] [--bridge] [--token <t>] [--token-file <path>] [--file <path>] [--dry-run] [--yes] [--json]
   callmux client detach <claude|codex> [--name <id>] [--file <path>] [--dry-run] [--yes] [--json]
   callmux client status [claude|codex] [--config <path>] [--name <id>] [--url <listener-url>] [--bridge] [--file <path>] [--json]
   callmux daemon <install|uninstall|start|stop|restart|enable|disable|status|logs> [options]
@@ -155,6 +156,8 @@ Bridge Options:
   --cwd <path>          Project cwd to send as x-callmux-cwd (default: process cwd)
   --header Name:Value   Extra HTTP header for the shared listener (repeatable)
   --call-timeout <ms>   Timeout for forwarded tool calls (default: SDK default)
+  --token <t>           Client->callmux bearer token (loopback needs none)
+  --token-file <path>   Read the bearer token from a file (keeps it out of ps/history)
 
 Call Options:
   --url <listener-url>  Shared Streamable HTTP MCP endpoint (default: http://127.0.0.1:4860/mcp)
@@ -163,6 +166,10 @@ Call Options:
   --file <path>         Read the JSON args payload from a file instead of the command line
   --call-timeout <ms>   Timeout for the forwarded tool call
   --output-format <fmt> Render the result as json, toon, or auto (default: json)
+  --token <t>           Client->callmux bearer token. Precedence: CALLMUX_TOKEN
+                         env > --token > --token-file > managed store. Loopback
+                         daemons need no token.
+  --token-file <path>   Read the bearer token from a file (keeps it out of ps/history)
 
 Parallel/Batch/Pipeline Options:
   Same options as Call Options above. Each '<tool> <argsJSON>' argument is
@@ -181,6 +188,8 @@ Tools Options:
   --header Name:Value   Extra HTTP header for the shared listener (repeatable)
   --server <name>       Filter to tools qualified with the "<name>__" prefix (list/search)
   --call-timeout <ms>   Timeout for the tools/list request
+  --token <t>           Client->callmux bearer token (see Call Options precedence)
+  --token-file <path>   Read the bearer token from a file (keeps it out of ps/history)
   --json                Machine-readable output instead of the human-readable default
 
 Daemon Options:
@@ -647,6 +656,8 @@ async function handleClientMutation(
   let json = false;
   let url: string | undefined;
   let bridge = false;
+  let token: string | undefined;
+  let tokenFile: string | undefined;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--name" && i + 1 < args.length) {
@@ -657,6 +668,10 @@ async function handleClientMutation(
       url = args[++i];
     } else if (args[i] === "--bridge") {
       bridge = true;
+    } else if (args[i] === "--token" && i + 1 < args.length) {
+      token = args[++i];
+    } else if (args[i] === "--token-file" && i + 1 < args.length) {
+      tokenFile = args[++i];
     } else if (args[i] === "--yes") {
       yes = true;
     } else if (args[i] === "--dry-run") {
@@ -666,6 +681,10 @@ async function handleClientMutation(
     } else {
       throw new Error(`Unknown client ${action} option "${args[i]}"`);
     }
+  }
+
+  if ((token !== undefined || tokenFile !== undefined) && action !== "attach") {
+    throw new Error("--token/--token-file are only valid with client attach");
   }
 
   const source = await readTextFileIfExists(filePath);
@@ -690,9 +709,26 @@ async function handleClientMutation(
         ? `Remove mcpServers.${name}`
         : `Remove CALLMUX-managed [mcp_servers.${name}] block`;
 
+  // Resolve the CLI token straight from the flags (env: "" skips the env var so
+  // this reflects exactly what the user passed) so one `attach` can stash the
+  // client -> callmux bearer alongside the MCP client entry.
+  const attachToken =
+    action === "attach"
+      ? await resolveClientToken({
+          env: "",
+          ...(token !== undefined ? { token } : {}),
+          ...(tokenFile !== undefined ? { tokenFile } : {}),
+        })
+      : undefined;
+
   if (shouldWrite) {
     await mkdir(dirname(filePath), { recursive: true });
     await writeFile(filePath, mutation.content, "utf-8");
+  }
+
+  let tokenStorePath: string | undefined;
+  if (shouldWrite && attachToken) {
+    tokenStorePath = await writeManagedClientToken(attachToken);
   }
 
   const payload = {
@@ -705,6 +741,8 @@ async function handleClientMutation(
     dryRun: !shouldWrite,
     ...(url ? { url } : {}),
     ...(bridge ? { bridge } : {}),
+    ...(attachToken ? { tokenStashed: shouldWrite } : {}),
+    ...(tokenStorePath ? { tokenStorePath } : {}),
     ...(mutation.changed ? { preview } : {}),
   };
 
@@ -715,17 +753,26 @@ async function handleClientMutation(
 
   if (!mutation.changed) {
     console.log(`No changes needed for "${name}" in ${filePath}`);
+    if (tokenStorePath) {
+      console.log(`Stashed CLI token in ${tokenStorePath}`);
+    }
     return;
   }
 
   if (!shouldWrite) {
     console.log(`Preview only for ${client} at ${filePath}. Re-run with --yes to write.`);
+    if (attachToken) {
+      console.log(`(--yes would also stash the CLI token in ${getManagedClientTokenPath()})`);
+    }
     console.log("");
     console.log(preview);
     return;
   }
 
   console.log(`${action === "attach" ? "Attached" : "Detached"} "${name}" ${action === "attach" ? "in" : "from"} ${filePath}`);
+  if (tokenStorePath) {
+    console.log(`Stashed CLI token in ${tokenStorePath}`);
+  }
 }
 
 async function handleClientCommand(
@@ -900,6 +947,8 @@ async function handleBridgeCommand(args: string[]): Promise<void> {
   let url: string | undefined;
   let cwd = process.cwd();
   let callTimeoutMs: number | undefined;
+  let token: string | undefined;
+  let tokenFile: string | undefined;
   const headers: Record<string, string> = {};
 
   for (let i = 0; i < args.length; i++) {
@@ -920,19 +969,29 @@ async function handleBridgeCommand(args: string[]): Promise<void> {
       if (!Number.isInteger(callTimeoutMs) || callTimeoutMs < 0) {
         throw new Error("--call-timeout must be a non-negative integer");
       }
+    } else if (arg === "--token" && i + 1 < args.length) {
+      token = args[++i];
+    } else if (arg === "--token-file" && i + 1 < args.length) {
+      tokenFile = args[++i];
     } else {
       throw new Error(`Unknown bridge option "${arg}"`);
     }
   }
 
   if (!url) {
-    throw new Error("Usage: callmux bridge --url <listener-url> [--cwd <path>] [--header Name:Value]");
+    throw new Error("Usage: callmux bridge --url <listener-url> [--cwd <path>] [--header Name:Value] [--token <t>] [--token-file <path>]");
   }
+
+  const resolvedToken = await resolveClientToken({
+    ...(token !== undefined ? { token } : {}),
+    ...(tokenFile !== undefined ? { tokenFile } : {}),
+  });
+  const bridgeHeaders = withBearerToken(headers, resolvedToken);
 
   const bridge = new CallmuxBridge({
     url,
     cwd,
-    ...(Object.keys(headers).length > 0 ? { headers } : {}),
+    ...(Object.keys(bridgeHeaders).length > 0 ? { headers: bridgeHeaders } : {}),
     ...(callTimeoutMs !== undefined ? { callTimeoutMs } : {}),
   });
   const transport = new StdioServerTransport();
@@ -957,13 +1016,16 @@ interface ListenerCallOptions {
   filePath?: string;
   outputFormat?: OutputFormat;
   headers: Record<string, string>;
+  token?: string;
+  tokenFile?: string;
   positionals: string[];
 }
 
 /**
  * Parses the flags shared by `call`, `parallel`, `batch`, and `pipeline`
- * (--url, --cwd, --header, --call-timeout, --file, --output-format),
- * leaving positional (non-flag) arguments for the caller to interpret.
+ * (--url, --cwd, --header, --call-timeout, --file, --output-format,
+ * --token, --token-file), leaving positional (non-flag) arguments for the
+ * caller to interpret.
  */
 function parseListenerCallOptions(args: string[], commandLabel: string): ListenerCallOptions {
   let url: string | undefined;
@@ -971,6 +1033,8 @@ function parseListenerCallOptions(args: string[], commandLabel: string): Listene
   let callTimeoutMs: number | undefined;
   let filePath: string | undefined;
   let outputFormat: OutputFormat | undefined;
+  let token: string | undefined;
+  let tokenFile: string | undefined;
   const headers: Record<string, string> = {};
   const positionals: string[] = [];
 
@@ -994,6 +1058,10 @@ function parseListenerCallOptions(args: string[], commandLabel: string): Listene
       }
     } else if (arg === "--file" && i + 1 < args.length) {
       filePath = args[++i];
+    } else if (arg === "--token" && i + 1 < args.length) {
+      token = args[++i];
+    } else if (arg === "--token-file" && i + 1 < args.length) {
+      tokenFile = args[++i];
     } else if (arg === "--output-format" && i + 1 < args.length) {
       const value = args[++i];
       if (!isOutputFormat(value)) {
@@ -1007,7 +1075,7 @@ function parseListenerCallOptions(args: string[], commandLabel: string): Listene
     }
   }
 
-  return { url, cwd, callTimeoutMs, filePath, outputFormat, headers, positionals };
+  return { url, cwd, callTimeoutMs, filePath, outputFormat, headers, token, tokenFile, positionals };
 }
 
 async function readJsonObjectPayload(source: string, label: string): Promise<Record<string, unknown>> {
@@ -1031,13 +1099,19 @@ async function readJsonObjectPayload(source: string, label: string): Promise<Rec
 async function runListenerToolCall(
   toolName: string,
   toolArgs: Record<string, unknown>,
-  options: Pick<ListenerCallOptions, "url" | "cwd" | "callTimeoutMs" | "outputFormat" | "headers">
+  options: Pick<ListenerCallOptions, "url" | "cwd" | "callTimeoutMs" | "outputFormat" | "headers" | "token" | "tokenFile">
 ): Promise<void> {
   const listenerUrl = options.url ?? `http://127.0.0.1:${DEFAULT_PORT}/mcp`;
 
+  const token = await resolveClientToken({
+    ...(options.token !== undefined ? { token: options.token } : {}),
+    ...(options.tokenFile !== undefined ? { tokenFile: options.tokenFile } : {}),
+  });
+  const headers = withBearerToken(options.headers, token);
+
   const outcome = await callListenerTool(listenerUrl, toolName, toolArgs, {
     cwd: options.cwd,
-    ...(Object.keys(options.headers).length > 0 ? { headers: options.headers } : {}),
+    ...(Object.keys(headers).length > 0 ? { headers } : {}),
     ...(options.callTimeoutMs !== undefined ? { timeoutMs: options.callTimeoutMs } : {}),
   });
 
@@ -1226,6 +1300,8 @@ interface ToolsCommandOptions {
   headers: Record<string, string>;
   callTimeoutMs?: number;
   server?: string;
+  token?: string;
+  tokenFile?: string;
   json: boolean;
   positionals: string[];
 }
@@ -1243,6 +1319,8 @@ function parseToolsCommandArgs(args: string[]): ToolsCommandOptions | { error: s
   let cwd = process.cwd();
   let callTimeoutMs: number | undefined;
   let server: string | undefined;
+  let token: string | undefined;
+  let tokenFile: string | undefined;
   let json = false;
   const headers: Record<string, string> = {};
   const positionals: string[] = [];
@@ -1267,6 +1345,10 @@ function parseToolsCommandArgs(args: string[]): ToolsCommandOptions | { error: s
       if (!Number.isInteger(callTimeoutMs) || callTimeoutMs < 0) {
         return { error: "--call-timeout must be a non-negative integer" };
       }
+    } else if (arg === "--token" && i + 1 < args.length) {
+      token = args[++i];
+    } else if (arg === "--token-file" && i + 1 < args.length) {
+      tokenFile = args[++i];
     } else if (arg === "--json") {
       json = true;
     } else if (arg.startsWith("--")) {
@@ -1282,6 +1364,8 @@ function parseToolsCommandArgs(args: string[]): ToolsCommandOptions | { error: s
     headers,
     ...(callTimeoutMs !== undefined ? { callTimeoutMs } : {}),
     ...(server !== undefined ? { server } : {}),
+    ...(token !== undefined ? { token } : {}),
+    ...(tokenFile !== undefined ? { tokenFile } : {}),
     json,
     positionals,
   };
@@ -1290,9 +1374,15 @@ function parseToolsCommandArgs(args: string[]): ToolsCommandOptions | { error: s
 async function fetchToolList(
   options: ToolsCommandOptions
 ): Promise<Tool[] | { error: string }> {
+  const token = await resolveClientToken({
+    ...(options.token !== undefined ? { token: options.token } : {}),
+    ...(options.tokenFile !== undefined ? { tokenFile: options.tokenFile } : {}),
+  });
+  const headers = withBearerToken(options.headers, token);
+
   const outcome = await listenerRequest(options.url, "tools/list", {}, {
     cwd: options.cwd,
-    ...(Object.keys(options.headers).length > 0 ? { headers: options.headers } : {}),
+    ...(Object.keys(headers).length > 0 ? { headers } : {}),
     ...(options.callTimeoutMs !== undefined ? { timeoutMs: options.callTimeoutMs } : {}),
   });
 

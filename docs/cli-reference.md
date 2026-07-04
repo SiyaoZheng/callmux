@@ -129,12 +129,61 @@ callmux tools search issue
 
 `tools list`/`tools search` call the daemon's `tools/list` once and print only names + one-line descriptions — cheap discovery for an agent deciding what's callable. `tools schema <tool>` prints the full input schema for one tool, paid for only when that tool is actually used. `--server <name>` filters to tools qualified with the `<name>__` prefix (honors the server's configured `prefix`, e.g. `gh__`). Same exit codes as `callmux call` (`0` success, `2` usage/transport error or unknown tool).
 
+### Authenticating Against a Remote or Shared Daemon
+
+A **loopback** daemon needs no token — the listener permits `127.0.0.1`/`::1`/`localhost` without auth, so `callmux call ...` just works locally. When you point `--url` at a **remote or auth-configured** daemon, `call`, `tools`, and `bridge` present a client→callmux **bearer token**. This is a separate layer from downstream secrets like `GITHUB_TOKEN`, which stay server-side in the daemon — the agent never holds them.
+
+The token is resolved in this precedence (cheapest-trust-first — the first source that yields a token wins):
+
+1. **Loopback** → no token required.
+2. **`CALLMUX_TOKEN`** environment variable.
+3. **`--token <t>`** / **`--token-file <path>`** (`--token` wins if both are given; the file form keeps the secret out of `ps` output and shell history).
+4. The **managed CLI token store** written by `callmux client attach --token …` (`~/.config/callmux/cli-token`, mode `0600`).
+
+```bash
+# Remote daemon, token via env (nothing lands in argv):
+CALLMUX_TOKEN=… callmux call github__search_issues '{"query":"is:open"}' --url https://mux.example.com/mcp
+
+# Token from a file (out of ps/history):
+callmux call github__search_issues '{"query":"is:open"}' --url https://mux.example.com/mcp --token-file ~/.secrets/callmux.token
+```
+
+The token is sent as `Authorization: Bearer <token>`. An explicit `--header Authorization:…` always overrides the resolved token. On the daemon, the existing stack verifies it — `authenticateBearerToken` for bearer tokens, the OIDC verifier for `oidc_jwt` SSO principals — then `evaluateToolAuthorization` applies the policy. Nothing about that server-side path changes; the CLI only *presents* the token.
+
+#### One `attach` wires both the MCP client and the CLI
+
+`callmux client attach <claude|codex> --token <t> --yes` (or `--token-file <path>`) stashes the bearer in the managed CLI token store **in addition to** writing the MCP client entry. A subsequent bare `callmux call …` then resolves the token at tier 4 with no extra flags. In `--bridge` mode the MCP client spawns `callmux bridge --url …`, which reads the same store — so a single `attach --bridge --token …` authenticates both the client's MCP session and any CLI call.
+
+#### Per-tool authorization for agents (deny-write pattern)
+
+Keep the **harness grant coarse and the daemon policy fine.** Give an agent a single broad permission — `callmux call:*` — and let callmux enforce which tools that principal may actually invoke. Issue the agent a read-ish principal by denying writes per-tool:
+
+```jsonc
+// callmux config.json (daemon side)
+{
+  "auth": {
+    "mode": "bearer",
+    "tokens": [{ "id": "agent-readonly", "hash": "scrypt$..." }]
+  },
+  "authorization": {
+    "defaultEffect": "allow",
+    "rules": [
+      { "id": "deny-writes", "effect": "deny", "principals": ["*"], "tools": ["*__*write*"] }
+    ]
+  }
+}
+```
+
+With the agent holding only the `agent-readonly` token, `callmux call github__search_issues …` succeeds while `callmux call github__create_issue …` (or any `*write*` tool) comes back as an `authorization_denied` error result (exit code `1`) naming the blocked tool. Read tools stay allowed; a single write rule fences off the mutating surface. Tighten further by flipping `defaultEffect` to `deny` and adding explicit `allow` rules for the exact read tools the agent needs — deny always wins when allow and deny both match, so the policy fails closed. See the [Config Reference](config-reference.md) for the full `auth`/`authorization` schema.
+
 ### Attach a Client
 
 ```bash
 callmux client attach claude --yes
 callmux client attach codex --url http://localhost:4860/mcp --yes
 callmux client attach codex --url http://localhost:4860/mcp --bridge --yes
+# Remote/auth'd daemon: stash the client→callmux bearer for the CLI + bridge:
+callmux client attach codex --url https://mux.example.com/mcp --bridge --token-file ~/.secrets/callmux.token --yes
 ```
 
 ### Print Client Snippets
@@ -184,6 +233,7 @@ The output covers meta-tool recovery fields, `callmux_dry_run`, response-shield 
 |:---------|:------------|
 | `CALLMUX_CONFIG` | Override config file path |
 | `CALLMUX_NAMESPACE` | Instance identifier for multi-instance sessions (e.g. `mcp__server1__`) |
+| `CALLMUX_TOKEN` | Client→callmux bearer token presented by `call`/`tools`/`bridge` ([details](#authenticating-against-a-remote-or-shared-daemon)) |
 
 ---
 

@@ -66,6 +66,12 @@ import { PrometheusMetrics } from "./metrics.js";
 import { formatCommandForDisplay, redactUrl } from "./redact.js";
 import { hashBearerToken } from "./auth.js";
 import { evaluateToolAuthorization } from "./authorization.js";
+import {
+  getManagedClientTokenPath,
+  resolveClientToken,
+  withBearerToken,
+  writeManagedClientToken,
+} from "./cli-auth.js";
 import { listenerClientUrl, renderSharedListenerStartCommand } from "./setup.js";
 import { createResponseStore } from "./response-store.js";
 import {
@@ -242,12 +248,16 @@ async function getFreePort(): Promise<number> {
 }
 
 async function runCallmuxCli(
-  args: string[]
+  args: string[],
+  options: { env?: Record<string, string> } = {}
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   const child = spawn(
     process.execPath,
     [join(process.cwd(), "dist-test", "bin", "callmux.js"), ...args],
-    { stdio: ["ignore", "pipe", "pipe"] }
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      ...(options.env ? { env: { ...process.env, ...options.env } } : {}),
+    }
   );
   let stdout = "";
   let stderr = "";
@@ -14843,4 +14853,297 @@ test("callmux pipeline with no calls and no --file prints usage and exits 2", as
   const { code, stderr } = await runCallmuxCli(["pipeline"]);
   assert.equal(code, 2);
   assert.match(stderr, /Usage: callmux pipeline/);
+});
+
+// ---------------------------------------------------------------------------
+// MCP2CLI Phase 4: client -> callmux auth (token resolution + bearer/authorization)
+// ---------------------------------------------------------------------------
+
+test("resolveClientToken returns undefined when no source provides a token (loopback)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-clitoken-none-"));
+  try {
+    const token = await resolveClientToken({
+      env: "",
+      managedTokenPath: join(dir, "cli-token"),
+    });
+    assert.equal(token, undefined);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveClientToken resolves precedence: env > --token > --token-file > managed store", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-clitoken-order-"));
+  const tokenFile = join(dir, "flag.token");
+  const managed = join(dir, "cli-token");
+  try {
+    await writeFile(tokenFile, "file-token\n", "utf-8");
+    await writeFile(managed, "managed-token\n", "utf-8");
+
+    // 2. CALLMUX_TOKEN env beats every lower tier.
+    assert.equal(
+      await resolveClientToken({
+        env: "env-token",
+        token: "flag-token",
+        tokenFile,
+        managedTokenPath: managed,
+      }),
+      "env-token"
+    );
+
+    // 3a. --token beats --token-file and the managed store.
+    assert.equal(
+      await resolveClientToken({
+        env: "",
+        token: "flag-token",
+        tokenFile,
+        managedTokenPath: managed,
+      }),
+      "flag-token"
+    );
+
+    // 3b. --token-file beats the managed store.
+    assert.equal(
+      await resolveClientToken({
+        env: "",
+        tokenFile,
+        managedTokenPath: managed,
+      }),
+      "file-token"
+    );
+
+    // 4. The managed store is the lowest-priority fallback.
+    assert.equal(
+      await resolveClientToken({
+        env: "",
+        managedTokenPath: managed,
+      }),
+      "managed-token"
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveClientToken reads CALLMUX_TOKEN from the real environment when env override is absent", async () => {
+  const previous = process.env.CALLMUX_TOKEN;
+  process.env.CALLMUX_TOKEN = "ambient-token";
+  const dir = await mkdtemp(join(tmpdir(), "callmux-clitoken-env-"));
+  try {
+    assert.equal(
+      await resolveClientToken({ managedTokenPath: join(dir, "cli-token") }),
+      "ambient-token"
+    );
+  } finally {
+    if (previous === undefined) delete process.env.CALLMUX_TOKEN;
+    else process.env.CALLMUX_TOKEN = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveClientToken throws when --token-file is set but empty", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-clitoken-empty-"));
+  const tokenFile = join(dir, "empty.token");
+  try {
+    await writeFile(tokenFile, "   \n", "utf-8");
+    await assert.rejects(
+      resolveClientToken({ env: "", tokenFile }),
+      /did not contain a non-empty token/
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("writeManagedClientToken round-trips through resolveClientToken as the managed store", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-clitoken-store-"));
+  const managed = join(dir, "nested", "cli-token");
+  try {
+    const written = await writeManagedClientToken("stashed-secret", managed);
+    assert.equal(written, managed);
+    const stored = await readFile(managed, "utf-8");
+    assert.equal(stored.trim(), "stashed-secret");
+    assert.equal(
+      await resolveClientToken({ env: "", managedTokenPath: managed }),
+      "stashed-secret"
+    );
+    await assert.rejects(writeManagedClientToken("  ", managed), /empty CLI token/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("getManagedClientTokenPath lives alongside the default callmux config", () => {
+  const path = getManagedClientTokenPath();
+  assert.match(path, /[/\\]cli-token$/);
+});
+
+test("withBearerToken attaches Authorization only when a token is present and none is set", () => {
+  assert.deepEqual(withBearerToken({}, "abc"), { Authorization: "Bearer abc" });
+  assert.deepEqual(withBearerToken({}, undefined), {});
+  // An explicit Authorization header wins over the resolved token (any casing).
+  assert.deepEqual(withBearerToken({ authorization: "Bearer explicit" }, "abc"), {
+    authorization: "Bearer explicit",
+  });
+});
+
+test("callmux call succeeds tokenless against a loopback daemon", async () => {
+  const listener = await createListener({
+    port: 0,
+    config: {
+      servers: { fake: fakeMcpServer("fake") },
+      cacheTtlSeconds: 0,
+    },
+  });
+  try {
+    const { code, stdout } = await runCallmuxCli([
+      "call",
+      "fake__get_item",
+      "--url",
+      listener.mcpUrl,
+    ]);
+    assert.equal(code, 0, stdout);
+    assert.match(stdout, /"tool": ?"get_item"/);
+  } finally {
+    await listener.stop();
+  }
+});
+
+test("callmux call is rejected without a token but accepted with a bearer token on an auth'd daemon", async () => {
+  const secret = "phase4-bearer-secret";
+  const listener = await createListener({
+    port: 0,
+    config: {
+      servers: { fake: fakeMcpServer("fake") },
+      cacheTtlSeconds: 0,
+      auth: {
+        mode: "bearer",
+        tokens: [{ id: "agent", hash: hashBearerToken(secret) }],
+      },
+    },
+  });
+  try {
+    // No token -> the daemon's authenticateBearerToken path rejects at 401.
+    const unauth = await runCallmuxCli(["call", "fake__get_item", "--url", listener.mcpUrl]);
+    assert.equal(unauth.code, 2);
+    assert.match(unauth.stderr, /401/);
+
+    // --token -> bearer accepted, tool call flows.
+    const withFlag = await runCallmuxCli([
+      "call",
+      "fake__get_item",
+      "--url",
+      listener.mcpUrl,
+      "--token",
+      secret,
+    ]);
+    assert.equal(withFlag.code, 0, withFlag.stderr);
+    assert.match(withFlag.stdout, /"tool": ?"get_item"/);
+
+    // CALLMUX_TOKEN env -> same accepted path (precedence tier 2).
+    const withEnv = await runCallmuxCli(
+      ["call", "fake__get_item", "--url", listener.mcpUrl],
+      { env: { CALLMUX_TOKEN: secret } }
+    );
+    assert.equal(withEnv.code, 0, withEnv.stderr);
+    assert.match(withEnv.stdout, /"tool": ?"get_item"/);
+  } finally {
+    await listener.stop();
+  }
+});
+
+test("callmux --token-file authenticates against an auth'd daemon", async () => {
+  const secret = "phase4-file-secret";
+  const dir = await mkdtemp(join(tmpdir(), "callmux-tokenfile-"));
+  const tokenFile = join(dir, "agent.token");
+  const listener = await createListener({
+    port: 0,
+    config: {
+      servers: { fake: fakeMcpServer("fake") },
+      cacheTtlSeconds: 0,
+      auth: {
+        mode: "bearer",
+        tokens: [{ id: "agent", hash: hashBearerToken(secret) }],
+      },
+    },
+  });
+  try {
+    await writeFile(tokenFile, `${secret}\n`, "utf-8");
+    const { code, stdout, stderr } = await runCallmuxCli([
+      "call",
+      "fake__get_item",
+      "--url",
+      listener.mcpUrl,
+      "--token-file",
+      tokenFile,
+    ]);
+    assert.equal(code, 0, stderr);
+    assert.match(stdout, /"tool": ?"get_item"/);
+  } finally {
+    await listener.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a deny-write authorization rule blocks one tool via the CLI while allowing others", async () => {
+  const secret = "phase4-authz-secret";
+  const listener = await createListener({
+    port: 0,
+    config: {
+      servers: {
+        fake: fakeMcpServer("fake", {
+          FAKE_MCP_TOOLS: JSON.stringify([
+            { name: "read_item" },
+            { name: "write_item" },
+          ]),
+        }),
+      },
+      cacheTtlSeconds: 0,
+      auth: {
+        mode: "bearer",
+        tokens: [{ id: "agent", hash: hashBearerToken(secret) }],
+      },
+      // Read-ish principal: everything allowed by default, writes denied per tool.
+      authorization: {
+        defaultEffect: "allow",
+        rules: [
+          {
+            id: "deny-writes",
+            effect: "deny",
+            principals: ["*"],
+            tools: ["*__*write*"],
+          },
+        ],
+      },
+    },
+  });
+  try {
+    // Allowed read tool.
+    const read = await runCallmuxCli([
+      "call",
+      "fake__read_item",
+      "--url",
+      listener.mcpUrl,
+      "--token",
+      secret,
+    ]);
+    assert.equal(read.code, 0, read.stderr);
+    assert.match(read.stdout, /"tool": ?"read_item"/);
+
+    // Denied write tool: the RPC completes but the daemon returns an
+    // authorization_denied error result (exit 1) naming the blocked tool.
+    const write = await runCallmuxCli([
+      "call",
+      "fake__write_item",
+      "--url",
+      listener.mcpUrl,
+      "--token",
+      secret,
+    ]);
+    assert.equal(write.code, 1, write.stdout);
+    assert.match(write.stdout, /authorization_denied/);
+    assert.match(write.stdout, /fake__write_item/);
+  } finally {
+    await listener.stop();
+  }
 });
