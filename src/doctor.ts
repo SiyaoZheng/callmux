@@ -262,17 +262,45 @@ export function listenerUrls(input: string): { mcpUrl: string; healthUrl: string
   return { mcpUrl: mcp.href, healthUrl: health.href };
 }
 
-export async function parseHttpBody(response: Response): Promise<unknown> {
+/**
+ * Parses an HTTP response body, decoding SSE payloads when present.
+ *
+ * An SSE stream can carry a notification before the actual JSON-RPC
+ * response (both arrive as `data:` lines), so when `expectedId` is given
+ * every `data:` line is scanned for a JSON-RPC message whose `id` matches —
+ * notifications (no `id`) and unrelated responses are skipped rather than
+ * returning whichever line happened to come first.
+ */
+export async function parseHttpBody(
+  response: Response,
+  expectedId?: number | string
+): Promise<unknown> {
   const contentType = response.headers.get("content-type") ?? "";
   if (contentType.includes("application/json")) {
     return response.json();
   }
   if (contentType.includes("text/event-stream")) {
     const text = await response.text();
-    const dataLine = text
+    const dataLines = text
       .split("\n")
-      .find((line) => line.startsWith("data: "));
-    return dataLine ? JSON.parse(dataLine.slice(6)) : text;
+      .filter((line) => line.startsWith("data: "))
+      .map((line) => line.slice(6));
+    let fallback: unknown;
+    let sawParseable = false;
+    for (const line of dataLines) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      sawParseable = true;
+      if (fallback === undefined) fallback = parsed;
+      if (isRecord(parsed) && "id" in parsed && (expectedId === undefined || parsed.id === expectedId)) {
+        return parsed;
+      }
+    }
+    return sawParseable ? fallback : text;
   }
   const text = await response.text();
   if (text.length === 0) return undefined;
@@ -353,7 +381,7 @@ export async function runListenerDoctor(
         id: 1,
       }),
     });
-    const body = await parseHttpBody(response);
+    const body = await parseHttpBody(response, 1);
     const sessionId = response.headers.get("mcp-session-id") ?? undefined;
     const jsonRpcError = hasJsonRpcError(body);
     initialize = {
@@ -387,7 +415,7 @@ export async function runListenerDoctor(
           id: 2,
         }),
       });
-      const statusBody = await parseHttpBody(statusResponse);
+      const statusBody = await parseHttpBody(statusResponse, 2);
       const statusPayload = extractToolPayload(statusBody);
       const jsonRpcStatusError = hasJsonRpcError(statusBody);
       status = {

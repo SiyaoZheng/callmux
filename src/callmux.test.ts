@@ -14232,6 +14232,27 @@ test("callmux call exits non-zero when the downstream tool reports an error", as
   }
 });
 
+test("callmux call exits 2 with a clear message when the listener is unreachable", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "callmux-call-unreachable-"));
+  try {
+    const port = await getFreePort();
+
+    const { code, stdout, stderr } = await runCallmuxCli([
+      "call",
+      "fake__get_item",
+      "{}",
+      "--url", `http://127.0.0.1:${port}/mcp`,
+      "--cwd", cwd,
+    ]);
+
+    assert.equal(code, 2);
+    assert.equal(stdout, "");
+    assert.match(stderr, /failed to reach listener/i);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("callmux call callmux_parallel fans out raw meta-tool calls", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "callmux-call-parallel-"));
   const upstream = new UpstreamManager();
@@ -14278,5 +14299,64 @@ test("callmux call callmux_parallel fans out raw meta-tool calls", async () => {
     await listener?.close();
     await upstream.close();
     await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("callmux call terminates its listener session instead of leaking it", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "callmux-call-session-"));
+  const statusCwd = await mkdtemp(join(tmpdir(), "callmux-call-session-status-"));
+  const upstream = new UpstreamManager();
+  const cache = new CallCache(0, undefined, {}, 100);
+  let listener: CallmuxListener | undefined;
+
+  try {
+    const serverConfig = fakeMcpServer("fake", {
+      FAKE_MCP_TOOLS: JSON.stringify([{ name: "get_item", description: "Get a fake item" }]),
+    });
+    await upstream.connect({ fake: serverConfig });
+
+    listener = new CallmuxListener({
+      port: 0,
+      host: "127.0.0.1",
+      config: { servers: { fake: serverConfig } },
+      upstream,
+      cache,
+      allTools: [],
+      maxConcurrency: 10,
+    });
+    await listener.start();
+    const port = listenerPort(listener);
+
+    const callResult = await runCallmuxCli([
+      "call",
+      "fake__get_item",
+      JSON.stringify({ id: 1 }),
+      "--url", `http://127.0.0.1:${port}/mcp`,
+      "--cwd", cwd,
+    ]);
+    assert.equal(callResult.code, 0, callResult.stderr);
+
+    // Uses a distinct cwd so its own (also self-terminating) session is
+    // distinguishable in the sessions list from the first call's session.
+    const statusResult = await runCallmuxCli([
+      "call",
+      "callmux_status",
+      JSON.stringify({ sessions: true, recommendations: false }),
+      "--url", `http://127.0.0.1:${port}/mcp`,
+      "--cwd", statusCwd,
+    ]);
+    assert.equal(statusResult.code, 0, statusResult.stderr);
+
+    const status = JSON.parse(statusResult.stdout) as {
+      listener?: { sessions?: Array<{ cwd?: string }> };
+    };
+    const sessions = status.listener?.sessions ?? [];
+    const leaked = sessions.filter((session) => session.cwd === cwd);
+    assert.equal(leaked.length, 0, `expected the first call's session to be terminated, found: ${JSON.stringify(sessions)}`);
+  } finally {
+    await listener?.close();
+    await upstream.close();
+    await rm(cwd, { recursive: true, force: true });
+    await rm(statusCwd, { recursive: true, force: true });
   }
 });

@@ -90,6 +90,7 @@ Usage:
   callmux bridge --url <listener-url>        Stdio bridge to shared HTTP listener with cwd header
   callmux call <tool> [json] [--file <path>] [--url <listener-url>]
                                               Call one tool against a running listener (tools/call)
+                                              Exit codes: 1 = tool error, 2 = usage/transport error
   callmux [options] -- <command> [args...]   Single-server mode
   callmux setup [--config <path>]            Interactive setup wizard
   callmux init [--config <path>] [--force]
@@ -908,12 +909,19 @@ async function handleBridgeCommand(args: string[]): Promise<void> {
   await bridge.start(transport);
 }
 
+/**
+ * Exit codes: 1 = the downstream tool reported an error (`isError: true`).
+ * 2 = usage error or transport/connection failure (couldn't reach the
+ * listener, bad JSON payload, unknown flag, ...).
+ */
 async function handleCallCommand(args: string[]): Promise<void> {
   const toolName = args[0];
   if (!toolName) {
-    throw new Error(
+    console.error(
       "Usage: callmux call <tool> [json] [--file <path>] [--url <listener-url>] [--cwd <path>] [--header Name:Value] [--call-timeout <ms>] [--output-format json|toon|auto]"
     );
+    process.exitCode = 2;
+    return;
   }
 
   let url: string | undefined;
@@ -924,49 +932,62 @@ async function handleCallCommand(args: string[]): Promise<void> {
   const headers: Record<string, string> = {};
   const positionals: string[] = [];
 
-  for (let i = 1; i < args.length; i++) {
-    const arg = args[i];
-    if (arg === "--url" && i + 1 < args.length) {
-      url = args[++i];
-    } else if (arg === "--cwd" && i + 1 < args.length) {
-      cwd = resolve(args[++i]);
-    } else if (arg === "--header" && i + 1 < args.length) {
-      const raw = args[++i];
-      const separator = raw.indexOf(":");
-      if (separator <= 0) {
-        throw new Error("--header must use Name:Value format");
+  try {
+    for (let i = 1; i < args.length; i++) {
+      const arg = args[i];
+      if (arg === "--url" && i + 1 < args.length) {
+        url = args[++i];
+      } else if (arg === "--cwd" && i + 1 < args.length) {
+        cwd = resolve(args[++i]);
+      } else if (arg === "--header" && i + 1 < args.length) {
+        const raw = args[++i];
+        const separator = raw.indexOf(":");
+        if (separator <= 0) {
+          throw new Error("--header must use Name:Value format");
+        }
+        headers[raw.slice(0, separator).trim()] = raw.slice(separator + 1).trim();
+      } else if (arg === "--call-timeout" && i + 1 < args.length) {
+        callTimeoutMs = Number(args[++i]);
+        if (!Number.isInteger(callTimeoutMs) || callTimeoutMs < 0) {
+          throw new Error("--call-timeout must be a non-negative integer");
+        }
+      } else if (arg === "--file" && i + 1 < args.length) {
+        filePath = args[++i];
+      } else if (arg === "--output-format" && i + 1 < args.length) {
+        const value = args[++i];
+        if (!isOutputFormat(value)) {
+          throw new Error("--output-format must be one of: json, toon, auto");
+        }
+        outputFormat = value;
+      } else if (arg.startsWith("--")) {
+        throw new Error(`Unknown call option "${arg}"`);
+      } else {
+        positionals.push(arg);
       }
-      headers[raw.slice(0, separator).trim()] = raw.slice(separator + 1).trim();
-    } else if (arg === "--call-timeout" && i + 1 < args.length) {
-      callTimeoutMs = Number(args[++i]);
-      if (!Number.isInteger(callTimeoutMs) || callTimeoutMs < 0) {
-        throw new Error("--call-timeout must be a non-negative integer");
-      }
-    } else if (arg === "--file" && i + 1 < args.length) {
-      filePath = args[++i];
-    } else if (arg === "--output-format" && i + 1 < args.length) {
-      const value = args[++i];
-      if (!isOutputFormat(value)) {
-        throw new Error("--output-format must be one of: json, toon, auto");
-      }
-      outputFormat = value;
-    } else if (arg.startsWith("--")) {
-      throw new Error(`Unknown call option "${arg}"`);
-    } else {
-      positionals.push(arg);
     }
+
+    if (positionals.length > 1) {
+      throw new Error("Usage: callmux call <tool> [json] — only one JSON payload argument is allowed");
+    }
+    if (positionals.length > 0 && filePath) {
+      throw new Error("Provide the JSON payload as an argument or via --file, not both");
+    }
+  } catch (error) {
+    console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 2;
+    return;
   }
 
-  if (positionals.length > 1) {
-    throw new Error("Usage: callmux call <tool> [json] — only one JSON payload argument is allowed");
+  let payloadText: string;
+  try {
+    payloadText = filePath
+      ? await readFile(resolve(filePath), "utf-8")
+      : (positionals[0] ?? "{}");
+  } catch (error) {
+    console.error(`Error: failed to read --file: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 2;
+    return;
   }
-  if (positionals.length > 0 && filePath) {
-    throw new Error("Provide the JSON payload as an argument or via --file, not both");
-  }
-
-  const payloadText = filePath
-    ? await readFile(resolve(filePath), "utf-8")
-    : (positionals[0] ?? "{}");
 
   let toolArgs: Record<string, unknown>;
   try {
@@ -976,9 +997,11 @@ async function handleCallCommand(args: string[]): Promise<void> {
     }
     toolArgs = parsed;
   } catch (error) {
-    throw new Error(
-      `Invalid JSON payload: ${error instanceof Error ? error.message : String(error)}`
+    console.error(
+      `Error: Invalid JSON payload: ${error instanceof Error ? error.message : String(error)}`
     );
+    process.exitCode = 2;
+    return;
   }
 
   const listenerUrl = url ?? `http://127.0.0.1:${DEFAULT_PORT}/mcp`;
@@ -991,7 +1014,7 @@ async function handleCallCommand(args: string[]): Promise<void> {
 
   if (!outcome.ok || !outcome.result) {
     console.error(`Error: ${outcome.error ?? "call failed"}`);
-    process.exitCode = 1;
+    process.exitCode = 2;
     return;
   }
 

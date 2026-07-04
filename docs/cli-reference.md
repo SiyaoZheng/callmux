@@ -105,7 +105,9 @@ callmux call github__create_issue --file payload.json --url http://localhost:486
 callmux call callmux_parallel '{"calls":[{"tool":"github__issue_read","arguments":{"number":1}}]}'
 ```
 
-Defaults to `http://127.0.0.1:4860/mcp` when `--url` is omitted. Non-zero exit code on a tool error (`isError: true`) or a transport/HTTP failure. Meta-tools (`callmux_parallel`, `callmux_batch`, `callmux_pipeline`, ...) are reachable the same way as proxied downstream tools.
+Defaults to `http://127.0.0.1:4860/mcp` when `--url` is omitted. Meta-tools (`callmux_parallel`, `callmux_batch`, `callmux_pipeline`, ...) are reachable the same way as proxied downstream tools.
+
+Exit codes: `0` success, `1` the downstream tool reported an error (`isError: true`), `2` a usage error (bad flag, invalid JSON payload, ...) or a transport/connection failure (listener unreachable, bad HTTP status, ...).
 
 ### Attach a Client
 
