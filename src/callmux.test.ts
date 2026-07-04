@@ -14360,3 +14360,233 @@ test("callmux call terminates its listener session instead of leaking it", async
     await rm(statusCwd, { recursive: true, force: true });
   }
 });
+
+// ─── `callmux parallel|batch|pipeline` sugar verbs ─────────────
+
+test("callmux parallel splits argv into a calls array and fans out via callmux_parallel", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "callmux-parallel-cwd-"));
+  const upstream = new UpstreamManager();
+  const cache = new CallCache(0, undefined, {}, 100);
+  let listener: CallmuxListener | undefined;
+
+  try {
+    const serverConfig = fakeMcpServer("fake", {
+      FAKE_MCP_TOOLS: JSON.stringify([{ name: "get_item", description: "Get a fake item" }]),
+    });
+    await upstream.connect({ fake: serverConfig });
+
+    listener = new CallmuxListener({
+      port: 0,
+      host: "127.0.0.1",
+      config: { servers: { fake: serverConfig } },
+      upstream,
+      cache,
+      allTools: [],
+      maxConcurrency: 10,
+    });
+    await listener.start();
+    const port = listenerPort(listener);
+
+    const { code, stdout, stderr } = await runCallmuxCli([
+      "parallel",
+      `fake__get_item ${JSON.stringify({ id: 1 })}`,
+      `fake__get_item ${JSON.stringify({ id: 2 })}`,
+      "--url", `http://127.0.0.1:${port}/mcp`,
+      "--cwd", cwd,
+    ]);
+
+    assert.equal(code, 0, stderr);
+    const payload = JSON.parse(stdout);
+    assert.equal(payload.status, "completed");
+    assert.equal(payload.succeeded, 2);
+    assert.equal(payload.failed, 0);
+  } finally {
+    await listener?.close();
+    await upstream.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("callmux batch splits argv into items for one tool via callmux_batch", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "callmux-batch-cwd-"));
+  const upstream = new UpstreamManager();
+  const cache = new CallCache(0, undefined, {}, 100);
+  let listener: CallmuxListener | undefined;
+
+  try {
+    const serverConfig = fakeMcpServer("fake", {
+      FAKE_MCP_TOOLS: JSON.stringify([{ name: "get_item", description: "Get a fake item" }]),
+    });
+    await upstream.connect({ fake: serverConfig });
+
+    listener = new CallmuxListener({
+      port: 0,
+      host: "127.0.0.1",
+      config: { servers: { fake: serverConfig } },
+      upstream,
+      cache,
+      allTools: [],
+      maxConcurrency: 10,
+    });
+    await listener.start();
+    const port = listenerPort(listener);
+
+    const { code, stdout, stderr } = await runCallmuxCli([
+      "batch",
+      `fake__get_item ${JSON.stringify({ id: 1 })}`,
+      `fake__get_item ${JSON.stringify({ id: 2 })}`,
+      `fake__get_item ${JSON.stringify({ id: 3 })}`,
+      "--url", `http://127.0.0.1:${port}/mcp`,
+      "--cwd", cwd,
+    ]);
+
+    assert.equal(code, 0, stderr);
+    const payload = JSON.parse(stdout);
+    assert.equal(payload.status, "completed");
+    assert.equal(payload.succeeded, 3);
+    assert.equal(payload.failed, 0);
+  } finally {
+    await listener?.close();
+    await upstream.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("callmux batch rejects mixed tools with a usage error (dumb sugar, not a DSL)", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "callmux-batch-mixed-"));
+  try {
+    const { code, stderr } = await runCallmuxCli([
+      "batch",
+      `fake__get_item ${JSON.stringify({ id: 1 })}`,
+      `fake__other_tool ${JSON.stringify({ id: 2 })}`,
+      "--cwd", cwd,
+    ]);
+
+    assert.equal(code, 2);
+    assert.match(stderr, /callmux batch applies one tool across many items/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("callmux pipeline splits argv into ordered steps via callmux_pipeline", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "callmux-pipeline-cwd-"));
+  const upstream = new UpstreamManager();
+  const cache = new CallCache(0, undefined, {}, 100);
+  let listener: CallmuxListener | undefined;
+
+  try {
+    const serverConfig = fakeMcpServer("fake", {
+      FAKE_MCP_TOOLS: JSON.stringify([{ name: "get_item", description: "Get a fake item" }]),
+    });
+    await upstream.connect({ fake: serverConfig });
+
+    listener = new CallmuxListener({
+      port: 0,
+      host: "127.0.0.1",
+      config: { servers: { fake: serverConfig } },
+      upstream,
+      cache,
+      allTools: [],
+      maxConcurrency: 10,
+    });
+    await listener.start();
+    const port = listenerPort(listener);
+
+    const { code, stdout, stderr } = await runCallmuxCli([
+      "pipeline",
+      `fake__get_item ${JSON.stringify({ id: 1 })}`,
+      `fake__get_item ${JSON.stringify({ id: 2 })}`,
+      "--url", `http://127.0.0.1:${port}/mcp`,
+      "--cwd", cwd,
+    ]);
+
+    assert.equal(code, 0, stderr);
+    const payload = JSON.parse(stdout);
+    assert.equal(payload.status, "completed");
+    assert.equal(payload.steps.length, 2);
+  } finally {
+    await listener?.close();
+    await upstream.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("callmux parallel --file reads the full callmux_parallel args from a file", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "callmux-parallel-file-"));
+  const upstream = new UpstreamManager();
+  const cache = new CallCache(0, undefined, {}, 100);
+  let listener: CallmuxListener | undefined;
+
+  try {
+    const serverConfig = fakeMcpServer("fake", {
+      FAKE_MCP_TOOLS: JSON.stringify([{ name: "get_item", description: "Get a fake item" }]),
+    });
+    await upstream.connect({ fake: serverConfig });
+
+    listener = new CallmuxListener({
+      port: 0,
+      host: "127.0.0.1",
+      config: { servers: { fake: serverConfig } },
+      upstream,
+      cache,
+      allTools: [],
+      maxConcurrency: 10,
+    });
+    await listener.start();
+    const port = listenerPort(listener);
+
+    const planPath = join(cwd, "plan.json");
+    await writeFile(
+      planPath,
+      JSON.stringify({
+        calls: [
+          { tool: "fake__get_item", arguments: { id: 1 } },
+          { tool: "fake__get_item", arguments: { id: 2 } },
+        ],
+      })
+    );
+
+    const { code, stdout, stderr } = await runCallmuxCli([
+      "parallel",
+      "--file", planPath,
+      "--url", `http://127.0.0.1:${port}/mcp`,
+      "--cwd", cwd,
+    ]);
+
+    assert.equal(code, 0, stderr);
+    const payload = JSON.parse(stdout);
+    assert.equal(payload.status, "completed");
+    assert.equal(payload.succeeded, 2);
+  } finally {
+    await listener?.close();
+    await upstream.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("callmux parallel rejects combining argv calls with --file", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "callmux-parallel-both-"));
+  try {
+    const planPath = join(cwd, "plan.json");
+    await writeFile(planPath, JSON.stringify({ calls: [] }));
+
+    const { code, stderr } = await runCallmuxCli([
+      "parallel",
+      `fake__get_item ${JSON.stringify({ id: 1 })}`,
+      "--file", planPath,
+      "--cwd", cwd,
+    ]);
+
+    assert.equal(code, 2);
+    assert.match(stderr, /not both/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("callmux pipeline with no calls and no --file prints usage and exits 2", async () => {
+  const { code, stderr } = await runCallmuxCli(["pipeline"]);
+  assert.equal(code, 2);
+  assert.match(stderr, /Usage: callmux pipeline/);
+});

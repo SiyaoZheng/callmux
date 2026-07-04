@@ -91,6 +91,12 @@ Usage:
   callmux call <tool> [json] [--file <path>] [--url <listener-url>]
                                               Call one tool against a running listener (tools/call)
                                               Exit codes: 1 = tool error, 2 = usage/transport error
+  callmux parallel '<tool> <argsJSON>' ... [--file <path>] [--url <listener-url>]
+                                              Sugar for callmux_parallel: fan out N tool calls
+  callmux batch '<tool> <argsJSON>' ... [--file <path>] [--url <listener-url>]
+                                              Sugar for callmux_batch: apply one tool across many items
+  callmux pipeline '<tool> <argsJSON>' ... [--file <path>] [--url <listener-url>]
+                                              Sugar for callmux_pipeline: chain tool calls in order
   callmux [options] -- <command> [args...]   Single-server mode
   callmux setup [--config <path>]            Interactive setup wizard
   callmux init [--config <path>] [--force]
@@ -150,6 +156,17 @@ Call Options:
   --file <path>         Read the JSON args payload from a file instead of the command line
   --call-timeout <ms>   Timeout for the forwarded tool call
   --output-format <fmt> Render the result as json, toon, or auto (default: json)
+
+Parallel/Batch/Pipeline Options:
+  Same options as Call Options above. Each '<tool> <argsJSON>' argument is
+  split on its FIRST space into a tool name and a JSON args object; the
+  resulting list is assembled into the calls/items/steps array expected by
+  callmux_parallel/_batch/_pipeline and forwarded as one tool call.
+  batch requires every argument to name the SAME tool (one tool, many items).
+  --file <path>         Read the full callmux_parallel/_batch/_pipeline args
+                         object from a file instead of building it from argv.
+                         Use this for anything beyond "list of tool + args"
+                         (per-call timeouts/cwd, pipeline inputMapping, etc).
 
 Daemon Options:
   --port <n>            Listener port for install (default: 4860)
@@ -282,6 +299,10 @@ Examples:
   callmux call github__search_issues '{"query":"is:open"}'
   callmux call callmux_parallel '{"calls":[{"tool":"github__issue_read","arguments":{"number":1}}]}'
   callmux call github__create_issue --file payload.json --url http://localhost:4860/mcp
+  callmux parallel 'github__issue_read {"number":1}' 'github__issue_read {"number":2}'
+  callmux batch 'github__issue_read {"number":1}' 'github__issue_read {"number":2}'
+  callmux pipeline 'github__issue_read {"number":1}' 'github__create_comment {"body":"ack"}'
+  callmux pipeline --file plan.json --url http://localhost:4860/mcp
   callmux --config callmux.json
   callmux --cache 60 -- node my-mcp-server.js
   callmux --cache 60 --cache-allow get_*,list_* -- npx -y @modelcontextprotocol/server-github
@@ -909,6 +930,111 @@ async function handleBridgeCommand(args: string[]): Promise<void> {
   await bridge.start(transport);
 }
 
+interface ListenerCallOptions {
+  url?: string;
+  cwd: string;
+  callTimeoutMs?: number;
+  filePath?: string;
+  outputFormat?: OutputFormat;
+  headers: Record<string, string>;
+  positionals: string[];
+}
+
+/**
+ * Parses the flags shared by `call`, `parallel`, `batch`, and `pipeline`
+ * (--url, --cwd, --header, --call-timeout, --file, --output-format),
+ * leaving positional (non-flag) arguments for the caller to interpret.
+ */
+function parseListenerCallOptions(args: string[], commandLabel: string): ListenerCallOptions {
+  let url: string | undefined;
+  let cwd = process.cwd();
+  let callTimeoutMs: number | undefined;
+  let filePath: string | undefined;
+  let outputFormat: OutputFormat | undefined;
+  const headers: Record<string, string> = {};
+  const positionals: string[] = [];
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--url" && i + 1 < args.length) {
+      url = args[++i];
+    } else if (arg === "--cwd" && i + 1 < args.length) {
+      cwd = resolve(args[++i]);
+    } else if (arg === "--header" && i + 1 < args.length) {
+      const raw = args[++i];
+      const separator = raw.indexOf(":");
+      if (separator <= 0) {
+        throw new Error("--header must use Name:Value format");
+      }
+      headers[raw.slice(0, separator).trim()] = raw.slice(separator + 1).trim();
+    } else if (arg === "--call-timeout" && i + 1 < args.length) {
+      callTimeoutMs = Number(args[++i]);
+      if (!Number.isInteger(callTimeoutMs) || callTimeoutMs < 0) {
+        throw new Error("--call-timeout must be a non-negative integer");
+      }
+    } else if (arg === "--file" && i + 1 < args.length) {
+      filePath = args[++i];
+    } else if (arg === "--output-format" && i + 1 < args.length) {
+      const value = args[++i];
+      if (!isOutputFormat(value)) {
+        throw new Error("--output-format must be one of: json, toon, auto");
+      }
+      outputFormat = value;
+    } else if (arg.startsWith("--")) {
+      throw new Error(`Unknown ${commandLabel} option "${arg}"`);
+    } else {
+      positionals.push(arg);
+    }
+  }
+
+  return { url, cwd, callTimeoutMs, filePath, outputFormat, headers, positionals };
+}
+
+async function readJsonObjectPayload(source: string, label: string): Promise<Record<string, unknown>> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(source);
+  } catch (error) {
+    throw new Error(`Invalid JSON ${label}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`${label} must be a JSON object`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+/**
+ * Calls a tool on a running listener and prints/exits like the `call` CLI
+ * verb: exit 1 when the downstream tool reports an error, exit 2 on
+ * usage/transport failure.
+ */
+async function runListenerToolCall(
+  toolName: string,
+  toolArgs: Record<string, unknown>,
+  options: Pick<ListenerCallOptions, "url" | "cwd" | "callTimeoutMs" | "outputFormat" | "headers">
+): Promise<void> {
+  const listenerUrl = options.url ?? `http://127.0.0.1:${DEFAULT_PORT}/mcp`;
+
+  const outcome = await callListenerTool(listenerUrl, toolName, toolArgs, {
+    cwd: options.cwd,
+    ...(Object.keys(options.headers).length > 0 ? { headers: options.headers } : {}),
+    ...(options.callTimeoutMs !== undefined ? { timeoutMs: options.callTimeoutMs } : {}),
+  });
+
+  if (!outcome.ok || !outcome.result) {
+    console.error(`Error: ${outcome.error ?? "call failed"}`);
+    process.exitCode = 2;
+    return;
+  }
+
+  const payload = extractListenerToolPayload(outcome.result);
+  console.log(formatToolText(payload, { format: options.outputFormat }));
+
+  if (outcome.result.isError) {
+    process.exitCode = 1;
+  }
+}
+
 /**
  * Exit codes: 1 = the downstream tool reported an error (`isError: true`).
  * 2 = usage error or transport/connection failure (couldn't reach the
@@ -924,52 +1050,13 @@ async function handleCallCommand(args: string[]): Promise<void> {
     return;
   }
 
-  let url: string | undefined;
-  let cwd = process.cwd();
-  let callTimeoutMs: number | undefined;
-  let filePath: string | undefined;
-  let outputFormat: OutputFormat | undefined;
-  const headers: Record<string, string> = {};
-  const positionals: string[] = [];
-
+  let options: ListenerCallOptions;
   try {
-    for (let i = 1; i < args.length; i++) {
-      const arg = args[i];
-      if (arg === "--url" && i + 1 < args.length) {
-        url = args[++i];
-      } else if (arg === "--cwd" && i + 1 < args.length) {
-        cwd = resolve(args[++i]);
-      } else if (arg === "--header" && i + 1 < args.length) {
-        const raw = args[++i];
-        const separator = raw.indexOf(":");
-        if (separator <= 0) {
-          throw new Error("--header must use Name:Value format");
-        }
-        headers[raw.slice(0, separator).trim()] = raw.slice(separator + 1).trim();
-      } else if (arg === "--call-timeout" && i + 1 < args.length) {
-        callTimeoutMs = Number(args[++i]);
-        if (!Number.isInteger(callTimeoutMs) || callTimeoutMs < 0) {
-          throw new Error("--call-timeout must be a non-negative integer");
-        }
-      } else if (arg === "--file" && i + 1 < args.length) {
-        filePath = args[++i];
-      } else if (arg === "--output-format" && i + 1 < args.length) {
-        const value = args[++i];
-        if (!isOutputFormat(value)) {
-          throw new Error("--output-format must be one of: json, toon, auto");
-        }
-        outputFormat = value;
-      } else if (arg.startsWith("--")) {
-        throw new Error(`Unknown call option "${arg}"`);
-      } else {
-        positionals.push(arg);
-      }
-    }
-
-    if (positionals.length > 1) {
+    options = parseListenerCallOptions(args.slice(1), "call");
+    if (options.positionals.length > 1) {
       throw new Error("Usage: callmux call <tool> [json] — only one JSON payload argument is allowed");
     }
-    if (positionals.length > 0 && filePath) {
+    if (options.positionals.length > 0 && options.filePath) {
       throw new Error("Provide the JSON payload as an argument or via --file, not both");
     }
   } catch (error) {
@@ -980,9 +1067,9 @@ async function handleCallCommand(args: string[]): Promise<void> {
 
   let payloadText: string;
   try {
-    payloadText = filePath
-      ? await readFile(resolve(filePath), "utf-8")
-      : (positionals[0] ?? "{}");
+    payloadText = options.filePath
+      ? await readFile(resolve(options.filePath), "utf-8")
+      : (options.positionals[0] ?? "{}");
   } catch (error) {
     console.error(`Error: failed to read --file: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 2;
@@ -991,39 +1078,124 @@ async function handleCallCommand(args: string[]): Promise<void> {
 
   let toolArgs: Record<string, unknown>;
   try {
-    const parsed = JSON.parse(payloadText);
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new Error("payload must be a JSON object");
-    }
-    toolArgs = parsed;
+    toolArgs = await readJsonObjectPayload(payloadText, "payload");
   } catch (error) {
-    console.error(
-      `Error: Invalid JSON payload: ${error instanceof Error ? error.message : String(error)}`
-    );
+    console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 2;
     return;
   }
 
-  const listenerUrl = url ?? `http://127.0.0.1:${DEFAULT_PORT}/mcp`;
+  await runListenerToolCall(toolName, toolArgs, options);
+}
 
-  const outcome = await callListenerTool(listenerUrl, toolName, toolArgs, {
-    cwd,
-    ...(Object.keys(headers).length > 0 ? { headers } : {}),
-    ...(callTimeoutMs !== undefined ? { timeoutMs: callTimeoutMs } : {}),
+type MetaSugarVerb = "parallel" | "batch" | "pipeline";
+
+const META_SUGAR_TOOL: Record<MetaSugarVerb, string> = {
+  parallel: "callmux_parallel",
+  batch: "callmux_batch",
+  pipeline: "callmux_pipeline",
+};
+
+function metaSugarUsage(verb: MetaSugarVerb): string {
+  return (
+    `Usage: callmux ${verb} '<tool> <argsJSON>' ['<tool> <argsJSON>' ...] [--file <path>] ` +
+    "[--url <listener-url>] [--cwd <path>] [--header Name:Value] [--call-timeout <ms>] [--output-format json|toon|auto]"
+  );
+}
+
+/**
+ * Splits each `<tool> <argsJSON>` argument on its FIRST space into a tool
+ * name and a JSON payload. This is intentionally dumb argv->JSON sugar —
+ * anything more structured than "list of tool + args" belongs in --file.
+ */
+function parseMetaSugarEntries(
+  entries: string[]
+): Array<{ tool: string; arguments: Record<string, unknown> }> {
+  return entries.map((entry) => {
+    const spaceIndex = entry.indexOf(" ");
+    const tool = spaceIndex === -1 ? entry : entry.slice(0, spaceIndex);
+    const jsonText = spaceIndex === -1 ? "{}" : entry.slice(spaceIndex + 1).trim() || "{}";
+    if (!tool) {
+      throw new Error(`Invalid call "${entry}" — expected "<tool> <argsJSON>"`);
+    }
+    let parsed: Record<string, unknown>;
+    try {
+      const candidate = JSON.parse(jsonText);
+      if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) {
+        throw new Error("args payload must be a JSON object");
+      }
+      parsed = candidate;
+    } catch (error) {
+      throw new Error(
+        `Invalid JSON args for tool "${tool}": ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    return { tool, arguments: parsed };
   });
+}
 
-  if (!outcome.ok || !outcome.result) {
-    console.error(`Error: ${outcome.error ?? "call failed"}`);
+function buildMetaSugarToolArgs(
+  verb: MetaSugarVerb,
+  entries: Array<{ tool: string; arguments: Record<string, unknown> }>
+): Record<string, unknown> {
+  if (verb === "parallel") {
+    return { calls: entries.map(({ tool, arguments: toolArguments }) => ({ tool, arguments: toolArguments })) };
+  }
+  if (verb === "pipeline") {
+    return { steps: entries.map(({ tool, arguments: toolArguments }) => ({ tool, arguments: toolArguments })) };
+  }
+
+  const tool = entries[0]?.tool;
+  for (const entry of entries) {
+    if (entry.tool !== tool) {
+      throw new Error(
+        `callmux batch applies one tool across many items — got both "${tool}" and "${entry.tool}". ` +
+          "Use --file for plans that call different tools."
+      );
+    }
+  }
+  return {
+    tool,
+    items: entries.map(({ arguments: toolArguments }) => ({ arguments: toolArguments })),
+  };
+}
+
+/**
+ * `callmux parallel|batch|pipeline '<tool> <argsJSON>' ...` — pure argv->JSON
+ * sugar that assembles the same request shape callmux_parallel/_batch/_pipeline
+ * expect and forwards it through the same callListenerTool path as `call`.
+ */
+async function handleMetaSugarCommand(verb: MetaSugarVerb, args: string[]): Promise<void> {
+  let options: ListenerCallOptions;
+  try {
+    options = parseListenerCallOptions(args, verb);
+    if (options.positionals.length > 0 && options.filePath) {
+      throw new Error("Provide calls as arguments or via --file, not both");
+    }
+    if (options.positionals.length === 0 && !options.filePath) {
+      throw new Error(metaSugarUsage(verb));
+    }
+  } catch (error) {
+    console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 2;
     return;
   }
 
-  const payload = extractListenerToolPayload(outcome.result);
-  console.log(formatToolText(payload, { format: outputFormat }));
-
-  if (outcome.result.isError) {
-    process.exitCode = 1;
+  let toolArgs: Record<string, unknown>;
+  try {
+    if (options.filePath) {
+      const payloadText = await readFile(resolve(options.filePath), "utf-8");
+      toolArgs = await readJsonObjectPayload(payloadText, "payload");
+    } else {
+      toolArgs = buildMetaSugarToolArgs(verb, parseMetaSugarEntries(options.positionals));
+    }
+  } catch (error) {
+    console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 2;
+    return;
   }
+
+  await runListenerToolCall(META_SUGAR_TOOL[verb], toolArgs, options);
 }
 
 function handleInstructionsCommand(args: string[]): void {
@@ -1279,6 +1451,11 @@ async function main(): Promise<void> {
 
   if (args[0] === "call") {
     await handleCallCommand(args.slice(1));
+    return;
+  }
+
+  if (args[0] === "parallel" || args[0] === "batch" || args[0] === "pipeline") {
+    await handleMetaSugarCommand(args[0], args.slice(1));
     return;
   }
 
