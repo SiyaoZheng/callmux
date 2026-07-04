@@ -4,6 +4,7 @@ import { listenerUrls, parseHttpBody } from "./doctor.js";
 const MCP_ACCEPT_HEADER = "application/json, text/event-stream";
 const MCP_PROTOCOL_VERSION = "2025-11-25";
 const CWD_HEADER = "x-callmux-cwd";
+const CLIENT_HEADER = "x-callmux-client";
 const CLIENT_INFO = { name: "callmux-cli", version: "1.0" };
 const INITIALIZE_ID = 1;
 const REQUEST_ID = 2;
@@ -62,6 +63,7 @@ export async function listenerRequest(
     ...baseHeaders,
     "Content-Type": "application/json",
     Accept: MCP_ACCEPT_HEADER,
+    [CLIENT_HEADER]: "cli",
     ...(options.cwd ? { [CWD_HEADER]: options.cwd } : {}),
   };
   const signal = options.timeoutMs !== undefined ? AbortSignal.timeout(options.timeoutMs) : undefined;

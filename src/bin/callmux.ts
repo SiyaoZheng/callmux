@@ -58,7 +58,16 @@ import {
   type DaemonScope,
 } from "../daemon.js";
 import { callListenerTool, extractListenerToolPayload, listenerRequest } from "../listener-client.js";
-import { getManagedClientTokenPath, resolveClientToken, withBearerToken, writeManagedClientToken } from "../cli-auth.js";
+import {
+  describeClientTokenSource,
+  getManagedClientTokenPath,
+  resolveClientToken,
+  resolveClientTokenDetailed,
+  withBearerToken,
+  writeManagedClientToken,
+  type ClientTokenSources,
+  type ResolvedClientToken,
+} from "../cli-auth.js";
 import { formatToolText, isOutputFormat, type OutputFormat } from "../output-format.js";
 import { runSetup } from "../setup.js";
 import {
@@ -170,6 +179,8 @@ Call Options:
                          env > --token > --token-file > managed store. Loopback
                          daemons need no token.
   --token-file <path>   Read the bearer token from a file (keeps it out of ps/history)
+  --verbose             Print the listener URL and token source tier to stderr before calling
+  Exit codes: 1 = the downstream tool reported an error, 2 = usage/transport error.
 
 Parallel/Batch/Pipeline Options:
   Same options as Call Options above. Each '<tool> <argsJSON>' argument is
@@ -191,6 +202,9 @@ Tools Options:
   --token <t>           Client->callmux bearer token (see Call Options precedence)
   --token-file <path>   Read the bearer token from a file (keeps it out of ps/history)
   --json                Machine-readable output instead of the human-readable default
+  --quiet               Suppress the "no tools found" message on an empty result (list/search)
+  --verbose             Print the listener URL and token source tier to stderr before calling
+  Exit codes: 2 = usage/transport error (tools/list has no per-tool "error" result to report as 1).
 
 Daemon Options:
   --port <n>            Listener port for install (default: 4860)
@@ -709,13 +723,16 @@ async function handleClientMutation(
         ? `Remove mcpServers.${name}`
         : `Remove CALLMUX-managed [mcp_servers.${name}] block`;
 
-  // Resolve the CLI token straight from the flags (env: "" skips the env var so
-  // this reflects exactly what the user passed) so one `attach` can stash the
-  // client -> callmux bearer alongside the MCP client entry.
+  // Resolve the CLI token straight from the flags (env: "" skips the env var,
+  // skipManagedStore skips reading back what we're about to write) so this
+  // reflects exactly what the user passed this run — an `attach --yes` with no
+  // token flags stashes nothing instead of silently re-writing the existing
+  // managed token and reporting it as freshly "Stashed".
   const attachToken =
     action === "attach"
       ? await resolveClientToken({
           env: "",
+          skipManagedStore: true,
           ...(token !== undefined ? { token } : {}),
           ...(tokenFile !== undefined ? { tokenFile } : {}),
         })
@@ -1018,8 +1035,21 @@ interface ListenerCallOptions {
   headers: Record<string, string>;
   token?: string;
   tokenFile?: string;
+  verbose?: boolean;
   positionals: string[];
 }
+
+/** Value-taking flags for `call`/`parallel`/`batch`/`pipeline` — a bare trailing flag names itself instead of reading as "unknown option". */
+const LISTENER_CALL_VALUE_FLAGS = new Set([
+  "--url",
+  "--cwd",
+  "--header",
+  "--call-timeout",
+  "--file",
+  "--token",
+  "--token-file",
+  "--output-format",
+]);
 
 /**
  * Parses the flags shared by `call`, `parallel`, `batch`, and `pipeline`
@@ -1035,6 +1065,7 @@ function parseListenerCallOptions(args: string[], commandLabel: string): Listene
   let outputFormat: OutputFormat | undefined;
   let token: string | undefined;
   let tokenFile: string | undefined;
+  let verbose = false;
   const headers: Record<string, string> = {};
   const positionals: string[] = [];
 
@@ -1044,6 +1075,8 @@ function parseListenerCallOptions(args: string[], commandLabel: string): Listene
       url = args[++i];
     } else if (arg === "--cwd" && i + 1 < args.length) {
       cwd = resolve(args[++i]);
+    } else if (arg === "--verbose") {
+      verbose = true;
     } else if (arg === "--header" && i + 1 < args.length) {
       const raw = args[++i];
       const separator = raw.indexOf(":");
@@ -1069,13 +1102,16 @@ function parseListenerCallOptions(args: string[], commandLabel: string): Listene
       }
       outputFormat = value;
     } else if (arg.startsWith("--")) {
+      if (LISTENER_CALL_VALUE_FLAGS.has(arg)) {
+        throw new Error(`missing value for ${arg}`);
+      }
       throw new Error(`Unknown ${commandLabel} option "${arg}"`);
     } else {
       positionals.push(arg);
     }
   }
 
-  return { url, cwd, callTimeoutMs, filePath, outputFormat, headers, token, tokenFile, positionals };
+  return { url, cwd, callTimeoutMs, filePath, outputFormat, headers, token, tokenFile, verbose, positionals };
 }
 
 async function readJsonObjectPayload(source: string, label: string): Promise<Record<string, unknown>> {
@@ -1092,6 +1128,32 @@ async function readJsonObjectPayload(source: string, label: string): Promise<Rec
 }
 
 /**
+ * On a 401, name which precedence tier actually sent the token (env/flag/
+ * token-file/managed-store/none) so a stale `CALLMUX_TOKEN` env var beating a
+ * correct `--token` flag doesn't read as an unexplained bare "HTTP 401".
+ */
+function describeListenerCallError(
+  error: string | undefined,
+  httpStatus: number | undefined,
+  resolvedToken: ResolvedClientToken,
+  tokenSources: ClientTokenSources
+): string {
+  const base = error ?? "call failed";
+  if (httpStatus !== 401) return base;
+  return `${base} (${describeClientTokenSource(resolvedToken, tokenSources)})`;
+}
+
+/** `--verbose` diagnostic line: which listener and token tier a request is about to use. */
+function logVerboseListenerRequest(
+  label: string,
+  listenerUrl: string,
+  resolvedToken: ResolvedClientToken,
+  tokenSources: ClientTokenSources
+): void {
+  console.error(`[callmux] ${label} ${listenerUrl} (${describeClientTokenSource(resolvedToken, tokenSources)})`);
+}
+
+/**
  * Calls a tool on a running listener and prints/exits like the `call` CLI
  * verb: exit 1 when the downstream tool reports an error, exit 2 on
  * usage/transport failure.
@@ -1099,15 +1161,19 @@ async function readJsonObjectPayload(source: string, label: string): Promise<Rec
 async function runListenerToolCall(
   toolName: string,
   toolArgs: Record<string, unknown>,
-  options: Pick<ListenerCallOptions, "url" | "cwd" | "callTimeoutMs" | "outputFormat" | "headers" | "token" | "tokenFile">
+  options: Pick<ListenerCallOptions, "url" | "cwd" | "callTimeoutMs" | "outputFormat" | "headers" | "token" | "tokenFile" | "verbose">
 ): Promise<void> {
   const listenerUrl = options.url ?? `http://127.0.0.1:${DEFAULT_PORT}/mcp`;
 
-  const token = await resolveClientToken({
+  const tokenSources: ClientTokenSources = {
     ...(options.token !== undefined ? { token: options.token } : {}),
     ...(options.tokenFile !== undefined ? { tokenFile: options.tokenFile } : {}),
-  });
-  const headers = withBearerToken(options.headers, token);
+  };
+  const resolvedToken = await resolveClientTokenDetailed(tokenSources);
+  const headers = withBearerToken(options.headers, resolvedToken.token);
+  if (options.verbose) {
+    logVerboseListenerRequest(`tools/call ${toolName} via`, listenerUrl, resolvedToken, tokenSources);
+  }
 
   const outcome = await callListenerTool(listenerUrl, toolName, toolArgs, {
     cwd: options.cwd,
@@ -1116,7 +1182,9 @@ async function runListenerToolCall(
   });
 
   if (!outcome.ok || !outcome.result) {
-    console.error(`Error: ${outcome.error ?? "call failed"}`);
+    console.error(
+      `Error: ${describeListenerCallError(outcome.error, outcome.httpStatus, resolvedToken, tokenSources)}`
+    );
     process.exitCode = 2;
     return;
   }
@@ -1303,12 +1371,25 @@ interface ToolsCommandOptions {
   token?: string;
   tokenFile?: string;
   json: boolean;
+  quiet: boolean;
+  verbose: boolean;
   positionals: string[];
 }
 
 function isRecordValue(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
+
+/** Value-taking flags for `tools list|schema|search` — a bare trailing flag names itself instead of reading as "unknown option". */
+const TOOLS_COMMAND_VALUE_FLAGS = new Set([
+  "--url",
+  "--cwd",
+  "--server",
+  "--header",
+  "--call-timeout",
+  "--token",
+  "--token-file",
+]);
 
 /**
  * Shared flag parsing for `callmux tools list|schema|search` — all three
@@ -1322,6 +1403,8 @@ function parseToolsCommandArgs(args: string[]): ToolsCommandOptions | { error: s
   let token: string | undefined;
   let tokenFile: string | undefined;
   let json = false;
+  let quiet = false;
+  let verbose = false;
   const headers: Record<string, string> = {};
   const positionals: string[] = [];
 
@@ -1333,6 +1416,10 @@ function parseToolsCommandArgs(args: string[]): ToolsCommandOptions | { error: s
       cwd = resolve(args[++i]);
     } else if (arg === "--server" && i + 1 < args.length) {
       server = args[++i];
+    } else if (arg === "--quiet") {
+      quiet = true;
+    } else if (arg === "--verbose") {
+      verbose = true;
     } else if (arg === "--header" && i + 1 < args.length) {
       const raw = args[++i];
       const separator = raw.indexOf(":");
@@ -1352,6 +1439,9 @@ function parseToolsCommandArgs(args: string[]): ToolsCommandOptions | { error: s
     } else if (arg === "--json") {
       json = true;
     } else if (arg.startsWith("--")) {
+      if (TOOLS_COMMAND_VALUE_FLAGS.has(arg)) {
+        return { error: `missing value for ${arg}` };
+      }
       return { error: `Unknown tools option "${arg}"` };
     } else {
       positionals.push(arg);
@@ -1367,6 +1457,8 @@ function parseToolsCommandArgs(args: string[]): ToolsCommandOptions | { error: s
     ...(token !== undefined ? { token } : {}),
     ...(tokenFile !== undefined ? { tokenFile } : {}),
     json,
+    quiet,
+    verbose,
     positionals,
   };
 }
@@ -1374,11 +1466,15 @@ function parseToolsCommandArgs(args: string[]): ToolsCommandOptions | { error: s
 async function fetchToolList(
   options: ToolsCommandOptions
 ): Promise<Tool[] | { error: string }> {
-  const token = await resolveClientToken({
+  const tokenSources: ClientTokenSources = {
     ...(options.token !== undefined ? { token: options.token } : {}),
     ...(options.tokenFile !== undefined ? { tokenFile: options.tokenFile } : {}),
-  });
-  const headers = withBearerToken(options.headers, token);
+  };
+  const resolvedToken = await resolveClientTokenDetailed(tokenSources);
+  const headers = withBearerToken(options.headers, resolvedToken.token);
+  if (options.verbose) {
+    logVerboseListenerRequest("tools/list via", options.url, resolvedToken, tokenSources);
+  }
 
   const outcome = await listenerRequest(options.url, "tools/list", {}, {
     cwd: options.cwd,
@@ -1387,7 +1483,9 @@ async function fetchToolList(
   });
 
   if (!outcome.ok) {
-    return { error: outcome.error ?? "tools/list failed" };
+    return {
+      error: describeListenerCallError(outcome.error ?? "tools/list failed", outcome.httpStatus, resolvedToken, tokenSources),
+    };
   }
 
   const tools =
@@ -1414,7 +1512,12 @@ function oneLineToolDescription(description: unknown): string | undefined {
     : firstLine;
 }
 
-function printToolSummaries(tools: Tool[], json: boolean, emptyMessage: string): void {
+function printToolSummaries(
+  tools: Tool[],
+  json: boolean,
+  emptyMessage: string,
+  quiet = false
+): void {
   const summaries = tools.map((tool) => ({
     name: tool.name,
     description: oneLineToolDescription(tool.description),
@@ -1426,7 +1529,9 @@ function printToolSummaries(tools: Tool[], json: boolean, emptyMessage: string):
   }
 
   if (summaries.length === 0) {
-    console.log(emptyMessage);
+    // --quiet drops the human "nothing found" sentence so scripts parsing
+    // stdout see truly empty output instead of a line they'd have to filter.
+    if (!quiet) console.log(emptyMessage);
     return;
   }
 
@@ -1470,7 +1575,8 @@ async function handleToolsListCommand(args: string[]): Promise<void> {
   printToolSummaries(
     filtered,
     parsed.json,
-    parsed.server ? `No tools found for server "${parsed.server}".` : "No tools available."
+    parsed.server ? `No tools found for server "${parsed.server}".` : "No tools available.",
+    parsed.quiet
   );
 }
 
@@ -1545,7 +1651,7 @@ async function handleToolsSearchCommand(args: string[]): Promise<void> {
       (typeof tool.description === "string" && tool.description.toLowerCase().includes(needle))
   );
 
-  printToolSummaries(matches, parsed.json, `No tools matched "${query}".`);
+  printToolSummaries(matches, parsed.json, `No tools matched "${query}".`, parsed.quiet);
 }
 
 async function handleToolsCommand(args: string[]): Promise<void> {

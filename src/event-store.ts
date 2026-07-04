@@ -42,6 +42,8 @@ export interface EventStoreCallSample {
   targetTool?: string;
   sessionId?: string;
   principal?: string;
+  /** How the calling client reached the listener: the `callmux` CLI verbs vs any MCP client */
+  transport?: "cli" | "mcp";
   durationMs: number;
   ok: boolean;
   status?: string;
@@ -87,6 +89,7 @@ interface EventStoreDrilldown {
   byServer: EventStoreBreakdownRow[];
   byTool: EventStoreBreakdownRow[];
   bySession: EventStoreBreakdownRow[];
+  byTransport: EventStoreBreakdownRow[];
   forwardedHeaders: EventStoreForwardedHeaderRow[];
 }
 
@@ -104,6 +107,7 @@ CREATE TABLE IF NOT EXISTS call_events (
   target_tool TEXT,
   session_id TEXT,
   principal TEXT,
+  transport TEXT,
   duration_ms INTEGER NOT NULL,
   ok INTEGER NOT NULL,
   status TEXT,
@@ -197,6 +201,7 @@ export class EventStore {
   private readonly serverBreakdownStmt: StatementSync;
   private readonly toolBreakdownStmt: StatementSync;
   private readonly sessionBreakdownStmt: StatementSync;
+  private readonly transportBreakdownStmt: StatementSync;
   private readonly forwardedHeaderStmt: StatementSync;
 
   constructor(options: EventStoreOptions, Database: DatabaseSyncConstructor) {
@@ -207,12 +212,13 @@ export class EventStore {
     this.now = options.now ?? Date.now;
     this.db = new Database(options.path);
     this.db.exec(SCHEMA_SQL);
+    this.migrateTransportColumn();
     this.insertEvent = this.db.prepare(`
       INSERT INTO call_events (
-        ts_ms, ts, server, tool, target_tool, session_id, principal, duration_ms,
+        ts_ms, ts, server, tool, target_tool, session_id, principal, transport, duration_ms,
         ok, status, error_class, bytes_in, bytes_out, cache_hit, tool_kind,
         operation, downstream_calls
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     this.insertTarget = this.db.prepare(`
       INSERT INTO call_event_targets (event_id, server, tool, count)
@@ -300,6 +306,21 @@ export class EventStore {
       ORDER BY calls DESC, name ASC
       LIMIT ?
     `);
+    this.transportBreakdownStmt = this.db.prepare(`
+      SELECT
+        COALESCE(NULLIF(transport, ''), 'mcp') AS name,
+        COUNT(*) AS calls,
+        COALESCE(SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END), 0) AS errors,
+        COALESCE(ROUND(AVG(duration_ms)), 0) AS avgDurationMs,
+        COALESCE(SUM(bytes_in), 0) AS bytesIn,
+        COALESCE(SUM(bytes_out), 0) AS bytesOut,
+        MAX(ts) AS lastCallAt
+      FROM call_events
+      WHERE ts_ms >= ? AND ts_ms <= ?
+      GROUP BY COALESCE(NULLIF(transport, ''), 'mcp')
+      ORDER BY calls DESC, name ASC
+      LIMIT ?
+    `);
     this.forwardedHeaderStmt = this.db.prepare(`
       SELECT
         server,
@@ -315,6 +336,15 @@ export class EventStore {
       ORDER BY calls DESC, lastSeenAt DESC
       LIMIT ?
     `);
+  }
+
+  /** `CREATE TABLE IF NOT EXISTS` doesn't add columns to a table that already existed on disk. */
+  private migrateTransportColumn(): void {
+    const columns = this.db.prepare("PRAGMA table_info(call_events)").all();
+    const hasTransport = columns.some((column) => column.name === "transport");
+    if (!hasTransport) {
+      this.db.exec("ALTER TABLE call_events ADD COLUMN transport TEXT");
+    }
   }
 
   recordCall(sample: EventStoreCallSample): void {
@@ -335,6 +365,7 @@ export class EventStore {
         sample.targetTool ?? null,
         sample.sessionId ?? null,
         sample.principal ?? null,
+        sample.transport ?? null,
         integerOr(sample.durationMs),
         sample.ok ? 1 : 0,
         sample.status ?? null,
@@ -397,6 +428,7 @@ export class EventStore {
       byServer: this.serverBreakdownStmt.all(fromMs, toMs, limit).map(rowToBreakdown),
       byTool: this.toolBreakdownStmt.all(fromMs, toMs, limit).map(rowToBreakdown),
       bySession: this.sessionBreakdownStmt.all(fromMs, toMs, limit).map(rowToBreakdown),
+      byTransport: this.transportBreakdownStmt.all(fromMs, toMs, limit).map(rowToBreakdown),
       forwardedHeaders: this.forwardedHeaderStmt.all(fromMs, toMs, limit).map((row) => ({
         server: textOr(row.server),
         tool: textOr(row.tool),

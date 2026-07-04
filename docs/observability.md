@@ -35,9 +35,12 @@ Each completed top-level tool call records:
 - timestamp
 - requested tool, target tool, downstream server targets
 - session id and authenticated principal when available
+- transport: `cli` for calls made through the `callmux call`/`tools`/`parallel`/`batch`/`pipeline` CLI verbs, `mcp` for any MCP client (including the stdio bridge)
 - duration, status, error class, cache hit
 - approximate JSON bytes in and out
 - call kind and downstream fan-out count
+
+CLI and MCP traffic share the same authentication, authorization, and event-store recording path — a `callmux call` against an auth'd daemon carries the same principal an equivalent MCP tool call would. The `transport` tag is the only thing that tells them apart; use it to see whether a team is offloading long-tail tool usage to the CLI as intended.
 
 Tool arguments and raw tool results are not stored in the event store.
 
@@ -72,5 +75,7 @@ curl http://localhost:4860/dashboard/drilldown?range=1h
 ```
 
 Supported ranges match the existing dashboard charts: `1h`, `today`, `yesterday`, `7d`, and `30d`.
+
+The response includes a `byTransport` breakdown (alongside `byServer`/`byTool`/`bySession`) with one row per `cli`/`mcp` transport tag, so `cli` traffic showing up there is exactly how you confirm CLI calls are flowing through the same audit trail as MCP calls.
 
 [< Back to README](../README.md)

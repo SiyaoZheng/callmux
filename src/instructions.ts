@@ -30,6 +30,9 @@ export function renderAgentInstructions(
     "- If a response is shielded/truncated, follow `_callmux.retrieval` with `callmux_get_result` to page/filter/project the stored result.",
     "- Use `outputFormat: \"toon\"` or `\"auto\"` on large tabular meta-tool outputs when model-facing JSON is too verbose.",
     "- Prefer `callmux_search_tools` or `callmux_status` to discover wrapped tools instead of guessing names.",
+    "- Long-tail tools you rarely need: use the `callmux` CLI (`call`, `tools list/schema/search`, `parallel`/`batch`/`pipeline`) so their schemas never load into context; keep hot/frequent tools on this MCP connection for structured results and richer error detail.",
+    "- Downstream secrets (API tokens, env vars) live only in the callmux server config; neither MCP nor CLI callers ever see them, only tool names, arguments, and results.",
+    "- Authorization is enforced per tool on the server for both transports — a denied call returns the same `authorization_denied` error over MCP or the CLI.",
   ];
 
   if (mode === "meta-only") {

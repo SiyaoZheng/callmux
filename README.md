@@ -150,6 +150,22 @@ callmux daemon install --start --enable
 
 [Full guide ->](docs/shared-server.md)
 
+### CLI: Call Tools Without an MCP Session
+
+Every tool callmux exposes is also reachable straight from the shell — no MCP client, no persistent session. `callmux call <tool> '<argsJSON>'`, `callmux tools list/schema/search`, and the `parallel`/`batch`/`pipeline` sugar verbs talk to a running listener the same way an MCP client does, over the same `tools/call` path.
+
+```bash
+callmux call github__search_issues '{"query":"is:open"}'
+callmux tools search issue
+callmux parallel 'github__issue_read {"number":1}' 'github__issue_read {"number":2}'
+```
+
+**When to reach for the CLI vs the MCP connection:** tools you use once or rarely (long-tail) are cheaper via the CLI — their schemas never load into the agent's context window, since `tools schema <tool>` fetches one schema on demand instead of every tool definition riding along on every turn. Tools you call repeatedly in a session (hot tools) belong on the MCP connection, where structured results, per-tool permission granularity, and richer error detail are already wired up. Use both in the same session — they're not exclusive.
+
+CLI and MCP traffic are one audit trail, not two: both flow through the same authentication, per-tool authorization, and SQLite event store, tagged with a `transport` of `cli` or `mcp` so `/dashboard/drilldown` can tell them apart. Downstream secrets (API tokens, env vars) never leave the daemon config either way — the CLI only ever presents a client→callmux bearer token, never a downstream credential. `callmux client attach <claude|codex> --token <t> --yes` wires that bearer into the managed CLI token store in the same step it writes the MCP client entry, so one `attach` authenticates both.
+
+[Full guide ->](docs/cli-reference.md)
+
 ### Library API for Embedders
 
 Embed callmux in-process when another supervisor owns the service lifecycle. The package exports a `createListener()` helper that builds the proxy runtime, starts the shared listener, reports structured health, emits status snapshots, and supports programmatic reloads. The `callmux bridge --url --cwd` stdio entrypoint remains the stable per-session bridge for clients that need stdio MCP.

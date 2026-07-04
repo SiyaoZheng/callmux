@@ -21,6 +21,7 @@ test("event store records call rows and drill-down breakdowns", async () => {
       targetTool: "issue_read",
       sessionId: "session-a",
       principal: "bearer:ops",
+      transport: "cli",
       durationMs: 25,
       ok: true,
       status: "ok",
@@ -39,6 +40,7 @@ test("event store records call rows and drill-down breakdowns", async () => {
       targetTool: "issue_write",
       sessionId: "session-a",
       principal: "bearer:ops",
+      transport: "mcp",
       durationMs: 75,
       ok: false,
       status: "error",
@@ -61,6 +63,8 @@ test("event store records call rows and drill-down breakdowns", async () => {
     assert.equal(drilldown.byServer[0].calls, 2);
     assert.equal(drilldown.byTool.some((row) => row.name === "issue_read"), true);
     assert.equal(drilldown.bySession[0].name, "session-a");
+    assert.equal(drilldown.byTransport.find((row) => row.name === "cli")?.calls, 1);
+    assert.equal(drilldown.byTransport.find((row) => row.name === "mcp")?.calls, 1);
     assert.deepEqual(drilldown.forwardedHeaders, [{
       server: "github",
       tool: "issue_read",
@@ -101,6 +105,78 @@ test("event store prunes by max rows and age", async () => {
     assert.equal(drilldown.byTool.some((row) => row.name === "old"), false);
     assert.equal(drilldown.byTool.some((row) => row.name === "one"), false);
     assert.deepEqual(drilldown.byTool.map((row) => row.name).sort(), ["three", "two"]);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("event store migrates an existing database that predates the transport column", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-event-migrate-"));
+  const path = join(dir, "events.sqlite");
+
+  const sqlite = await import("node:sqlite");
+  const legacyDb = new sqlite.DatabaseSync(path);
+  legacyDb.exec(`
+    CREATE TABLE call_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts_ms INTEGER NOT NULL,
+      ts TEXT NOT NULL,
+      server TEXT,
+      tool TEXT NOT NULL,
+      target_tool TEXT,
+      session_id TEXT,
+      principal TEXT,
+      duration_ms INTEGER NOT NULL,
+      ok INTEGER NOT NULL,
+      status TEXT,
+      error_class TEXT,
+      bytes_in INTEGER NOT NULL DEFAULT 0,
+      bytes_out INTEGER NOT NULL DEFAULT 0,
+      cache_hit INTEGER NOT NULL DEFAULT 0,
+      tool_kind TEXT,
+      operation TEXT,
+      downstream_calls INTEGER NOT NULL DEFAULT 0
+    );
+  `);
+  legacyDb
+    .prepare(`
+      INSERT INTO call_events (
+        ts_ms, ts, server, tool, target_tool, session_id, principal, duration_ms,
+        ok, status, error_class, bytes_in, bytes_out, cache_hit, tool_kind,
+        operation, downstream_calls
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    .run(
+      T0 - 5_000,
+      new Date(T0 - 5_000).toISOString(),
+      "github",
+      "github__issue_read",
+      "issue_read",
+      "session-legacy",
+      "bearer:ops",
+      10,
+      1,
+      "ok",
+      null,
+      10,
+      20,
+      0,
+      "downstream",
+      "direct",
+      1
+    );
+  legacyDb.close();
+
+  const store = await openEventStore({ path, now: () => T0 });
+  try {
+    store.recordCall({ timestampMs: T0, tool: "new_tool", transport: "cli", durationMs: 5, ok: true });
+
+    const drilldown = store.queryDrilldown({ fromMs: T0 - 60_000, toMs: T0 + 1 });
+    assert.equal(drilldown.totals.calls, 2);
+    // Pre-migration rows have no transport recorded; they group under "mcp".
+    assert.equal(drilldown.byTransport.find((row) => row.name === "mcp")?.calls, 1);
+    assert.equal(drilldown.byTransport.find((row) => row.name === "cli")?.calls, 1);
   } finally {
     store.close();
     await rm(dir, { recursive: true, force: true });

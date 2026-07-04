@@ -127,7 +127,7 @@ interface SessionEntry {
   cwd?: string;
   cwdSource?: "header" | "meta" | "roots";
   forwardedHeaders?: Record<string, string>;
-  clientKind?: "stdio-bridge";
+  clientKind?: "stdio-bridge" | "cli";
   rootsAttempted?: boolean;
 }
 
@@ -1483,13 +1483,19 @@ export class CallmuxListener {
     return trimmed;
   }
 
+  /** `x-callmux-client` identifies the bridge (`stdio-bridge`) or the CLI (`cli`); absent for any other MCP client. */
+  private clientKindFromHeader(req: IncomingMessage): SessionEntry["clientKind"] | undefined {
+    const raw = headerValue(req.headers[CLIENT_HEADER]);
+    if (raw === "stdio-bridge") return "stdio-bridge";
+    if (raw === "cli") return "cli";
+    return undefined;
+  }
+
   private sessionCwdFromHeader(
     req: IncomingMessage
   ): Pick<SessionEntry, "cwd" | "cwdSource" | "clientKind"> {
     const cwd = this.normalizeSessionCwd(headerValue(req.headers[CWD_HEADER]));
-    const clientKind = headerValue(req.headers[CLIENT_HEADER]) === "stdio-bridge"
-      ? "stdio-bridge"
-      : undefined;
+    const clientKind = this.clientKindFromHeader(req);
     return {
       ...(cwd ? { cwd, cwdSource: "header" as const } : {}),
       ...(clientKind ? { clientKind } : {}),
@@ -1498,12 +1504,12 @@ export class CallmuxListener {
 
   private setSessionCwdFromHeader(session: SessionEntry, req: IncomingMessage): void {
     const cwd = this.normalizeSessionCwd(headerValue(req.headers[CWD_HEADER]));
-    if (!cwd) return;
-    session.cwd = cwd;
-    session.cwdSource = "header";
-    if (headerValue(req.headers[CLIENT_HEADER]) === "stdio-bridge") {
-      session.clientKind = "stdio-bridge";
+    if (cwd) {
+      session.cwd = cwd;
+      session.cwdSource = "header";
     }
+    const clientKind = this.clientKindFromHeader(req);
+    if (clientKind) session.clientKind = clientKind;
   }
 
   private configuredForwardHeaderNames(): Set<string> {
@@ -1575,6 +1581,7 @@ export class CallmuxListener {
     const context: ToolCallContext = {
       ...(extra.sessionId ? { sessionId: extra.sessionId } : {}),
       ...(session?.forwardedHeaders ? { forwardedHeaders: session.forwardedHeaders } : {}),
+      transport: session?.clientKind === "cli" ? "cli" : "mcp",
     };
 
     const metaCwd = this.cwdFromMeta(extra._meta);
@@ -1612,6 +1619,7 @@ export class CallmuxListener {
     return {
       ...(extra.sessionId ? { sessionId: extra.sessionId } : {}),
       ...(session?.forwardedHeaders ? { forwardedHeaders: session.forwardedHeaders } : {}),
+      transport: session?.clientKind === "cli" ? "cli" : "mcp",
     };
   }
 
@@ -2330,6 +2338,7 @@ export class CallmuxListener {
         ...(target?.tool ? { targetTool: target.tool } : {}),
         ...(toolContext?.sessionId ? { sessionId: toolContext.sessionId } : {}),
         ...(this.principalLabel(this.authzContext.getStore()) ? { principal: this.principalLabel(this.authzContext.getStore()) } : {}),
+        transport: toolContext?.transport ?? "mcp",
         durationMs,
         ok: status !== "error",
         status,

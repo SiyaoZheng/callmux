@@ -376,6 +376,8 @@ export interface ToolCallContext {
   retryOnReconnect?: boolean;
   /** Override the configured downstream tool call timeout for this call */
   timeoutMs?: number;
+  /** How the calling client reached the listener: the `callmux` CLI verbs vs any MCP client */
+  transport?: "cli" | "mcp";
 }
 
 export interface ListenerRuntimeDiagnostics {
@@ -413,7 +415,7 @@ export interface ListenerRuntimeDiagnostics {
     transport: "streamable-http" | "sse" | "unknown";
     cwd?: string;
     cwdSource?: "header" | "meta" | "roots";
-    clientKind?: "stdio-bridge";
+    clientKind?: "stdio-bridge" | "cli";
     /** Reported MCP client name (clientInfo.name), when the client supplied one. */
     client?: string;
     /** Whether the client advertised the `roots` capability — the channel callmux uses to learn a session's cwd when no header/_meta is present. */

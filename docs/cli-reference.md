@@ -110,7 +110,9 @@ callmux call callmux_parallel '{"calls":[{"tool":"github__issue_read","arguments
 
 Defaults to `http://127.0.0.1:4860/mcp` when `--url` is omitted. Meta-tools (`callmux_parallel`, `callmux_batch`, `callmux_pipeline`, ...) are reachable the same way as proxied downstream tools.
 
-Exit codes: `0` success, `1` the downstream tool reported an error (`isError: true`), `2` a usage error (bad flag, invalid JSON payload, ...) or a transport/connection failure (listener unreachable, bad HTTP status, ...).
+Exit codes: `0` success, `1` the downstream tool reported an error (`isError: true`), `2` a usage error (bad flag, invalid JSON payload, ...) or a transport/connection failure (listener unreachable, bad HTTP status, ...). The same codes apply to `parallel`/`batch`/`pipeline`.
+
+Add `--verbose` to print the listener URL and which token precedence tier is about to be used (env var, `--token`, `--token-file`, or the managed store) to stderr before the call — useful when a 401 is confusing because more than one token source is in play.
 
 When a result is truncated it comes back with a `_callmux.ref`. Page through the full result the same way, via `callmux_get_result`:
 
@@ -127,7 +129,18 @@ callmux tools schema github__create_issue
 callmux tools search issue
 ```
 
-`tools list`/`tools search` call the daemon's `tools/list` once and print only names + one-line descriptions — cheap discovery for an agent deciding what's callable. `tools schema <tool>` prints the full input schema for one tool, paid for only when that tool is actually used. `--server <name>` filters to tools qualified with the `<name>__` prefix (honors the server's configured `prefix`, e.g. `gh__`). Same exit codes as `callmux call` (`0` success, `2` usage/transport error or unknown tool).
+`tools list`/`tools search` call the daemon's `tools/list` once and print only names + one-line descriptions — cheap discovery for an agent deciding what's callable. `tools schema <tool>` prints the full input schema for one tool, paid for only when that tool is actually used. `--server <name>` filters to tools qualified with the `<name>__` prefix (honors the server's configured `prefix`, e.g. `gh__`). Same exit codes as `callmux call` (`0` success, `2` usage/transport error or unknown tool — there's no per-tool `isError` result to report as `1` here).
+
+`--quiet` drops the "no tools found"/"no tools matched" sentence on an empty `list`/`search` result, leaving stdout empty for scripts that only care whether anything came back. `--verbose` prints the same listener/token diagnostic line `call` does.
+
+### CLI vs MCP: When to Use Which
+
+Both transports call the same tools through the same daemon — this is a routing choice, not a capability difference:
+
+- **Long-tail tools** (used once or rarely in a session): reach for the CLI. `tools schema <tool>` loads one schema on demand; it never rides along in every turn's system prompt the way a connected MCP tool definition does.
+- **Hot tools** (called repeatedly): keep them on the MCP connection. You get structured `structuredContent` results, per-tool authorization errors surfaced as part of the normal tool-call flow, and no per-call session-bootstrap overhead (the CLI opens and tears down an MCP session for every single call).
+- **Secrets stay server-side either way.** The CLI only ever presents a client→callmux bearer token (see below); it never touches `GITHUB_TOKEN`-style downstream credentials, which live exclusively in the daemon config.
+- **One audit trail.** CLI and MCP calls hit the same authentication, [authorization](#per-tool-authorization-for-agents-deny-write-pattern), and [event store](observability.md) — a `callmux call` shows up in `/dashboard/drilldown`'s `byTransport` breakdown tagged `cli`, with the same principal an equivalent MCP call would carry, right alongside `mcp` traffic.
 
 ### Authenticating Against a Remote or Shared Daemon
 
@@ -150,9 +163,13 @@ callmux call github__search_issues '{"query":"is:open"}' --url https://mux.examp
 
 The token is sent as `Authorization: Bearer <token>`. An explicit `--header Authorization:…` always overrides the resolved token. On the daemon, the existing stack verifies it — `authenticateBearerToken` for bearer tokens, the OIDC verifier for `oidc_jwt` SSO principals — then `evaluateToolAuthorization` applies the policy. Nothing about that server-side path changes; the CLI only *presents* the token.
 
+A rejected (401) call names which tier actually sent the token — e.g. `sent the token from the CALLMUX_TOKEN env var` — so a stale env var beating a correct `--token` flag doesn't read as an unexplained bare `HTTP 401`.
+
 #### One `attach` wires both the MCP client and the CLI
 
 `callmux client attach <claude|codex> --token <t> --yes` (or `--token-file <path>`) stashes the bearer in the managed CLI token store **in addition to** writing the MCP client entry. A subsequent bare `callmux call …` then resolves the token at tier 4 with no extra flags. In `--bridge` mode the MCP client spawns `callmux bridge --url …`, which reads the same store — so a single `attach --bridge --token …` authenticates both the client's MCP session and any CLI call.
+
+Running `attach --yes` again with neither `--token` nor `--token-file` leaves the managed store untouched and prints nothing about it — attach only stashes a token when you actually give it one, so re-running it to update just the client config never silently re-writes (or falsely reports re-writing) whatever token is already there.
 
 #### Per-tool authorization for agents (deny-write pattern)
 
