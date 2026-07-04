@@ -11,7 +11,7 @@ interface ToolDefinition {
   description?: string;
 }
 
-type CallMode = "ok" | "throw" | "tool_error" | "exit" | "hang";
+type CallMode = "ok" | "throw" | "tool_error" | "exit" | "hang" | "large_result";
 
 function numberFromEnv(name: string): number {
   const value = process.env[name];
@@ -44,11 +44,13 @@ const callMode: CallMode = (
   callModeEnv === "throw" ||
   callModeEnv === "tool_error" ||
   callModeEnv === "exit" ||
-  callModeEnv === "hang"
+  callModeEnv === "hang" ||
+  callModeEnv === "large_result"
 )
   ? callModeEnv
   : (failCall ? "throw" : "ok");
 const toolErrorMessage = process.env.FAKE_MCP_TOOL_ERROR_MESSAGE ?? "fake tool error";
+const largeResultItemCount = numberFromEnv("FAKE_MCP_LARGE_ITEM_COUNT") || 120;
 
 const server = new McpServer(
   {
@@ -76,6 +78,14 @@ for (const tool of tools) {
       isError: true,
       content: [{ type: "text", text: toolErrorMessage }],
     };
+    if (callMode === "large_result") {
+      const items = Array.from({ length: largeResultItemCount }, (_, index) => ({
+        id: index + 1,
+        name: `item-${index + 1}`,
+        body: "x".repeat(200),
+      }));
+      return textResult(JSON.stringify(items));
+    }
     return textResult(
       JSON.stringify({
         server: process.env.FAKE_MCP_NAME ?? "fake-mcp-server",

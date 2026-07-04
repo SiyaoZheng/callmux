@@ -57,7 +57,7 @@ import {
   type DaemonAction,
   type DaemonScope,
 } from "../daemon.js";
-import { callListenerTool, extractListenerToolPayload } from "../listener-client.js";
+import { callListenerTool, extractListenerToolPayload, listenerRequest } from "../listener-client.js";
 import { formatToolText, isOutputFormat, type OutputFormat } from "../output-format.js";
 import { runSetup } from "../setup.js";
 import {
@@ -75,6 +75,7 @@ import {
 import * as p from "@clack/prompts";
 import { UpstreamManager } from "../upstream.js";
 import type { CallmuxConfig, ServerConfig } from "../types.js";
+import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 
 const HELP = `
 callmux — Multiplexer for MCP tool calls
@@ -97,6 +98,12 @@ Usage:
                                               Sugar for callmux_batch: apply one tool across many items
   callmux pipeline '<tool> <argsJSON>' ... [--file <path>] [--url <listener-url>]
                                               Sugar for callmux_pipeline: chain tool calls in order
+  callmux tools list [--server <name>] [--json] [--url <listener-url>]
+                                              List hosted tool names + one-line descriptions (tools/list)
+  callmux tools schema <tool> [--json] [--url <listener-url>]
+                                              Print the full input schema for one tool
+  callmux tools search <query> [--server <name>] [--json] [--url <listener-url>]
+                                              Substring-match tool names/descriptions
   callmux [options] -- <command> [args...]   Single-server mode
   callmux setup [--config <path>]            Interactive setup wizard
   callmux init [--config <path>] [--force]
@@ -167,6 +174,14 @@ Parallel/Batch/Pipeline Options:
                          object from a file instead of building it from argv.
                          Use this for anything beyond "list of tool + args"
                          (per-call timeouts/cwd, pipeline inputMapping, etc).
+
+Tools Options:
+  --url <listener-url>  Shared Streamable HTTP MCP endpoint (default: http://127.0.0.1:4860/mcp)
+  --cwd <path>          Project cwd to send as x-callmux-cwd (default: process cwd)
+  --header Name:Value   Extra HTTP header for the shared listener (repeatable)
+  --server <name>       Filter to tools qualified with the "<name>__" prefix (list/search)
+  --call-timeout <ms>   Timeout for the tools/list request
+  --json                Machine-readable output instead of the human-readable default
 
 Daemon Options:
   --port <n>            Listener port for install (default: 4860)
@@ -303,6 +318,11 @@ Examples:
   callmux batch 'github__issue_read {"number":1}' 'github__issue_read {"number":2}'
   callmux pipeline 'github__issue_read {"number":1}' 'github__create_comment {"body":"ack"}'
   callmux pipeline --file plan.json --url http://localhost:4860/mcp
+  callmux call callmux_get_result '{"ref":"r_...","offset":50,"limit":50}'
+  callmux tools list --url http://localhost:4860/mcp
+  callmux tools list --server github --json
+  callmux tools schema github__create_issue
+  callmux tools search issue
   callmux --config callmux.json
   callmux --cache 60 -- node my-mcp-server.js
   callmux --cache 60 --cache-allow get_*,list_* -- npx -y @modelcontextprotocol/server-github
@@ -1198,6 +1218,266 @@ async function handleMetaSugarCommand(verb: MetaSugarVerb, args: string[]): Prom
   await runListenerToolCall(META_SUGAR_TOOL[verb], toolArgs, options);
 }
 
+const MAX_TOOLS_LIST_DESCRIPTION_LENGTH = 100;
+
+interface ToolsCommandOptions {
+  url: string;
+  cwd: string;
+  headers: Record<string, string>;
+  callTimeoutMs?: number;
+  server?: string;
+  json: boolean;
+  positionals: string[];
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Shared flag parsing for `callmux tools list|schema|search` — all three
+ * talk to the same daemon `tools/list` endpoint via listenerRequest.
+ */
+function parseToolsCommandArgs(args: string[]): ToolsCommandOptions | { error: string } {
+  let url: string | undefined;
+  let cwd = process.cwd();
+  let callTimeoutMs: number | undefined;
+  let server: string | undefined;
+  let json = false;
+  const headers: Record<string, string> = {};
+  const positionals: string[] = [];
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--url" && i + 1 < args.length) {
+      url = args[++i];
+    } else if (arg === "--cwd" && i + 1 < args.length) {
+      cwd = resolve(args[++i]);
+    } else if (arg === "--server" && i + 1 < args.length) {
+      server = args[++i];
+    } else if (arg === "--header" && i + 1 < args.length) {
+      const raw = args[++i];
+      const separator = raw.indexOf(":");
+      if (separator <= 0) {
+        return { error: "--header must use Name:Value format" };
+      }
+      headers[raw.slice(0, separator).trim()] = raw.slice(separator + 1).trim();
+    } else if (arg === "--call-timeout" && i + 1 < args.length) {
+      callTimeoutMs = Number(args[++i]);
+      if (!Number.isInteger(callTimeoutMs) || callTimeoutMs < 0) {
+        return { error: "--call-timeout must be a non-negative integer" };
+      }
+    } else if (arg === "--json") {
+      json = true;
+    } else if (arg.startsWith("--")) {
+      return { error: `Unknown tools option "${arg}"` };
+    } else {
+      positionals.push(arg);
+    }
+  }
+
+  return {
+    url: url ?? `http://127.0.0.1:${DEFAULT_PORT}/mcp`,
+    cwd,
+    headers,
+    ...(callTimeoutMs !== undefined ? { callTimeoutMs } : {}),
+    ...(server !== undefined ? { server } : {}),
+    json,
+    positionals,
+  };
+}
+
+async function fetchToolList(
+  options: ToolsCommandOptions
+): Promise<Tool[] | { error: string }> {
+  const outcome = await listenerRequest(options.url, "tools/list", {}, {
+    cwd: options.cwd,
+    ...(Object.keys(options.headers).length > 0 ? { headers: options.headers } : {}),
+    ...(options.callTimeoutMs !== undefined ? { timeoutMs: options.callTimeoutMs } : {}),
+  });
+
+  if (!outcome.ok) {
+    return { error: outcome.error ?? "tools/list failed" };
+  }
+
+  const tools =
+    isRecordValue(outcome.result) && Array.isArray(outcome.result.tools)
+      ? (outcome.result.tools as Tool[])
+      : undefined;
+  if (!tools) {
+    return { error: "tools/list response did not include a tools array" };
+  }
+  return tools;
+}
+
+/** Matches the `<prefix>__<toolName>` convention servers are qualified with. */
+function toolMatchesServer(toolName: string, server: string): boolean {
+  return toolName === server || toolName.startsWith(`${server}__`);
+}
+
+function oneLineToolDescription(description: unknown): string | undefined {
+  if (typeof description !== "string") return undefined;
+  const firstLine = description.split("\n")[0]?.trim();
+  if (!firstLine) return undefined;
+  return firstLine.length > MAX_TOOLS_LIST_DESCRIPTION_LENGTH
+    ? `${firstLine.slice(0, MAX_TOOLS_LIST_DESCRIPTION_LENGTH - 1)}…`
+    : firstLine;
+}
+
+function printToolSummaries(tools: Tool[], json: boolean, emptyMessage: string): void {
+  const summaries = tools.map((tool) => ({
+    name: tool.name,
+    description: oneLineToolDescription(tool.description),
+  }));
+
+  if (json) {
+    console.log(JSON.stringify({ count: summaries.length, tools: summaries }, null, 2));
+    return;
+  }
+
+  if (summaries.length === 0) {
+    console.log(emptyMessage);
+    return;
+  }
+
+  console.log(
+    summaries
+      .map((tool) => (tool.description ? `${tool.name}  ${tool.description}` : tool.name))
+      .join("\n")
+  );
+}
+
+/**
+ * `callmux tools list` — cheap discovery: names + one-line descriptions from
+ * the daemon's tools/list. Full schemas are fetched on demand via `tools schema`.
+ */
+async function handleToolsListCommand(args: string[]): Promise<void> {
+  const parsed = parseToolsCommandArgs(args);
+  if ("error" in parsed) {
+    console.error(`Error: ${parsed.error}`);
+    process.exitCode = 2;
+    return;
+  }
+  if (parsed.positionals.length > 0) {
+    console.error(
+      `Error: Unknown argument "${parsed.positionals[0]}" — usage: callmux tools list [--server <name>] [--json] [--url <listener-url>]`
+    );
+    process.exitCode = 2;
+    return;
+  }
+
+  const tools = await fetchToolList(parsed);
+  if ("error" in tools) {
+    console.error(`Error: ${tools.error}`);
+    process.exitCode = 2;
+    return;
+  }
+
+  const filtered = parsed.server
+    ? tools.filter((tool) => toolMatchesServer(tool.name, parsed.server!))
+    : tools;
+
+  printToolSummaries(
+    filtered,
+    parsed.json,
+    parsed.server ? `No tools found for server "${parsed.server}".` : "No tools available."
+  );
+}
+
+/** `callmux tools schema <tool>` — full input schema for one tool, on demand. */
+async function handleToolsSchemaCommand(args: string[]): Promise<void> {
+  const parsed = parseToolsCommandArgs(args);
+  if ("error" in parsed) {
+    console.error(`Error: ${parsed.error}`);
+    process.exitCode = 2;
+    return;
+  }
+  if (parsed.positionals.length !== 1) {
+    console.error("Usage: callmux tools schema <tool> [--json] [--url <listener-url>]");
+    process.exitCode = 2;
+    return;
+  }
+  const toolName = parsed.positionals[0];
+
+  const tools = await fetchToolList(parsed);
+  if ("error" in tools) {
+    console.error(`Error: ${tools.error}`);
+    process.exitCode = 2;
+    return;
+  }
+
+  const tool = tools.find((candidate) => candidate.name === toolName);
+  if (!tool) {
+    console.error(`Error: tool "${toolName}" not found`);
+    process.exitCode = 2;
+    return;
+  }
+
+  if (parsed.json) {
+    console.log(JSON.stringify(tool, null, 2));
+    return;
+  }
+
+  console.log(tool.description ? `${tool.name} — ${tool.description}` : tool.name);
+  console.log("");
+  console.log(JSON.stringify(tool.inputSchema ?? {}, null, 2));
+}
+
+/** `callmux tools search <query>` — substring match over names + descriptions. */
+async function handleToolsSearchCommand(args: string[]): Promise<void> {
+  const parsed = parseToolsCommandArgs(args);
+  if ("error" in parsed) {
+    console.error(`Error: ${parsed.error}`);
+    process.exitCode = 2;
+    return;
+  }
+  if (parsed.positionals.length !== 1) {
+    console.error("Usage: callmux tools search <query> [--server <name>] [--json] [--url <listener-url>]");
+    process.exitCode = 2;
+    return;
+  }
+  const query = parsed.positionals[0];
+
+  const tools = await fetchToolList(parsed);
+  if ("error" in tools) {
+    console.error(`Error: ${tools.error}`);
+    process.exitCode = 2;
+    return;
+  }
+
+  const scoped = parsed.server
+    ? tools.filter((tool) => toolMatchesServer(tool.name, parsed.server!))
+    : tools;
+  const needle = query.toLowerCase();
+  const matches = scoped.filter(
+    (tool) =>
+      tool.name.toLowerCase().includes(needle) ||
+      (typeof tool.description === "string" && tool.description.toLowerCase().includes(needle))
+  );
+
+  printToolSummaries(matches, parsed.json, `No tools matched "${query}".`);
+}
+
+async function handleToolsCommand(args: string[]): Promise<void> {
+  const sub = args[0];
+  if (sub === "list") {
+    await handleToolsListCommand(args.slice(1));
+    return;
+  }
+  if (sub === "schema") {
+    await handleToolsSchemaCommand(args.slice(1));
+    return;
+  }
+  if (sub === "search") {
+    await handleToolsSearchCommand(args.slice(1));
+    return;
+  }
+  console.error(
+    "Usage: callmux tools <list|schema <tool>|search <query>> [--server <name>] [--json] [--url <listener-url>]"
+  );
+  process.exitCode = 2;
+}
+
 function handleInstructionsCommand(args: string[]): void {
   let profile: AgentInstructionsProfile = "generic";
   let mode: AgentInstructionsMode = "standard";
@@ -1456,6 +1736,11 @@ async function main(): Promise<void> {
 
   if (args[0] === "parallel" || args[0] === "batch" || args[0] === "pipeline") {
     await handleMetaSugarCommand(args[0], args.slice(1));
+    return;
+  }
+
+  if (args[0] === "tools") {
+    await handleToolsCommand(args.slice(1));
     return;
   }
 

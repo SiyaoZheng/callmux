@@ -14361,6 +14361,260 @@ test("callmux call terminates its listener session instead of leaking it", async
   }
 });
 
+// ─── `callmux tools list|schema|search` CLI verbs ────────────────
+
+async function startToolsListener(): Promise<{
+  url: string;
+  cwd: string;
+  cleanup: () => Promise<void>;
+}> {
+  const cwd = await mkdtemp(join(tmpdir(), "callmux-tools-cwd-"));
+  const upstream = new UpstreamManager();
+  const alphaConfig = fakeMcpServer("alpha", {
+    FAKE_MCP_TOOLS: JSON.stringify([
+      { name: "get_item", description: "Get a fake item by id.\nSecond line is ignored." },
+    ]),
+  });
+  const betaConfig = fakeMcpServer("beta", {
+    FAKE_MCP_TOOLS: JSON.stringify([{ name: "list_items", description: "List fake items" }]),
+  });
+  await upstream.connect({ alpha: alphaConfig, beta: betaConfig });
+
+  const listener = new CallmuxListener({
+    port: 0,
+    host: "127.0.0.1",
+    // Disable schema compression so descriptions reach the CLI unmodified,
+    // exercising the CLI's own one-line collapsing/truncation instead.
+    config: {
+      servers: { alpha: alphaConfig, beta: betaConfig },
+      schemaCompression: { mode: "off" },
+    },
+    upstream,
+    cache: new CallCache(0, undefined, {}, 100),
+    allTools: [],
+    maxConcurrency: 10,
+  });
+  await listener.start();
+  const port = listenerPort(listener);
+
+  return {
+    url: `http://127.0.0.1:${port}/mcp`,
+    cwd,
+    cleanup: async () => {
+      await listener.close();
+      await upstream.close();
+      await rm(cwd, { recursive: true, force: true });
+    },
+  };
+}
+
+test("callmux tools list prints qualified names and one-line descriptions", async () => {
+  const harness = await startToolsListener();
+  try {
+    const { code, stdout, stderr } = await runCallmuxCli([
+      "tools", "list",
+      "--url", harness.url,
+      "--cwd", harness.cwd,
+    ]);
+
+    assert.equal(code, 0, stderr);
+    assert.match(stdout, /alpha__get_item\s+Get a fake item by id\./);
+    assert.doesNotMatch(stdout, /Second line is ignored/);
+    assert.match(stdout, /beta__list_items\s+List fake items/);
+    assert.match(stdout, /callmux_parallel/);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("callmux tools list --json returns names + descriptions only (no schemas)", async () => {
+  const harness = await startToolsListener();
+  try {
+    const { code, stdout, stderr } = await runCallmuxCli([
+      "tools", "list",
+      "--json",
+      "--url", harness.url,
+      "--cwd", harness.cwd,
+    ]);
+
+    assert.equal(code, 0, stderr);
+    const payload = JSON.parse(stdout) as { count: number; tools: Array<{ name: string; description?: string }> };
+    assert.ok(payload.count >= 2);
+    const alpha = payload.tools.find((tool) => tool.name === "alpha__get_item");
+    assert.ok(alpha);
+    assert.equal(alpha!.description, "Get a fake item by id.");
+    assert.equal((alpha as unknown as { inputSchema?: unknown }).inputSchema, undefined);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("callmux tools list --server filters to the <server>__ prefix", async () => {
+  const harness = await startToolsListener();
+  try {
+    const { code, stdout, stderr } = await runCallmuxCli([
+      "tools", "list",
+      "--server", "alpha",
+      "--json",
+      "--url", harness.url,
+      "--cwd", harness.cwd,
+    ]);
+
+    assert.equal(code, 0, stderr);
+    const payload = JSON.parse(stdout) as { tools: Array<{ name: string }> };
+    assert.deepEqual(payload.tools.map((tool) => tool.name), ["alpha__get_item"]);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("callmux tools schema prints the full input schema for one tool", async () => {
+  const harness = await startToolsListener();
+  try {
+    const { code, stdout, stderr } = await runCallmuxCli([
+      "tools", "schema", "alpha__get_item",
+      "--json",
+      "--url", harness.url,
+      "--cwd", harness.cwd,
+    ]);
+
+    assert.equal(code, 0, stderr);
+    const tool = JSON.parse(stdout) as { name: string; inputSchema: { properties?: Record<string, unknown> } };
+    assert.equal(tool.name, "alpha__get_item");
+    assert.ok(tool.inputSchema.properties && "id" in tool.inputSchema.properties);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("callmux tools schema exits 2 for an unknown tool", async () => {
+  const harness = await startToolsListener();
+  try {
+    const { code, stderr } = await runCallmuxCli([
+      "tools", "schema", "does_not_exist",
+      "--url", harness.url,
+      "--cwd", harness.cwd,
+    ]);
+
+    assert.equal(code, 2);
+    assert.match(stderr, /not found/);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("callmux tools search substring-matches names and descriptions", async () => {
+  const harness = await startToolsListener();
+  try {
+    const { code, stdout, stderr } = await runCallmuxCli([
+      "tools", "search", "fake item",
+      "--json",
+      "--url", harness.url,
+      "--cwd", harness.cwd,
+    ]);
+
+    assert.equal(code, 0, stderr);
+    const payload = JSON.parse(stdout) as { tools: Array<{ name: string }> };
+    assert.deepEqual(
+      payload.tools.map((tool) => tool.name).sort(),
+      ["alpha__get_item", "beta__list_items"]
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("callmux tools list exits 2 with a clear message when the listener is unreachable", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "callmux-tools-unreachable-"));
+  try {
+    const port = await getFreePort();
+    const { code, stdout, stderr } = await runCallmuxCli([
+      "tools", "list",
+      "--url", `http://127.0.0.1:${port}/mcp`,
+      "--cwd", cwd,
+    ]);
+    assert.equal(code, 2);
+    assert.equal(stdout, "");
+    assert.match(stderr, /failed to reach listener/i);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("callmux call callmux_get_result pages through a truncated large `call` result", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "callmux-call-paging-"));
+  const upstream = new UpstreamManager();
+  const cache = new CallCache(0, undefined, {}, 100);
+  let listener: CallmuxListener | undefined;
+
+  try {
+    const serverConfig = fakeMcpServer("large", {
+      FAKE_MCP_TOOLS: JSON.stringify([{ name: "list_items", description: "List many fake items" }]),
+      FAKE_MCP_CALL_MODE: "large_result",
+      FAKE_MCP_LARGE_ITEM_COUNT: "120",
+    });
+    await upstream.connect({ large: serverConfig });
+
+    listener = new CallmuxListener({
+      port: 0,
+      host: "127.0.0.1",
+      config: { servers: { large: serverConfig } },
+      upstream,
+      cache,
+      allTools: [],
+      maxConcurrency: 10,
+    });
+    await listener.start();
+    const port = listenerPort(listener);
+    const url = `http://127.0.0.1:${port}/mcp`;
+
+    const initial = await runCallmuxCli([
+      "call", "large__list_items", "{}",
+      "--url", url,
+      "--cwd", cwd,
+    ]);
+    assert.equal(initial.code, 0, initial.stderr);
+    const initialPayload = JSON.parse(initial.stdout) as {
+      _callmux: { truncated: boolean; ref: string; shape: { total: number } };
+    };
+    assert.equal(initialPayload._callmux.truncated, true);
+    assert.match(initialPayload._callmux.ref, /^r_/);
+
+    const firstPage = await runCallmuxCli([
+      "call", "callmux_get_result",
+      JSON.stringify({ ref: initialPayload._callmux.ref, offset: 0, limit: 3, fields: ["id"] }),
+      "--url", url,
+      "--cwd", cwd,
+    ]);
+    assert.equal(firstPage.code, 0, firstPage.stderr);
+    const firstPagePayload = JSON.parse(firstPage.stdout) as {
+      total: number; count: number; hasMore: boolean; data: Array<{ id: number }>;
+    };
+    assert.equal(firstPagePayload.total, 120);
+    assert.equal(firstPagePayload.count, 3);
+    assert.equal(firstPagePayload.hasMore, true);
+    assert.deepEqual(firstPagePayload.data, [{ id: 1 }, { id: 2 }, { id: 3 }]);
+
+    const lastPage = await runCallmuxCli([
+      "call", "callmux_get_result",
+      JSON.stringify({ ref: initialPayload._callmux.ref, offset: 117, limit: 50, fields: ["id"] }),
+      "--url", url,
+      "--cwd", cwd,
+    ]);
+    assert.equal(lastPage.code, 0, lastPage.stderr);
+    const lastPagePayload = JSON.parse(lastPage.stdout) as {
+      count: number; hasMore: boolean; data: Array<{ id: number }>;
+    };
+    assert.equal(lastPagePayload.count, 3);
+    assert.equal(lastPagePayload.hasMore, false);
+    assert.deepEqual(lastPagePayload.data, [{ id: 118 }, { id: 119 }, { id: 120 }]);
+  } finally {
+    await listener?.close();
+    await upstream.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 // ─── `callmux parallel|batch|pipeline` sugar verbs ─────────────
 
 test("callmux parallel splits argv into a calls array and fans out via callmux_parallel", async () => {

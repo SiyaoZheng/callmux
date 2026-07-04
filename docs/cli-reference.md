@@ -17,6 +17,9 @@
 | `callmux doctor --url <url> [--cwd <path>] [--header Name:Value] [--json]` | Smoke-test a running shared listener |
 | `callmux bridge --url <url> [--cwd <path>] [--header Name:Value]` | Stdio bridge to a shared listener |
 | `callmux call <tool> [json] [--file <path>] [--url <url>] [--output-format <fmt>]` | Call one tool on a running shared listener |
+| `callmux tools list [--server <name>] [--json] [--url <url>]` | List hosted tool names + one-line descriptions |
+| `callmux tools schema <tool> [--json] [--url <url>]` | Print the full input schema for one tool |
+| `callmux tools search <query> [--server <name>] [--json] [--url <url>]` | Substring-match tool names/descriptions |
 | `callmux client status [claude\|codex]` | Check client configuration state |
 | `callmux client attach <client> [--yes]` | Write command-mode callmux into client config |
 | `callmux client attach <client> --url <url> [--yes]` | Write shared listener URL into client config |
@@ -108,6 +111,23 @@ callmux call callmux_parallel '{"calls":[{"tool":"github__issue_read","arguments
 Defaults to `http://127.0.0.1:4860/mcp` when `--url` is omitted. Meta-tools (`callmux_parallel`, `callmux_batch`, `callmux_pipeline`, ...) are reachable the same way as proxied downstream tools.
 
 Exit codes: `0` success, `1` the downstream tool reported an error (`isError: true`), `2` a usage error (bad flag, invalid JSON payload, ...) or a transport/connection failure (listener unreachable, bad HTTP status, ...).
+
+When a result is truncated it comes back with a `_callmux.ref`. Page through the full result the same way, via `callmux_get_result`:
+
+```bash
+callmux call callmux_get_result '{"ref":"r_...","offset":0,"limit":50}'
+```
+
+### Discover Tools on a Running Listener
+
+```bash
+callmux tools list --url http://localhost:4860/mcp
+callmux tools list --server github --json
+callmux tools schema github__create_issue
+callmux tools search issue
+```
+
+`tools list`/`tools search` call the daemon's `tools/list` once and print only names + one-line descriptions — cheap discovery for an agent deciding what's callable. `tools schema <tool>` prints the full input schema for one tool, paid for only when that tool is actually used. `--server <name>` filters to tools qualified with the `<name>__` prefix (honors the server's configured `prefix`, e.g. `gh__`). Same exit codes as `callmux call` (`0` success, `2` usage/transport error or unknown tool).
 
 ### Attach a Client
 
