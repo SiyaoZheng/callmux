@@ -93,11 +93,11 @@ The same fan-out primitives available as MCP meta-tools (`callmux_parallel`, `ca
 
 ```bash
 callmux parallel 'github__issue_read {"number":1}' 'github__issue_read {"number":2}'
-callmux batch github__issue_read '[{"number":1},{"number":2},{"number":3}]'
-callmux pipeline 'github__search_issues {"query":"is:open"}' 'github__issue_read {"$json":"[0].number"}'
+callmux batch 'github__issue_read {"number":1}' 'github__issue_read {"number":2}' 'github__issue_read {"number":3}'
+callmux pipeline 'github__issue_read {"number":1}' 'github__create_comment {"body":"ack"}'
 ```
 
-Each `parallel` argument is `<tool> <argsJSON>` — one shell token for the tool name, split by the first space from the JSON that follows. That argv-vs-JSON split is exact: everything before the first space is the tool name, everything after is parsed as JSON. When a step's arguments are too large or too structured to fit that split cleanly (nested objects, nested arrays, nested pipelines), drop to `--file`:
+Each argument is `<tool> <argsJSON>` — one shell token for the tool name, split by the first space from the JSON that follows. That argv-vs-JSON split is exact: everything before the first space is the tool name, everything after is parsed as JSON. `batch` requires every argument to name the SAME tool (one tool, many items). `pipeline` chains steps in order, but the argv sugar forwards each step's `argsJSON` verbatim — there's no way to reference a previous step's output from argv. The `callmux_pipeline` meta-tool does support that, via a per-step `inputMapping` field (e.g. `"$json.field.path"` pulled from the prior step's result), but it's only reachable through `--file`, not the argv sugar. When a step's arguments are too large or too structured to fit that split cleanly (nested objects, nested arrays, nested pipelines, or pipeline `inputMapping`), drop to `--file`:
 
 ```bash
 callmux pipeline --file plan.json
