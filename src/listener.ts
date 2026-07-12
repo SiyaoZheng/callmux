@@ -1762,6 +1762,11 @@ export class CallmuxListener {
           ...(toolContext.cwd ? { cwd: toolContext.cwd } : {}),
         });
 
+      // Scope any shielded/stored response to this caller so another principal
+      // can't retrieve it later via callmux_get_result (undefined = unowned when
+      // unauthenticated; see responseOwnerKey).
+      const responseOwner = this.responseOwnerKey(principal);
+
       let result: CallToolResult;
       switch (name) {
         case "callmux_parallel":
@@ -1776,7 +1781,8 @@ export class CallmuxListener {
               toolContext,
               config.outputFormat
             ),
-            this.outputFormatFor(args)
+            this.outputFormatFor(args),
+            responseOwner
           );
           break;
         case "callmux_batch":
@@ -1791,7 +1797,8 @@ export class CallmuxListener {
               toolContext,
               config.outputFormat
             ),
-            this.outputFormatFor(args)
+            this.outputFormatFor(args),
+            responseOwner
           );
           break;
         case "callmux_pipeline":
@@ -1805,7 +1812,8 @@ export class CallmuxListener {
               toolContext,
               config.outputFormat
             ),
-            this.outputFormatFor(args)
+            this.outputFormatFor(args),
+            responseOwner
           );
           break;
         case "callmux_call":
@@ -1814,7 +1822,8 @@ export class CallmuxListener {
             result = handleGetResult(
               this.responseStore,
               args.arguments,
-              this.outputFormatFor(args)
+              this.outputFormatFor(args),
+              responseOwner
             );
           } else {
             target = this.responseShieldTarget(upstream, name, args);
@@ -1827,7 +1836,8 @@ export class CallmuxListener {
                 toolContext,
                 config.outputFormat
               ),
-              this.outputFormatFor(args)
+              this.outputFormatFor(args),
+              responseOwner
             );
           }
           break;
@@ -1841,7 +1851,7 @@ export class CallmuxListener {
           break;
         case "callmux_get_result":
           target = { tool: name };
-          result = handleGetResult(this.responseStore, args, config.outputFormat);
+          result = handleGetResult(this.responseStore, args, config.outputFormat, responseOwner);
           break;
         case "callmux_cache_clear":
           result = handleCacheClear(cache, args);
@@ -1868,7 +1878,8 @@ export class CallmuxListener {
               toolContext,
               config.outputFormat
             ),
-            this.outputFormatFor(args)
+            this.outputFormatFor(args),
+            responseOwner
           );
           break;
         case "callmux_recipe_dry_run":
@@ -1908,14 +1919,21 @@ export class CallmuxListener {
           const cached = cache.get(name, prepared.resolvedArguments, prepared.server, cacheScope);
           if (cached) {
             cacheHit = true;
-            result = this.shieldResult(target, cached);
+            result = this.shieldResult(target, cached, undefined, responseOwner);
           } else {
-            const upstreamResult = await upstream.callTool(name, prepared.resolvedArguments, prepared.server, {
+            // Reuse the already-prepared resolution instead of re-running
+            // prepareToolCall inside callTool. A second resolution pass would
+            // (a) re-read every $file/$jsonFile ref and, worse, (b) re-scan the
+            // FIRST pass's output for refs — so $jsonFile content containing a
+            // nested {"$file": ...} would be resolved on the second pass and
+            // sent downstream, and the cache key (pass 1) would no longer match
+            // the executed arguments (pass 2).
+            const upstreamResult = await upstream.callPrepared(prepared, {
               ...toolContext,
               retryOnReconnect: cache.isSafeToRetry(name, prepared.server),
             });
             cache.set(name, prepared.resolvedArguments, upstreamResult, prepared.server, cacheScope);
-            result = this.shieldResult(target, upstreamResult);
+            result = this.shieldResult(target, upstreamResult, undefined, responseOwner);
           }
           break;
         }
@@ -2006,7 +2024,8 @@ export class CallmuxListener {
   private shieldResult(
     target: ResponseShieldTarget,
     result: CallToolResult,
-    outputFormat?: OutputFormat
+    outputFormat: OutputFormat | undefined,
+    owner: string | undefined
   ): CallToolResult {
     return shieldToolResult(
       this.responseStore,
@@ -2015,8 +2034,27 @@ export class CallmuxListener {
       {
         ...resolveResponseShieldOptions(this.options.config, target),
         outputFormat: outputFormat ?? this.options.config.outputFormat,
+        ...(owner !== undefined ? { owner } : {}),
       }
     );
+  }
+
+  /**
+   * Identity used to scope stored (shielded) responses so callmux_get_result
+   * only returns a caller their OWN results. Keyed on the authenticated
+   * principal — stable across that principal's many short-lived sessions, which
+   * is exactly what the CLI relies on (each `callmux call` is its own session,
+   * yet a later `callmux call callmux_get_result` must reach the stored ref).
+   *
+   * Returns undefined when there is no authenticated principal: an unauthed
+   * listener is a single loopback trust domain with no principal boundary to
+   * enforce, and results stay unowned/public so cross-session CLI paging works.
+   * The cross-principal isolation this closes only exists once auth is on.
+   */
+  private responseOwnerKey(
+    principal: AuthorizationPrincipal | undefined
+  ): string | undefined {
+    return principal ? `principal:${principal.kind}:${principal.id}` : undefined;
   }
 
   private finalizeOutputFormat(
@@ -2739,19 +2777,28 @@ export class CallmuxListener {
       serverHint: unknown
     ): string | null | undefined => {
       if (typeof toolName !== "string" || toolName.trim().length === 0) return undefined;
-      if (typeof serverHint === "string" && serverHint.length > 0) {
-        const prefix = `${serverHint}__`;
-        const actualName = toolName.startsWith(prefix)
-          ? toolName.slice(prefix.length)
-          : toolName;
-        return `${serverHint}__${actualName}`;
-      }
+      const hint =
+        typeof serverHint === "string" && serverHint.length > 0 ? serverHint : undefined;
 
-      const resolved = this.options.upstream.resolveServer(toolName);
+      // Canonicalize through the SAME resolution the executor uses (honoring the
+      // explicit `server` hint), so a prefix alias — e.g. server "github" with
+      // prefix "gh" invoked as { server: "github", tool: "gh__delete_repo" } —
+      // can't dodge a rule written against the real name (github__delete_repo).
+      // Passing the hint is what closes the bypass: resolveServer strips the
+      // alias prefix, whereas a literal `${hint}__${tool}` would not.
+      const resolved = this.options.upstream.resolveServer(toolName, hint);
       if (!resolved || "error" in resolved) {
-        // Canonicalization failed. For an already-qualified name, fall back to
-        // the literal so explicit server__tool rules still match disconnected
-        // servers; otherwise propagate the resolution outcome.
+        // Canonicalization failed. Fall back to a literal qualified name so
+        // explicit server__tool rules still match disconnected servers (a call
+        // that can't resolve here also can't execute, so this only affects
+        // rule-matching, never routing).
+        if (hint) {
+          const prefix = `${hint}__`;
+          const actualName = toolName.startsWith(prefix)
+            ? toolName.slice(prefix.length)
+            : toolName;
+          return `${hint}__${actualName}`;
+        }
         if (toolName.includes("__")) return toolName;
         if (!resolved) return null;
         const message = extractStructuredErrorMessage(resolved.error);

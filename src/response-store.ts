@@ -12,6 +12,11 @@ const DEFAULT_MAX_RESULT_BYTES = 64 * 1024;
 const DEFAULT_MAX_STRING_CHARS = 8192;
 const DEFAULT_MAX_ARRAY_ITEMS = 50;
 const DEFAULT_MAX_STORED_RESULTS = 100;
+// Hard ceiling on the total bytes held across all stored responses, independent
+// of the entry count, so a handful of very large results can't grow memory
+// without bound. Eviction is oldest-first; a single result larger than this is
+// still kept (as the sole entry) so it stays retrievable.
+const DEFAULT_MAX_STORED_BYTES = 256 * 1024 * 1024;
 const DEFAULT_RESULT_PAGE_LIMIT = 50;
 const MAX_RESULT_PAGE_LIMIT = 100;
 const MAX_SHAPE_KEYS = 20;
@@ -24,6 +29,10 @@ interface StoredResponse {
   createdAt: number;
   byteSize: number;
   result: CallToolResult;
+  // Identity of the session/principal that created this entry. Only that owner
+  // may retrieve it. `undefined` means unowned (single-client proxy mode) and
+  // is readable by anyone — the shared listener always sets a concrete owner.
+  owner?: string;
 }
 
 interface ResponseShieldOptions {
@@ -34,6 +43,9 @@ interface ResponseShieldOptions {
   allowTools?: string[];
   denyTools?: string[];
   outputFormat?: OutputFormat;
+  // Owner (session/principal) to scope a stored result to, so only that owner
+  // can retrieve it via callmux_get_result.
+  owner?: string;
 }
 
 export interface ResponseShieldTarget {
@@ -476,15 +488,19 @@ function validateResultQueryArgs(args: unknown): ResultQueryArgs | CallToolResul
 export class ResponseStore {
   private entries = new Map<string, StoredResponse>();
   private totalStored = 0;
+  private currentBytes = 0;
 
-  constructor(private maxEntries = DEFAULT_MAX_STORED_RESULTS) {}
+  constructor(
+    private maxEntries = DEFAULT_MAX_STORED_RESULTS,
+    private maxTotalBytes = DEFAULT_MAX_STORED_BYTES
+  ) {}
 
   setMaxEntries(maxEntries = DEFAULT_MAX_STORED_RESULTS): void {
     this.maxEntries = maxEntries;
-    this.evictOldest();
+    this.evictToLimits();
   }
 
-  store(tool: string, result: CallToolResult): StoredResponse {
+  store(tool: string, result: CallToolResult, owner?: string): StoredResponse {
     const ref = `r_${randomUUID()}`;
     const entry: StoredResponse = {
       ref,
@@ -492,45 +508,61 @@ export class ResponseStore {
       createdAt: Date.now(),
       byteSize: byteLength(result),
       result,
+      ...(owner !== undefined ? { owner } : {}),
     };
     this.entries.set(ref, entry);
+    this.currentBytes += entry.byteSize;
     this.totalStored++;
-    this.evictOldest();
+    this.evictToLimits();
     return entry;
   }
 
-  get(ref: string): StoredResponse | undefined {
-    return this.entries.get(ref);
+  get(ref: string, owner?: string): StoredResponse | undefined {
+    const entry = this.entries.get(ref);
+    if (!entry) return undefined;
+    return this.ownerAllows(entry, owner) ? entry : undefined;
   }
 
   stats(): { entries: number; maxEntries: number; storedBytes: number; totalStored: number } {
-    let storedBytes = 0;
-    for (const entry of this.entries.values()) {
-      storedBytes += entry.byteSize;
-    }
     return {
       entries: this.entries.size,
       maxEntries: this.maxEntries,
-      storedBytes,
+      storedBytes: this.currentBytes,
       totalStored: this.totalStored,
     };
   }
 
-  private evictOldest(): void {
-    while (this.entries.size > this.maxEntries) {
+  /** An entry is retrievable only by its owner; unowned entries are public. */
+  private ownerAllows(entry: StoredResponse, owner: string | undefined): boolean {
+    if (entry.owner === undefined) return true;
+    return entry.owner === owner;
+  }
+
+  private evictToLimits(): void {
+    // Evict oldest-first past either bound. The byte bound keeps at least one
+    // entry so a lone oversized result stays retrievable rather than being
+    // stored and immediately dropped.
+    while (
+      this.entries.size > this.maxEntries ||
+      (this.currentBytes > this.maxTotalBytes && this.entries.size > 1)
+    ) {
       const oldest = this.entries.keys().next().value as string | undefined;
       if (oldest === undefined) return;
+      const evicted = this.entries.get(oldest);
       this.entries.delete(oldest);
+      if (evicted) this.currentBytes -= evicted.byteSize;
     }
   }
 
-  query(args: unknown, defaultOutputFormat?: OutputFormat): CallToolResult {
+  query(args: unknown, defaultOutputFormat?: OutputFormat, owner?: string): CallToolResult {
     const parsed = validateResultQueryArgs(args);
     if (isCallToolResult(parsed)) return parsed;
     const outputFormat = parsed.outputFormat ?? defaultOutputFormat;
 
-    const entry = this.entries.get(parsed.ref);
+    const entry = this.get(parsed.ref, owner);
     if (!entry) {
+      // Same error whether the ref is unknown, evicted, or owned by someone
+      // else — don't disclose that another principal's ref exists.
       return errorResult("result_not_found", `result "${parsed.ref}" not found or expired`, {
         ref: parsed.ref,
       });
@@ -628,7 +660,7 @@ export function shieldToolResult(
 
   if (!shouldShield) return result;
 
-  const entry = store.store(shieldTarget.tool, result);
+  const entry = store.store(shieldTarget.tool, result, options.owner);
   const shape = summarizeDataShape(dataFromResult(result));
   const preview =
     compactedBytes <= resolvedOptions.maxResultBytes

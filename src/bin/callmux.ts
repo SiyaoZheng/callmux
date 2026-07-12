@@ -1169,7 +1169,17 @@ async function runListenerToolCall(
     ...(options.token !== undefined ? { token: options.token } : {}),
     ...(options.tokenFile !== undefined ? { tokenFile: options.tokenFile } : {}),
   };
-  const resolvedToken = await resolveClientTokenDetailed(tokenSources);
+  // Token resolution can throw (missing/empty --token-file, unreadable managed
+  // store). Catch it here as a usage failure (exit 2) rather than letting it
+  // reach main().catch, which exits 1 — the "downstream tool errored" code.
+  let resolvedToken: Awaited<ReturnType<typeof resolveClientTokenDetailed>>;
+  try {
+    resolvedToken = await resolveClientTokenDetailed(tokenSources);
+  } catch (error) {
+    console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 2;
+    return;
+  }
   const headers = withBearerToken(options.headers, resolvedToken.token);
   if (options.verbose) {
     logVerboseListenerRequest(`tools/call ${toolName} via`, listenerUrl, resolvedToken, tokenSources);
@@ -1194,7 +1204,56 @@ async function runListenerToolCall(
 
   if (outcome.result.isError) {
     process.exitCode = 1;
+    return;
   }
+
+  // parallel/batch/pipeline report per-call failures as DATA, not isError, so
+  // without this a failed fan-out would exit 0 and any script gating on the
+  // exit code would treat it as success.
+  if (META_FANOUT_TOOLS.has(toolName)) {
+    const code = metaFanoutExitCode(payload);
+    if (code !== 0) {
+      process.exitCode = code;
+    }
+  }
+}
+
+/** Meta tools whose result encodes per-call failure as data (see metaFanoutExitCode). */
+const META_FANOUT_TOOLS = new Set(["callmux_parallel", "callmux_batch", "callmux_pipeline"]);
+
+/**
+ * Maps a parallel/batch/pipeline result payload onto the documented CLI exit
+ * codes:
+ *   1 — the fan-out ran but a downstream tool reported a tool-level error
+ *       (parallel/batch `status: "partial"`, or a pipeline step whose own
+ *       result was an error).
+ *   2 — execution halted before completion for a structural reason: a pipeline
+ *       step threw or a required `inputMapping` could not be satisfied (the
+ *       failing step carries an `error` string rather than a tool `result`).
+ *   0 — everything succeeded.
+ * The caller only invokes this for known meta tools, so the payload shape is
+ * always a meta result (no risk of a plain tool output being misread).
+ */
+function metaFanoutExitCode(payload: unknown): 0 | 1 | 2 {
+  if (!isRecordValue(payload)) return 0;
+  const status = payload.status;
+
+  if (status === "failed") {
+    const steps = Array.isArray(payload.steps) ? payload.steps : [];
+    const failedStep = typeof payload.failedStep === "number" ? payload.failedStep : undefined;
+    const step =
+      failedStep !== undefined
+        ? steps.find((s) => isRecordValue(s) && s.step === failedStep)
+        : undefined;
+    if (isRecordValue(step) && typeof step.error === "string") return 2;
+    return 1;
+  }
+
+  if (status === "partial") return 1;
+  if (typeof payload.failed === "number" && payload.failed > 0) return 1;
+  if (Array.isArray(payload.failedIndexes) && payload.failedIndexes.length > 0) return 1;
+
+  return 0;
 }
 
 /**
@@ -1470,7 +1529,14 @@ async function fetchToolList(
     ...(options.token !== undefined ? { token: options.token } : {}),
     ...(options.tokenFile !== undefined ? { tokenFile: options.tokenFile } : {}),
   };
-  const resolvedToken = await resolveClientTokenDetailed(tokenSources);
+  // Token resolution can throw (missing/empty --token-file); surface it as an
+  // error outcome so the caller exits 2 instead of it reaching main().catch.
+  let resolvedToken: Awaited<ReturnType<typeof resolveClientTokenDetailed>>;
+  try {
+    resolvedToken = await resolveClientTokenDetailed(tokenSources);
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
   const headers = withBearerToken(options.headers, resolvedToken.token);
   if (options.verbose) {
     logVerboseListenerRequest("tools/list via", options.url, resolvedToken, tokenSources);

@@ -258,20 +258,27 @@ async function prepareResolvedCacheKey(
   upstream: UpstreamManager,
   tool: string,
   args: Record<string, unknown> | undefined,
-  server: string | undefined
+  server: string | undefined,
+  opaqueArgumentKeys?: ReadonlySet<string>
 ): Promise<ResolvedCall | CallToolResult> {
   const maybePrepare = upstream as UpstreamManager & {
     prepareToolCall?: (
       toolName: string,
       args?: Record<string, unknown>,
-      serverHint?: string
+      serverHint?: string,
+      options?: { opaqueArgumentKeys?: ReadonlySet<string> }
     ) => ReturnType<UpstreamManager["prepareToolCall"]>;
   };
   if (typeof maybePrepare.prepareToolCall !== "function") {
     return { args, server };
   }
 
-  const prepared = await maybePrepare.prepareToolCall(tool, args, server);
+  const prepared = await maybePrepare.prepareToolCall(
+    tool,
+    args,
+    server,
+    opaqueArgumentKeys && opaqueArgumentKeys.size > 0 ? { opaqueArgumentKeys } : undefined
+  );
   if ("error" in prepared) return prepared.error;
   return {
     args: prepared.resolvedArguments,
@@ -1264,12 +1271,18 @@ export async function handlePipeline(
     const mappedArguments: Record<string, unknown> = {};
     const skippedMappings: Array<{ argument: string; expression: string; reason: string }> = [];
 
+    // Keys whose values come from the previous step's (untrusted) output. Their
+    // values must NOT be interpreted as $file/$jsonFile references during
+    // argument resolution — otherwise attacker-shaped output could make callmux
+    // read a local file and forward it downstream. See resolveToolArguments.
+    const opaqueArgumentKeys = new Set<string>();
     if (step.inputMapping && i > 0) {
       for (const [argName, expr] of Object.entries(step.inputMapping)) {
         const resolved = resolveMappingWithDiagnostics(previousText, expr);
         if (resolved.matched) {
           mergedArgs[argName] = resolved.value;
           mappedArguments[argName] = resolved.value;
+          opaqueArgumentKeys.add(argName);
         } else {
           skippedMappings.push({
             argument: argName,
@@ -1307,7 +1320,8 @@ export async function handlePipeline(
         upstream,
         step.tool,
         mergedArgs,
-        step.server
+        step.server,
+        opaqueArgumentKeys
       );
       if (isToolErrorResult(prepared)) {
         stepResults.push({
@@ -1800,9 +1814,10 @@ export function handleSearchTools(
 export function handleGetResult(
   responseStore: ResponseStore,
   args: unknown,
-  defaultOutputFormat?: OutputFormat
+  defaultOutputFormat?: OutputFormat,
+  owner?: string
 ): CallToolResult {
-  return responseStore.query(args, defaultOutputFormat);
+  return responseStore.query(args, defaultOutputFormat, owner);
 }
 
 export async function handleRecipeRun(

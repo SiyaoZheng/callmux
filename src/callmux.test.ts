@@ -73,7 +73,7 @@ import {
   writeManagedClientToken,
 } from "./cli-auth.js";
 import { listenerClientUrl, renderSharedListenerStartCommand } from "./setup.js";
-import { createResponseStore } from "./response-store.js";
+import { createResponseStore, ResponseStore } from "./response-store.js";
 import {
   compressToolForExposure,
   resolveSchemaCompressionConfig,
@@ -6449,6 +6449,24 @@ test("prefix alias cannot bypass an authorization rule on the real server name",
   // An unrelated tool stays allowed.
   const allowed = (listener as any).authorizeToolCall("other__ping", {}, principal);
   assert.equal(allowed.allowed, true);
+
+  // Regression (C1): an explicit `server` hint combined with the prefix alias
+  // must ALSO canonicalize to github__search_code. Before the fix, the hint
+  // path built the literal "github__gh__search_code" (matching no rule) while
+  // execution stripped the alias and ran the denied tool — a policy bypass.
+  const hintedAlias = (listener as any).authorizeToolCall(
+    "callmux_call",
+    { tool: "gh__search_code", server: "github" },
+    principal
+  );
+  assert.equal(hintedAlias.allowed, false);
+  // The same bypass shape inside a meta fan-out is denied too.
+  const hintedParallel = (listener as any).authorizeToolCall(
+    "callmux_parallel",
+    { calls: [{ tool: "gh__search_code", server: "github" }] },
+    principal
+  );
+  assert.equal(hintedParallel.allowed, false);
 });
 
 test("loadConfig parses startup timeout settings from file", async () => {
@@ -7637,6 +7655,51 @@ test("pipeline literal string mapping passes expression as-is", async () => {
   });
 
   assert.equal(capturedArgs.mode, "override_value");
+});
+
+test("pipeline inputMapping value is never resolved as a $file reference (C2)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-c2-"));
+  const secretPath = join(dir, "secret.txt");
+  await writeFile(secretPath, "TOP SECRET CONTENTS");
+  // Exactly the shape a $file reference would take, but sourced from the
+  // (untrusted) previous step's output rather than a caller-authored literal.
+  const untrustedRef = JSON.stringify({ $file: secretPath });
+
+  try {
+    const upstream = createMockUpstream([
+      { server: "srv", tool: mockTool("step1") },
+      { server: "srv", tool: mockTool("step2", undefined, ["body"]) },
+    ]) as unknown as UpstreamManager;
+
+    let capturedBody: unknown;
+    (upstream as unknown as {
+      callPrepared: (prepared: {
+        actualName: string;
+        resolvedArguments?: Record<string, unknown>;
+      }) => Promise<CallToolResult>;
+    }).callPrepared = async (prepared) => {
+      if (prepared.actualName === "step1") {
+        return textResult(untrustedRef);
+      }
+      capturedBody = prepared.resolvedArguments?.body;
+      return textResult("done");
+    };
+
+    const result = await handlePipeline(upstream, new CallCache(0), {
+      steps: [
+        { tool: "step1" },
+        { tool: "step2", inputMapping: { body: "$text" } },
+      ],
+    });
+
+    assert.equal(result.isError, undefined);
+    // The mapped value must reach step2 verbatim; callmux must NOT have read the
+    // local file and substituted its contents.
+    assert.equal(capturedBody, untrustedRef);
+    assert.notEqual(capturedBody, "TOP SECRET CONTENTS");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("pipeline inputMapping on first step is ignored", async () => {
@@ -9603,6 +9666,40 @@ test("listener applyRuntimeConfig updates runtime security settings", async () =
   assert.equal(internals.globalRequestBodyMaxBytes, 2048);
   assert.equal(internals.allowRequestBodyMaxOverride, true);
   assert.equal(internals.metrics.getPath(), "/metrics-secure");
+});
+
+test("ResponseStore scopes stored results to their owner", () => {
+  const store = new ResponseStore();
+  const owned = store.store("big_tool", textResult("owned-payload"), "principal:bearer:alice");
+  const unowned = store.store("big_tool", textResult("public-payload"));
+
+  // The owner retrieves their own entry.
+  assert.equal(store.get(owned.ref, "principal:bearer:alice")?.ref, owned.ref);
+  // A different principal cannot — same as if the ref didn't exist.
+  assert.equal(store.get(owned.ref, "principal:bearer:mallory"), undefined);
+  // Neither can an unauthenticated caller.
+  assert.equal(store.get(owned.ref, undefined), undefined);
+  // query() surfaces the miss as result_not_found (no existence disclosure).
+  const denied = store.query({ ref: owned.ref }, undefined, "principal:bearer:mallory");
+  assert.equal(denied.isError, true);
+  assert.equal(
+    (denied.structuredContent as { error: { code: string } }).error.code,
+    "result_not_found"
+  );
+  // Unowned entries (single-client proxy mode) stay readable by anyone.
+  assert.equal(store.get(unowned.ref, "principal:bearer:mallory")?.ref, unowned.ref);
+  assert.equal(store.get(unowned.ref, undefined)?.ref, unowned.ref);
+});
+
+test("ResponseStore enforces a total-byte ceiling independent of entry count", () => {
+  // 1 KiB ceiling; each entry ~2 KiB, so only the newest survives.
+  const store = new ResponseStore(100, 1024);
+  const first = store.store("t", textResult("a".repeat(2048)));
+  const second = store.store("t", textResult("b".repeat(2048)));
+
+  assert.equal(store.get(first.ref), undefined, "oldest evicted past the byte ceiling");
+  assert.equal(store.get(second.ref)?.ref, second.ref, "newest is always retained");
+  assert.ok(store.stats().storedBytes <= 4096);
 });
 
 test("listener applyReloadedState swaps structural listener state", () => {
@@ -12042,6 +12139,78 @@ test("stdio bridge sends tool list changed on reconnect when tools differ", asyn
   }
 });
 
+test("stdio bridge does not replay a tool call after a mid-flight transport drop (N1)", async () => {
+  const bridge = new CallmuxBridge({ url: "http://127.0.0.1:1/mcp", cwd: process.cwd() });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const bridgeClient = new Client({ name: "bridge-n1-noreplay", version: "1.0" }, { capabilities: {} });
+
+  let callCount = 0;
+  const fakeClient = {
+    async listTools() { return { tools: [mockTool("do_write")] }; },
+    async callTool() {
+      callCount++;
+      // A drop of ambiguous timing: the call may already have executed.
+      throw new Error("socket hang up");
+    },
+    async close() {},
+  };
+  (bridge as any).client = fakeClient;
+  // Reconnect succeeds (warms the connection) but keeps the same fake client.
+  (bridge as any).connectUpstream = async () => { (bridge as any).client = fakeClient; };
+
+  try {
+    await (bridge as any).server.connect(serverTransport);
+    await bridgeClient.connect(clientTransport);
+
+    const result = await bridgeClient.callTool({ name: "do_write", arguments: {} }) as any;
+
+    // Executed downstream exactly once — a mid-flight drop must NOT be replayed
+    // (it could double a write), it's surfaced as a retryable error instead.
+    assert.equal(callCount, 1);
+    assert.equal(result.isError, true);
+    assert.equal(result.structuredContent.error.code, "bridge_upstream_unavailable");
+    assert.equal(result.structuredContent.error.details.retryable, true);
+  } finally {
+    await bridgeClient.close().catch(() => undefined);
+    await bridge.close();
+  }
+});
+
+test("stdio bridge replays a tool call after a pre-execution session error (N1)", async () => {
+  const bridge = new CallmuxBridge({ url: "http://127.0.0.1:1/mcp", cwd: process.cwd() });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const bridgeClient = new Client({ name: "bridge-n1-replay", version: "1.0" }, { capabilities: {} });
+
+  let callCount = 0;
+  const fakeClient = {
+    async listTools() { return { tools: [mockTool("do_read")] }; },
+    async callTool() {
+      callCount++;
+      // The stale session is rejected before the tool runs — safe to replay.
+      if (callCount === 1) throw new Error("unknown session id");
+      return { content: [{ type: "text", text: "ok" }] };
+    },
+    async close() {},
+  };
+  (bridge as any).client = fakeClient;
+  (bridge as any).connectUpstream = async () => { (bridge as any).client = fakeClient; };
+
+  try {
+    await (bridge as any).server.connect(serverTransport);
+    await bridgeClient.connect(clientTransport);
+
+    const result = await bridgeClient.callTool({ name: "do_read", arguments: {} }) as any;
+
+    // Re-established the session and replayed — the call provably hadn't run.
+    assert.equal(callCount, 2);
+    assert.equal(result.isError, undefined);
+    assert.deepEqual(result.content, [{ type: "text", text: "ok" }]);
+  } finally {
+    await bridgeClient.close().catch(() => undefined);
+    await bridge.close();
+  }
+});
+
 test("stdio bridge forwards upstream tool list changed notifications in steady state", async () => {
   const bridge = new CallmuxBridge({
     url: "http://127.0.0.1:1/mcp",
@@ -12361,6 +12530,12 @@ test("listener enforces authorization policy for direct and meta-routed tool cal
     return null;
   };
   upstream.callTool = async (toolName: string) => textResult(`ok:${toolName}`);
+  // The passthrough executes an allowed call via callPrepared; delegate it to
+  // the callTool stub so the authorized request still returns a success result.
+  (upstream as unknown as {
+    callPrepared: (prepared: { toolName: string; resolvedArguments?: Record<string, unknown>; server: string }) => Promise<CallToolResult>;
+  }).callPrepared = (prepared) =>
+    upstream.callTool(prepared.toolName, prepared.resolvedArguments, prepared.server);
 
   const cache = new CallCache(0, undefined, {}, 100);
 
@@ -13596,6 +13771,10 @@ test("listener dashboard exposes in-flight and client-aborted tool calls", async
         new Promise<CallToolResult>((resolve) => {
           releaseCall = () => resolve(textResult("released"));
         });
+    // The passthrough executes via callPrepared; stub it identically so the
+    // downstream call stays controllable.
+    (upstream as unknown as { callPrepared: () => Promise<CallToolResult> }).callPrepared =
+      (upstream as unknown as { callTool: () => Promise<CallToolResult> }).callTool;
     listener = new CallmuxListener({
       port: 0,
       host: "127.0.0.1",
@@ -13712,6 +13891,10 @@ test("listener emits timeout overrun event only for still-active tool calls", as
   upstream.callTool = async () => new Promise<CallToolResult>((resolve) => {
     releaseCall = resolve;
   });
+  // The listener passthrough executes via callPrepared (prepare once, then
+  // invoke); stub it identically so this test controls the downstream call.
+  (upstream as unknown as { callPrepared: () => Promise<CallToolResult> }).callPrepared =
+    upstream.callTool;
 
   const listener = new CallmuxListener({
     port: 0,
@@ -13808,6 +13991,9 @@ test("listener lets callmux_call page stored truncated results", async () => {
       name: `item-${index + 1}`,
       body: "x".repeat(500),
     }))));
+  // The passthrough executes via callPrepared; stub it identically.
+  (upstream as unknown as { callPrepared: () => Promise<CallToolResult> }).callPrepared =
+    (upstream as unknown as { callTool: () => Promise<CallToolResult> }).callTool;
 
   const listener = new CallmuxListener({
     port: 0,
@@ -14511,6 +14697,67 @@ test("callmux tools schema exits 2 for an unknown tool", async () => {
   } finally {
     await harness.cleanup();
   }
+});
+
+test("callmux parallel/pipeline exit non-zero when a downstream call fails (L1)", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "callmux-l1-"));
+  const upstream = new UpstreamManager();
+  const good = fakeMcpServer("good", { FAKE_MCP_TOOLS: JSON.stringify([{ name: "do" }]) });
+  const bad = fakeMcpServer("bad", {
+    FAKE_MCP_TOOLS: JSON.stringify([{ name: "do" }]),
+    FAKE_MCP_CALL_MODE: "tool_error",
+  });
+  await upstream.connect({ good, bad });
+  const listener = new CallmuxListener({
+    port: 0,
+    host: "127.0.0.1",
+    config: { servers: { good, bad } },
+    upstream,
+    cache: new CallCache(0, undefined, {}, 100),
+    allTools: [],
+    maxConcurrency: 10,
+  });
+  await listener.start();
+  const url = `http://127.0.0.1:${listenerPort(listener)}/mcp`;
+
+  try {
+    // Baseline: an all-success fan-out still exits 0.
+    const ok = await runCallmuxCli(["parallel", "good__do {}", "--url", url, "--cwd", cwd]);
+    assert.equal(ok.code, 0, ok.stderr);
+
+    // One call tool-errors → status "partial" → exit 1 (was 0 before the fix,
+    // because the failure is reported as data, not result.isError).
+    const partial = await runCallmuxCli([
+      "parallel", "good__do {}", "bad__do {}", "--url", url, "--cwd", cwd,
+    ]);
+    assert.equal(partial.code, 1, partial.stderr);
+    assert.match(partial.stdout, /"status":\s*"partial"/);
+
+    // A pipeline that halts on a failing step also exits non-zero.
+    const pipeline = await runCallmuxCli(["pipeline", "bad__do {}", "--url", url, "--cwd", cwd]);
+    assert.equal(pipeline.code, 1, pipeline.stderr);
+    assert.match(pipeline.stdout, /"status":\s*"failed"/);
+  } finally {
+    await listener.close();
+    await upstream.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("callmux call exits 2 (not 1) for usage errors that throw (L2)", async () => {
+  // A missing --token-file makes token resolution throw; it must be classified
+  // as a usage failure (exit 2), not the downstream-tool-error code (exit 1).
+  const missingToken = await runCallmuxCli([
+    "call", "some_tool", "{}",
+    "--token-file", join(tmpdir(), "callmux-nonexistent-token-file"),
+    "--url", "http://127.0.0.1:1/mcp",
+  ]);
+  assert.equal(missingToken.code, 2, missingToken.stderr);
+
+  // A malformed --url makes new URL() throw inside the request path; likewise 2.
+  const badUrl = await runCallmuxCli(["call", "some_tool", "{}", "--url", "not-a-url"]);
+  assert.equal(badUrl.code, 2, badUrl.stderr);
+  assert.match(badUrl.stderr, /invalid listener URL/i);
 });
 
 test("callmux tools search substring-matches names and descriptions", async () => {

@@ -115,6 +115,12 @@ interface PrepareToolCallOptions {
    * the real wire path instead of the idealized object path.
    */
   modelClientCoercion?: boolean;
+  /**
+   * Top-level argument keys whose values came from an untrusted source (a
+   * pipeline step's inputMapping) and must NOT be interpreted as $file/$jsonFile
+   * /$text references during resolution. See resolveToolArguments.
+   */
+  opaqueArgumentKeys?: ReadonlySet<string>;
 }
 
 interface ScopedClient {
@@ -2284,11 +2290,29 @@ export class UpstreamManager {
   }
 
   async resolveToolArguments(
-    args?: Record<string, unknown>
+    args?: Record<string, unknown>,
+    opaqueArgumentKeys?: ReadonlySet<string>
   ): Promise<Record<string, unknown> | undefined> {
     if (!args) return args;
-    const resolved = await this.resolveFileReferences(args, "arguments");
-    return resolved as Record<string, unknown>;
+    // Top-level argument keys listed in opaqueArgumentKeys carry values from an
+    // UNTRUSTED source (a pipeline step's inputMapping, derived from a previous
+    // step's output). Pass those through verbatim — never scan them for
+    // $file/$jsonFile/$text references — so attacker-shaped output like
+    // {"$file": "/etc/passwd"} can't make callmux read a local file and forward
+    // it downstream. File references are a convenience for caller-authored
+    // argument literals only. Everything else resolves as usual; opaque values
+    // still go on to schema coercion like any other literal.
+    if (!opaqueArgumentKeys || opaqueArgumentKeys.size === 0) {
+      const resolved = await this.resolveFileReferences(args, "arguments");
+      return resolved as Record<string, unknown>;
+    }
+    const entries = await Promise.all(
+      Object.entries(args).map(async ([key, value]) => {
+        if (opaqueArgumentKeys.has(key)) return [key, value] as const;
+        return [key, await this.resolveFileReferences(value, `arguments.${key}`)] as const;
+      })
+    );
+    return Object.fromEntries(entries) as Record<string, unknown>;
   }
 
   private resolvedTool(server: string, actualName: string): Tool | undefined {
@@ -2327,7 +2351,10 @@ export class UpstreamManager {
           clientCoercions
         ) as Record<string, unknown>;
       }
-      const resolvedArguments = await this.resolveToolArguments(inputArguments);
+      const resolvedArguments = await this.resolveToolArguments(
+        inputArguments,
+        options?.opaqueArgumentKeys
+      );
       const normalizedArguments = tool?.inputSchema
         ? normalizeToolArgumentsForSchema(resolvedArguments, tool.inputSchema)
         : resolvedArguments;

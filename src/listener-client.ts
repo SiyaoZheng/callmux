@@ -57,7 +57,19 @@ export async function listenerRequest(
   params: Record<string, unknown>,
   options: ListenerCallOptions = {}
 ): Promise<ListenerRequestOutcome> {
-  const { mcpUrl } = listenerUrls(url);
+  let mcpUrl: string;
+  try {
+    ({ mcpUrl } = listenerUrls(url));
+  } catch (error) {
+    // A malformed --url (e.g. "not-a-url") makes new URL() throw. Return it as a
+    // usage-failure outcome so the CLI exits 2, instead of letting it propagate
+    // to the top-level catch which would exit 1 (the tool-error code).
+    return {
+      ok: false,
+      mcpUrl: url,
+      error: `invalid listener URL "${url}": ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
   const baseHeaders = options.headers ?? {};
   const mcpHeaders: Record<string, string> = {
     ...baseHeaders,

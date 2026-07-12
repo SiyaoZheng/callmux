@@ -382,9 +382,17 @@ export class CallmuxProxy {
     const cached = this.cache.get(name, cacheArgs, cacheServer, cacheScope);
     if (cached) return this.shieldResult(target, cached);
 
-    const result = await this.upstream.callTool(name, cacheArgs, cacheServer, {
-      retryOnReconnect: this.cache.isSafeToRetry(name, cacheServer),
-    });
+    // When we have a prepared resolution, reuse it via callPrepared so we don't
+    // resolve arguments (and re-scan first-pass $file output for further refs) a
+    // second time inside callTool; fall back to callTool for harnesses whose
+    // upstream lacks prepareToolCall.
+    const result = prepared
+      ? await this.upstream.callPrepared(prepared, {
+          retryOnReconnect: this.cache.isSafeToRetry(name, cacheServer),
+        })
+      : await this.upstream.callTool(name, cacheArgs, cacheServer, {
+          retryOnReconnect: this.cache.isSafeToRetry(name, cacheServer),
+        });
     this.cache.set(name, cacheArgs, result, cacheServer, cacheScope);
     return this.shieldResult(target, result);
   }

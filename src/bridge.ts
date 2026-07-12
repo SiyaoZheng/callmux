@@ -81,7 +81,10 @@ export class CallmuxBridge {
 
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
       try {
-        const result = await this.withReconnect((client) => client.listTools());
+        const result = await this.withReconnect(
+          (client) => client.listTools(),
+          { idempotent: true }
+        );
         const changed = this.hasReturnedTools && !sameToolList(result.tools, this.cachedTools);
         this.cachedTools = result.tools;
         this.hasReturnedTools = true;
@@ -145,7 +148,10 @@ export class CallmuxBridge {
     await this.closeUpstream();
   }
 
-  private async withReconnect<T>(operation: (client: Client) => Promise<T>): Promise<T> {
+  private async withReconnect<T>(
+    operation: (client: Client) => Promise<T>,
+    options: { idempotent?: boolean } = {}
+  ): Promise<T> {
     const client = await this.ensureUpstream();
     try {
       return await operation(client);
@@ -154,8 +160,23 @@ export class CallmuxBridge {
         throw error;
       }
 
+      // Reconnect regardless — the connection is known-bad — so the next call
+      // (or a caller-driven retry) lands on a live upstream.
       await this.reconnectUpstream();
-      return operation(await this.ensureUpstream());
+
+      // Only replay the operation automatically when it's safe to do so:
+      //  - idempotent reads (tools/list), or
+      //  - a *pre-execution* failure where the request provably never ran
+      //    downstream (connection refused, unknown/expired session, client not
+      //    connected — the send failed before the listener executed anything).
+      // A mid-flight transport drop (socket hang up, ECONNRESET, connection
+      // closed, fetch failed) may have executed the call already, so silently
+      // re-invoking it would double any side effects. Re-throw those instead
+      // and let the handler surface a retryable error the model can act on.
+      if (options.idempotent || isPreExecutionBridgeError(error)) {
+        return operation(await this.ensureUpstream());
+      }
+      throw error;
     }
   }
 
@@ -370,6 +391,29 @@ function isReconnectableBridgeError(error: unknown): boolean {
     /econnreset/i,
     /fetch failed/i,
     /transport.*closed/i,
+    /not connected/i,
+  ].some((pattern) => pattern.test(message));
+}
+
+/**
+ * A subset of reconnectable errors that provably occur BEFORE the request
+ * reached and executed downstream, so replaying the operation cannot duplicate
+ * a side effect:
+ *  - `econnrefused` — TCP connect refused; nothing was ever sent.
+ *  - `not connected` — the client had no transport; the SDK threw before send.
+ *  - `unknown session` / `re-initialize` — the listener rejected the stale
+ *    session at the HTTP layer (e.g. after a daemon restart) before dispatching
+ *    the tool call.
+ * Everything else in isReconnectableBridgeError (socket hang up, ECONNRESET,
+ * connection closed, fetch failed) is a mid-flight drop of ambiguous timing and
+ * is NOT treated as pre-execution.
+ */
+function isPreExecutionBridgeError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return [
+    /unknown session/i,
+    /re-initialize/i,
+    /econnrefused/i,
     /not connected/i,
   ].some((pattern) => pattern.test(message));
 }
