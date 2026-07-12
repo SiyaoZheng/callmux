@@ -358,6 +358,9 @@ export class CallmuxListener {
         addedTools: event.addedTools,
         removedTools: event.removedTools,
       });
+      for (const session of this.sessions.values()) {
+        void session.server.sendToolListChanged().catch(() => undefined);
+      }
     });
   }
 
@@ -1709,7 +1712,7 @@ export class CallmuxListener {
   private createSession(transport: Transport): Server {
     const server = new Server(
       { name: "callmux", version: "0.1.0" },
-      { capabilities: { tools: {} } }
+      { capabilities: { tools: { listChanged: true } } }
     );
 
     server.setRequestHandler(ListToolsRequestSchema, async () => ({

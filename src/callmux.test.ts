@@ -10691,6 +10691,123 @@ test("listener dashboard exposes tool suite change events", async () => {
   }
 });
 
+test("listener pushes tools/list_changed to connected sessions on tool suite change", async () => {
+  const upstream = new UpstreamManager();
+  const cache = new CallCache(0, undefined, {}, 100);
+  const clients: Array<{ onclose?: () => void; callTool: () => Promise<CallToolResult>; close: () => Promise<void> }> = [];
+  let connectCount = 0;
+  const harness = upstream as unknown as {
+    connectOne: (name: string, config: ServerConfig) => Promise<unknown>;
+  };
+  harness.connectOne = async (name: string, config: ServerConfig) => {
+    connectCount++;
+    const toolNames = connectCount === 1 ? ["get_issue", "old_tool"] : ["get_issue", "new_tool"];
+    const tools = toolNames.map((tool) => mockTool(tool));
+    const client = {
+      onclose: undefined as undefined | (() => void),
+      async callTool() {
+        return textResult("ok");
+      },
+      async close() {},
+    };
+    clients.push(client);
+    return {
+      name,
+      config,
+      client,
+      transport: { async close() {} },
+      resolvedTransport: "stdio",
+      allTools: tools,
+      tools,
+      connectDurationMs: 1,
+    };
+  };
+
+  await upstream.connect({ github: { command: "github-mcp" } });
+  const listener = new CallmuxListener({
+    port: 0,
+    host: "127.0.0.1",
+    config: {
+      servers: { github: { command: "github-mcp" } },
+      dashboard: { enabled: true, maxEvents: 10 },
+    },
+    upstream,
+    cache,
+    allTools: [],
+    maxConcurrency: 10,
+  });
+
+  await listener.start();
+  try {
+    let sendToolListChangedCalls = 0;
+    const fakeSession = {
+      transport: { async close() {} },
+      server: {
+        async sendToolListChanged() {
+          sendToolListChangedCalls++;
+        },
+        async close() {},
+      },
+    };
+    (listener as unknown as { sessions: Map<string, unknown> }).sessions.set(
+      "fake-session",
+      fakeSession
+    );
+
+    clients[0].onclose?.();
+    await upstream.callTool("get_issue", {}, "github", { forceReconnect: true });
+
+    await waitFor(async () => sendToolListChangedCalls === 1);
+    assert.equal(sendToolListChangedCalls, 1);
+  } finally {
+    await listener.close();
+    await upstream.close();
+  }
+});
+
+test("listener advertises tools.listChanged capability on session creation", async () => {
+  const upstream = new UpstreamManager();
+  const cache = new CallCache(0, undefined, {}, 100);
+  const listener = new CallmuxListener({
+    port: 0,
+    host: "127.0.0.1",
+    config: { servers: {} },
+    upstream,
+    cache,
+    allTools: [],
+    maxConcurrency: 10,
+  });
+
+  await listener.start();
+  try {
+    const port = listenerPort(listener);
+    const mcpHeaders = {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+    };
+    const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: "POST",
+      headers: mcpHeaders,
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "list-changed-capability-test", version: "1.0" },
+        },
+      }),
+    });
+    assert.equal(res.status, 200);
+    const body = await parseMcpResponseBody(res);
+    assert.equal(body.result.capabilities.tools.listChanged, true);
+  } finally {
+    await listener.close();
+    await upstream.close();
+  }
+});
+
 test("RuntimeEventStore tracks total events separately from retained history", () => {
   const store = new RuntimeEventStore(2);
   for (let i = 0; i < 3; i += 1) {
