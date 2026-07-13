@@ -38,12 +38,16 @@ callmux also accepts MCP-compatible format (`{ "mcpServers": { ... } }`) so you 
 | `recipes` | object | - | Named reusable callmux workflows ([details](recipes.md)) |
 | `cacheTtlSeconds` | integer | `0` | Cache TTL in seconds (0 = disabled) |
 | `cachePolicy` | object | - | Global cache allow/deny rules (see [Caching](#caching)) |
-| `maxConcurrency` | integer | `20` | Global max concurrent calls for parallel/batch |
+| `maxConcurrency` | integer | `20` | Service-wide max concurrent downstream calls across direct and meta-tool requests |
 | `connectTimeoutMs` | integer | `30000` | Timeout for downstream startup connect + list-tools |
 | `callTimeoutMs` | integer | `180000` | Timeout for downstream tool calls |
 | `reloadDrainTimeoutMs` | integer | longest call timeout + `1000` | Maximum time to drain active calls from an old upstream generation after hot reload |
 | `reconnectPolicy` | object | retry forever | Downstream reconnect/backoff policy (see [Resilience](#resilience)) |
 | `sessionCwdIdleTtlSeconds` | integer | `600` | Idle TTL for listener-mode session-cwd stdio clients (`0` = close after each call) |
+| `listenerSessionInactivityTtlSeconds` | integer | `1800` | Inactivity TTL for streamable HTTP MCP sessions (`0` disables expiry) |
+| `listenerMaxSessions` | integer | `1000` | Maximum live listener MCP sessions; idle sessions are evicted LRU-first at capacity |
+| `maxScopedClients` | integer | `64` | Service-wide cap for cached or connecting cwd/header-scoped downstream clients |
+| `maxScopedClientsPerServer` | integer | `16` | Default per-server cap for cached or connecting cwd/header-scoped downstream clients |
 | `fileReferenceRoots` | string[] | - | Local roots listener-origin `$file`/`$jsonFile`/`$yamlFile` references may read; relative roots resolve beside the config file |
 | `requestBodyMaxBytes` | integer | `1048576` | Global max inbound request payload bytes (`0` = unlimited) |
 | `allowRequestBodyMaxOverride` | boolean | `false` | Allow per-request `x-callmux-max-body-bytes` header override |
@@ -58,6 +62,8 @@ callmux also accepts MCP-compatible format (`{ "mcpServers": { ... } }`) so you 
 | `management` | object | disabled | Standalone listener management API |
 | `strictStartup` | boolean | `false` | Fail startup if any server fails to connect |
 | `maxCacheEntries` | integer | `1000` | Max cached entries before LRU eviction |
+| `maxCacheEntryBytes` | integer | `8388608` | Max serialized bytes retained for one cached result |
+| `maxCacheBytes` | integer | `134217728` | Max serialized bytes retained across all cached results |
 | `metaOnly` | boolean | `false` | Hide proxied tools, expose only meta-tools ([details](meta-only-mode.md)) |
 | `exposeMetaTools` | boolean | `true` | Expose `callmux_*` meta-tools in `tools/list`; set `false` to list only proxied downstream tools |
 | `descriptionMaxLength` | integer | - | Default max chars for tool descriptions in `callmux_status` |
@@ -67,6 +73,7 @@ callmux also accepts MCP-compatible format (`{ "mcpServers": { ... } }`) so you 
 
 Tool-call timeout precedence is: meta-tool `timeoutMs`, then `servers.<name>.callTimeoutMs`, then global `callTimeoutMs`, then the built-in default.
 Session-cwd precedence is: explicit meta-tool `cwd`, request `_meta` cwd, existing session cwd/header, then MCP roots when no session cwd exists.
+Call admission is persistent across requests: direct calls, parallel/batch fan-out, and pipeline steps share the same global and per-server limits. Queued calls retain arrival order among calls eligible to run and are cancelled when the caller's MCP request is cancelled.
 
 `metaOnly` and `exposeMetaTools` control opposite halves of the exposed tool list. `metaOnly: true` hides proxied downstream tools and keeps meta-tools. `exposeMetaTools: false` hides meta-tools and keeps proxied downstream tools. Setting both would expose no tools, so config loading rejects that combination.
 
@@ -91,6 +98,7 @@ Local process servers use `command` to launch:
 | `alwaysLoad` | string[] | - | Tool names the MCP client should eagerly load (sets `_meta` `anthropic/alwaysLoad`) |
 | `prefix` | string | - | Override the multi-server sub-prefix for this server's tools (default = server key; `""` drops it). See [Multi-Server Tool Naming](#multi-server-tool-naming) |
 | `maxConcurrency` | integer | - | Max concurrent calls to this server |
+| `maxScopedClients` | integer | - | Max cached or connecting cwd/header-scoped clients for this server (omit = global per-server default) |
 | `callTimeoutMs` | integer | - | Timeout for tool calls to this server (omit = global) |
 | `requestBodyMaxBytes` | integer | - | Inbound payload cap for calls targeting this server (`0` = unlimited, omit = global) |
 | `cachePolicy` | object | - | Per-server cache allow/deny rules |
@@ -132,6 +140,7 @@ Remote servers use `url` instead of `command`:
 | `alwaysLoad` | string[] | - | Tool names the MCP client should eagerly load (sets `_meta` `anthropic/alwaysLoad`) |
 | `prefix` | string | - | Override the multi-server sub-prefix for this server's tools (default = server key; `""` drops it). See [Multi-Server Tool Naming](#multi-server-tool-naming) |
 | `maxConcurrency` | integer | - | Max concurrent calls to this server |
+| `maxScopedClients` | integer | - | Max cached or connecting cwd/header-scoped clients for this server (omit = global per-server default) |
 | `callTimeoutMs` | integer | - | Timeout for tool calls to this server (omit = global) |
 | `requestBodyMaxBytes` | integer | - | Inbound payload cap for calls targeting this server (`0` = unlimited, omit = global) |
 | `cachePolicy` | object | - | Per-server cache allow/deny rules |
@@ -189,6 +198,8 @@ Enable with `cacheTtlSeconds` or `--cache <seconds>`. Error results are never ca
 {
   "cacheTtlSeconds": 60,
   "maxCacheEntries": 1000,
+  "maxCacheEntryBytes": 8388608,
+  "maxCacheBytes": 134217728,
   "cachePolicy": {
     "allowTools": ["get_*", "list_*", "search_*"],
     "denyTools": ["get_secret"]
@@ -201,13 +212,19 @@ Enable with `cacheTtlSeconds` or `--cache <seconds>`. Error results are never ca
 - Supports exact names and `*` wildcards
 - Per-server policies combine with the global policy
 - Oldest cache entries are evicted after `maxCacheEntries` (default: 1000)
+- Entries larger than `maxCacheEntryBytes` are not stored, and oldest entries
+  are evicted before the cache exceeds `maxCacheBytes`
+- Concurrent misses for an identical cacheable call share one in-flight
+  downstream invocation; one disconnected waiter does not cancel peers, the
+  shared invocation is cancelled when its last waiter leaves, and rejected
+  calls are removed from the in-flight map
 - `callmux_cache_clear` invalidates manually
 
 ---
 
 ## Response Shielding
 
-Response shielding is enabled by default. When a tool result is too large, callmux stores the full result in memory and returns a compact preview with `_callmux.ref`, `_callmux.shape`, and `_callmux.retrieval`. Use `callmux_get_result` to page through the stored result. If an MCP client defers that tool, call `callmux_call` with `tool: "callmux_get_result"` and the same retrieval arguments.
+Response shielding is enabled by default. When a tool result is too large, callmux stores the full result in memory and returns a compact preview with `_callmux.ref`, `_callmux.shape`, and `_callmux.retrieval`. Use `callmux_get_result` to page through the stored result. If an MCP client defers that tool, call `callmux_call` with `tool: "callmux_get_result"` and the same retrieval arguments. A result above either stored-result byte ceiling is never retained; its preview reports `retained: false` and intentionally has no unusable retrieval ref.
 
 Defaults:
 
@@ -218,6 +235,8 @@ Defaults:
 | `maxStringChars` | `8192` | Truncate individual string fields longer than this |
 | `maxArrayItems` | `50` | Truncate arrays longer than this |
 | `maxStoredResults` | `100` | Global stored-result capacity before oldest refs are evicted |
+| `maxStoredResultBytes` | `67108864` | Max serialized bytes retained for one full result |
+| `maxStoredBytes` | `268435456` | Max serialized bytes retained across all full results |
 | `allowTools` | - | Only shield matching tools when set |
 | `denyTools` | - | Never shield matching tools; takes precedence |
 
@@ -230,6 +249,8 @@ Global example:
     "maxStringChars": 4000,
     "maxArrayItems": 25,
     "maxStoredResults": 200,
+    "maxStoredResultBytes": 67108864,
+    "maxStoredBytes": 268435456,
     "denyTools": ["download_*"]
   }
 }
@@ -354,7 +375,7 @@ When auth is configured, dashboard requests use the same listener authentication
 | `retentionDays` | integer | `14` | Maximum retained event age (`0` = row-count-only retention) |
 | `pruneEvery` | integer | `100` | Completed calls between retention prune passes |
 
-The store uses WAL mode, `NORMAL` synchronous mode, indexed target tables for drill-down, and periodic pruning. Forwarded-header audit rows store header names, session id, principal, downstream server, and tool only; raw credential values are never stored.
+The store uses WAL mode, `NORMAL` synchronous mode, indexed target tables for drill-down, and periodic pruning. Inserts are batched in a dedicated worker thread, and dashboard analytical queries run in that worker as well, so optional SQLite observability does not block listener request processing. Forwarded-header audit rows store header names, session id, principal, downstream server, and tool only; raw credential values are never stored.
 
 When the dashboard is enabled, `/dashboard/drilldown` reads this store for per-server, per-tool, per-session, and forwarded-header audit breakdowns.
 
@@ -426,7 +447,10 @@ listener calls alike.
 
 Each tool call is limited to 32 file-backed references, 16 MB of file content in total,
 and four concurrent reads. Each file is opened and read only through `maxBytes + 1`, so
-a file that grows after validation cannot force an unbounded allocation.
+a file that grows after validation cannot force an unbounded allocation. References that
+resolve to the same real path share one filesystem read, including symlink aliases. Every
+occurrence still counts toward the reference and 16 MB expanded-content budgets and keeps
+its own `maxBytes`, so reuse cannot amplify the downstream request past those limits.
 
 Use the reference that matches the downstream field shape:
 
@@ -622,6 +646,8 @@ config — there is no callmux setting for this.
   },
   "cacheTtlSeconds": 60,
   "maxCacheEntries": 1000,
+  "maxCacheEntryBytes": 8388608,
+  "maxCacheBytes": 134217728,
   "cachePolicy": { "denyTools": ["create_*"] },
   "maxConcurrency": 20,
   "connectTimeoutMs": 30000,
@@ -635,6 +661,8 @@ config — there is no callmux setting for this.
   "responseShield": {
     "maxResultBytes": 65536,
     "maxStoredResults": 100,
+    "maxStoredResultBytes": 67108864,
+    "maxStoredBytes": 268435456,
     "denyTools": ["download_*"]
   },
   "schemaCompression": {

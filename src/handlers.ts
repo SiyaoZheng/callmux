@@ -261,6 +261,18 @@ function contextWithSafeRetry(
   };
 }
 
+function contextWithSignal(
+  context: ToolCallContext | undefined,
+  signal: AbortSignal | undefined
+): ToolCallContext | undefined {
+  const { signal: _ignored, ...withoutSignal } = context ?? {};
+  if (Object.keys(withoutSignal).length === 0 && !signal) return undefined;
+  return {
+    ...withoutSignal,
+    ...(signal ? { signal } : {}),
+  };
+}
+
 interface ResolvedCall {
   args: Record<string, unknown> | undefined;
   server: string | undefined;
@@ -723,39 +735,6 @@ function validateCacheClearArgs(
   };
 }
 
-function inferServerFromQualifiedTool(
-  tool: string,
-  explicitServer?: string
-): string | undefined {
-  if (explicitServer) return explicitServer;
-
-  const separator = tool.indexOf("__");
-  if (separator <= 0) return undefined;
-
-  return tool.slice(0, separator);
-}
-
-function resolveServerForConcurrency(
-  upstream: UpstreamManager,
-  tool: string,
-  explicitServer?: string
-): string | undefined {
-  const inferred = inferServerFromQualifiedTool(tool, explicitServer);
-  if (inferred) return inferred;
-
-  const maybeResolve = (upstream as unknown as {
-    resolveServer?: (
-      toolName: string,
-      serverHint?: string
-    ) => { server: string } | { error: CallToolResult } | null;
-  }).resolveServer;
-  if (typeof maybeResolve !== "function") return undefined;
-
-  const resolved = maybeResolve.call(upstream, tool, explicitServer);
-  if (!resolved || "error" in resolved) return undefined;
-  return resolved.server;
-}
-
 type DryRunMode = "call" | "parallel" | "batch" | "pipeline";
 
 type RecipeArgs = { recipe: string; arguments?: Record<string, unknown> };
@@ -1059,29 +1038,7 @@ export async function handleParallel(
 
   const startTime = Date.now();
   const { calls, autoWrappedCalls } = parsedArgs;
-  const callsWithLimits = calls.map((call) => ({
-    call,
-    serverForLimit: resolveServerForConcurrency(upstream, call.tool, call.server),
-  }));
-
-  const globalSemaphore = new Semaphore(maxConcurrency);
-  const serverSemaphores = new Map<string, Semaphore>();
-
-  const getServerSemaphore = (server: string | undefined): Semaphore | undefined => {
-    if (!server) return undefined;
-    let sem = serverSemaphores.get(server);
-    if (sem) return sem;
-    const limit = upstream.getServerConcurrency(server);
-    if (limit === undefined) return undefined;
-    sem = new Semaphore(limit);
-    serverSemaphores.set(server, sem);
-    return sem;
-  };
-
-  const promises = callsWithLimits.map(async ({ call, serverForLimit }) => {
-    const serverSem = getServerSemaphore(serverForLimit);
-    await globalSemaphore.acquire();
-    if (serverSem) await serverSem.acquire();
+  const promises = calls.map(async (call) => {
     const callStart = Date.now();
     try {
       const callContext = contextWithCallOverrides(context, {
@@ -1100,24 +1057,28 @@ export async function handleParallel(
       }
       const cacheScope = cacheScopeForCall(upstream, call.tool, prepared.server, callContext);
       const annotations = prepared.preparedCall?.annotations;
-      const cached = cache.get(
-        call.tool,
-        prepared.args,
-        prepared.server,
-        cacheScope,
-        annotations
+      const { result } = await cache.getOrLoad(
+        {
+          tool: call.tool,
+          args: prepared.args,
+          server: prepared.server,
+          scope: cacheScope,
+          annotations,
+          signal: callContext?.signal,
+        },
+        (operationSignal) => invokeResolved(
+          upstream,
+          call.tool,
+          prepared,
+          contextWithSafeRetry(
+            cache,
+            call.tool,
+            prepared.server,
+            contextWithSignal(callContext, operationSignal),
+            annotations
+          )
+        )
       );
-      if (cached) {
-        return { call, result: unwrapResult(cached), durationMs: Date.now() - callStart };
-      }
-
-      const result = await invokeResolved(
-        upstream,
-        call.tool,
-        prepared,
-        contextWithSafeRetry(cache, call.tool, prepared.server, callContext, annotations)
-      );
-      cache.set(call.tool, prepared.args, result, prepared.server, cacheScope, annotations);
       return { call, result: unwrapResult(result), durationMs: Date.now() - callStart };
     } catch (err) {
       return {
@@ -1125,9 +1086,6 @@ export async function handleParallel(
         error: err instanceof Error ? err.message : String(err),
         durationMs: Date.now() - callStart,
       };
-    } finally {
-      if (serverSem) serverSem.release();
-      globalSemaphore.release();
     }
   });
 
@@ -1182,19 +1140,10 @@ export async function handleBatch(
   const startTime = Date.now();
   const { server, tool, items, timeoutMs, cwd, autoWrappedItems } = parsedArgs;
 
-  const serverForLimit = resolveServerForConcurrency(upstream, tool, server);
-  const serverLimit = serverForLimit
-    ? upstream.getServerConcurrency(serverForLimit)
-    : undefined;
-  const effectiveLimit = serverLimit !== undefined
-    ? Math.min(maxConcurrency, serverLimit)
-    : maxConcurrency;
-  const semaphore = new Semaphore(effectiveLimit);
   let succeeded = 0;
   let failed = 0;
 
   const promises = items.map(async (item, index) => {
-    await semaphore.acquire();
     const callStart = Date.now();
     try {
       const callContext = contextWithCallOverrides(context, {
@@ -1214,26 +1163,28 @@ export async function handleBatch(
       }
       const cacheScope = cacheScopeForCall(upstream, tool, prepared.server, callContext);
       const annotations = prepared.preparedCall?.annotations;
-      const cached = cache.get(
-        tool,
-        prepared.args,
-        prepared.server,
-        cacheScope,
-        annotations
+      const { result } = await cache.getOrLoad(
+        {
+          tool,
+          args: prepared.args,
+          server: prepared.server,
+          scope: cacheScope,
+          annotations,
+          signal: callContext?.signal,
+        },
+        (operationSignal) => invokeResolved(
+          upstream,
+          tool,
+          prepared,
+          contextWithSafeRetry(
+            cache,
+            tool,
+            prepared.server,
+            contextWithSignal(callContext, operationSignal),
+            annotations
+          )
+        )
       );
-      if (cached) {
-        if (cached.isError) failed++;
-        else succeeded++;
-        return { index, result: unwrapResult(cached), durationMs: Date.now() - callStart };
-      }
-
-      const result = await invokeResolved(
-        upstream,
-        tool,
-        prepared,
-        contextWithSafeRetry(cache, tool, prepared.server, callContext, annotations)
-      );
-      cache.set(tool, prepared.args, result, prepared.server, cacheScope, annotations);
       if (result.isError) failed++;
       else succeeded++;
       return { index, result: unwrapResult(result), durationMs: Date.now() - callStart };
@@ -1244,8 +1195,6 @@ export async function handleBatch(
         error: err instanceof Error ? err.message : String(err),
         durationMs: Date.now() - callStart,
       };
-    } finally {
-      semaphore.release();
     }
   });
 
@@ -1385,23 +1334,28 @@ export async function handlePipeline(
       }
       const cacheScope = cacheScopeForCall(upstream, step.tool, prepared.server, callContext);
       const annotations = prepared.preparedCall?.annotations;
-      const cached = cache.get(
-        step.tool,
-        prepared.args,
-        prepared.server,
-        cacheScope,
-        annotations
+      const { result } = await cache.getOrLoad(
+        {
+          tool: step.tool,
+          args: prepared.args,
+          server: prepared.server,
+          scope: cacheScope,
+          annotations,
+          signal: callContext?.signal,
+        },
+        (operationSignal) => invokeResolved(
+          upstream,
+          step.tool,
+          prepared,
+          contextWithSafeRetry(
+            cache,
+            step.tool,
+            prepared.server,
+            contextWithSignal(callContext, operationSignal),
+            annotations
+          )
+        )
       );
-      const result = cached ?? await invokeResolved(
-        upstream,
-        step.tool,
-        prepared,
-        contextWithSafeRetry(cache, step.tool, prepared.server, callContext, annotations)
-      );
-
-      if (!cached) {
-        cache.set(step.tool, prepared.args, result, prepared.server, cacheScope, annotations);
-      }
 
       const durationMs = Date.now() - callStart;
       stepResults.push({
@@ -1660,14 +1614,26 @@ export async function handleCall(
   if (isToolErrorResult(prepared)) return prepared;
   const cacheScope = cacheScopeForCall(upstream, tool, prepared.server, callContext);
   const annotations = prepared.preparedCall?.annotations;
-  const cached = cache.get(tool, prepared.args, prepared.server, cacheScope, annotations);
-  if (cached) return formatResultIfStructured(cached, outputFormat);
-
-  const result = await invokeResolved(upstream, tool, prepared, {
-    ...contextWithSafeRetry(cache, tool, prepared.server, callContext, annotations),
-    forceReconnect,
-  });
-  cache.set(tool, prepared.args, result, prepared.server, cacheScope, annotations);
+  const { result } = await cache.getOrLoad(
+    {
+      tool,
+      args: prepared.args,
+      server: prepared.server,
+      scope: cacheScope,
+      annotations,
+      signal: callContext?.signal,
+    },
+    (operationSignal) => invokeResolved(upstream, tool, prepared, {
+      ...contextWithSafeRetry(
+        cache,
+        tool,
+        prepared.server,
+        contextWithSignal(callContext, operationSignal),
+        annotations
+      ),
+      forceReconnect,
+    })
+  );
   return formatResultIfStructured(result, outputFormat);
 }
 
@@ -2206,43 +2172,4 @@ export function handleStatus(
     ...(includeSessions && listenerDiagnostics ? { listener: listenerDiagnostics } : {}),
     ...(includeRecommendations ? { recommendations } : {}),
   }, { outputFormat });
-}
-
-// ─── Simple concurrency limiter ────────────────────────────────
-
-class Semaphore {
-  private current = 0;
-  private queue: Array<() => void> = [];
-  private queueHead = 0;
-
-  constructor(private max: number) {}
-
-  acquire(): Promise<void> {
-    if (this.current < this.max) {
-      this.current++;
-      return Promise.resolve();
-    }
-    return new Promise<void>((resolve) => {
-      this.queue.push(resolve);
-    });
-  }
-
-  release(): void {
-    const next = this.queue[this.queueHead];
-    if (next) {
-      this.queueHead++;
-      // Periodically compact resolved waiters to avoid unbounded sparse arrays.
-      if (this.queueHead >= 64 && this.queueHead * 2 >= this.queue.length) {
-        this.queue = this.queue.slice(this.queueHead);
-        this.queueHead = 0;
-      }
-      next();
-    } else {
-      if (this.queueHead > 0) {
-        this.queue = [];
-        this.queueHead = 0;
-      }
-      this.current--;
-    }
-  }
 }

@@ -1,5 +1,11 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import {
+  Worker,
+  isMainThread,
+  parentPort,
+  workerData,
+} from "node:worker_threads";
 
 export const DEFAULT_EVENT_STORE_MAX_ROWS = 100_000;
 export const DEFAULT_EVENT_STORE_RETENTION_DAYS = 14;
@@ -11,6 +17,8 @@ interface EventStoreOptions {
   retentionDays?: number;
   pruneEvery?: number;
   now?: () => number;
+  /** Receives asynchronous worker/queue failures without blocking call completion. */
+  onError?: (error: Error) => void;
 }
 
 interface StatementSync {
@@ -78,7 +86,7 @@ interface EventStoreForwardedHeaderRow {
   lastSeenAt: string;
 }
 
-interface EventStoreDrilldown {
+export interface EventStoreDrilldown {
   totals: {
     calls: number;
     errors: number;
@@ -184,7 +192,7 @@ function rowToBreakdown(row: Record<string, unknown>): EventStoreBreakdownRow {
   };
 }
 
-export class EventStore {
+class EventStoreEngine {
   private readonly db: DatabaseSync;
   private readonly maxRows: number;
   private readonly retentionMs: number;
@@ -347,16 +355,30 @@ export class EventStore {
     }
   }
 
-  recordCall(sample: EventStoreCallSample): void {
-    const tsMs = sample.timestampMs ?? this.now();
-    const ts = new Date(tsMs).toISOString();
-    const targets = this.normalizeTargets(sample);
-    const forwardedHeaders = [...new Set((sample.forwardedHeaders ?? []).map((h) => h.toLowerCase()))]
-      .filter(Boolean)
-      .sort();
-
+  recordCalls(samples: EventStoreCallSample[]): void {
+    if (samples.length === 0) return;
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      for (const sample of samples) this.insertCall(sample);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+
+    this.insertsSincePrune += samples.length;
+    if (this.insertsSincePrune >= this.pruneEvery) {
+      this.prune();
+    }
+  }
+
+  private insertCall(sample: EventStoreCallSample): void {
+      const tsMs = sample.timestampMs ?? this.now();
+      const ts = new Date(tsMs).toISOString();
+      const targets = this.normalizeTargets(sample);
+      const forwardedHeaders = [...new Set((sample.forwardedHeaders ?? []).map((h) => h.toLowerCase()))]
+        .filter(Boolean)
+        .sort();
       const result = this.insertEvent.run(
         tsMs,
         ts,
@@ -396,16 +418,6 @@ export class EventStore {
           );
         }
       }
-      this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-
-    this.insertsSincePrune += 1;
-    if (this.insertsSincePrune >= this.pruneEvery) {
-      this.prune();
-    }
   }
 
   queryDrilldown(options: {
@@ -493,7 +505,283 @@ export class EventStore {
   }
 }
 
+const EVENT_STORE_WORKER_MARKER = "callmux-event-store-worker";
+const EVENT_STORE_BATCH_SIZE = 100;
+const EVENT_STORE_BATCH_DELAY_MS = 20;
+const EVENT_STORE_MAX_PENDING_SAMPLES = 10_000;
+
+type WorkerCommand =
+  | { id: number; type: "record"; samples: EventStoreCallSample[] }
+  | { id: number; type: "query"; options: { fromMs?: number; toMs?: number; limit?: number } }
+  | { id: number; type: "close" };
+
+type WorkerReply =
+  | { type: "ready" }
+  | { id: number; ok: true; result?: unknown }
+  | { id: number; ok: false; error: string };
+
+interface EventStoreWorkerData {
+  marker: typeof EVENT_STORE_WORKER_MARKER;
+  options: Omit<EventStoreOptions, "now" | "onError"> & { nowMs?: number };
+}
+
+/**
+ * Async facade over the synchronous node:sqlite implementation. Writes are
+ * batched and every database operation runs in a dedicated worker, so request
+ * completion and dashboard queries never block the listener event loop.
+ */
+export class EventStore {
+  private readonly worker: Worker;
+  private readonly now: () => number;
+  private readonly onError: (error: Error) => void;
+  private readonly pendingRequests = new Map<
+    number,
+    { resolve: (value: unknown) => void; reject: (error: Error) => void }
+  >();
+  private nextRequestId = 1;
+  private pendingSamples: EventStoreCallSample[] = [];
+  private droppedSamples = 0;
+  private batchInFlight = false;
+  private batchTimer: ReturnType<typeof setTimeout> | undefined;
+  private flushWaiters: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
+  private closed = false;
+  private terminalError: Error | undefined;
+  private readonly readyPromise: Promise<void>;
+  private resolveReady!: () => void;
+  private rejectReady!: (error: Error) => void;
+
+  constructor(options: EventStoreOptions) {
+    this.now = options.now ?? Date.now;
+    this.onError = options.onError ?? (() => undefined);
+    const workerOptions: EventStoreWorkerData["options"] = {
+      path: options.path,
+      ...(options.maxRows !== undefined ? { maxRows: options.maxRows } : {}),
+      ...(options.retentionDays !== undefined ? { retentionDays: options.retentionDays } : {}),
+      ...(options.pruneEvery !== undefined ? { pruneEvery: options.pruneEvery } : {}),
+      ...(options.now ? { nowMs: options.now() } : {}),
+    };
+    this.readyPromise = new Promise<void>((resolve, reject) => {
+      this.resolveReady = resolve;
+      this.rejectReady = reject;
+    });
+    this.worker = new Worker(new URL(import.meta.url), {
+      workerData: {
+        marker: EVENT_STORE_WORKER_MARKER,
+        options: workerOptions,
+      } satisfies EventStoreWorkerData,
+    });
+    this.worker.on("message", (message: WorkerReply) => this.onWorkerMessage(message));
+    this.worker.on("error", (error) => this.fail(error));
+    this.worker.on("exit", (code) => {
+      if (!this.closed) {
+        this.fail(new Error(`event store worker exited with code ${code}`));
+      }
+    });
+  }
+
+  async ready(): Promise<void> {
+    await this.readyPromise;
+  }
+
+  recordCall(sample: EventStoreCallSample): void {
+    if (this.closed || this.terminalError) return;
+    const normalized = {
+      ...sample,
+      timestampMs: sample.timestampMs ?? this.now(),
+    };
+    if (this.pendingSamples.length >= EVENT_STORE_MAX_PENDING_SAMPLES) {
+      this.pendingSamples.shift();
+      this.droppedSamples += 1;
+      if (this.droppedSamples === 1 || this.droppedSamples % 1_000 === 0) {
+        this.reportError(new Error(
+          `event store queue capacity reached; dropped ${this.droppedSamples} call sample(s)`
+        ));
+      }
+    }
+    this.pendingSamples.push(normalized);
+    if (this.pendingSamples.length >= EVENT_STORE_BATCH_SIZE) {
+      this.scheduleBatch(0);
+    } else if (!this.batchTimer && !this.batchInFlight) {
+      this.scheduleBatch(EVENT_STORE_BATCH_DELAY_MS);
+    }
+  }
+
+  async flush(): Promise<void> {
+    await this.ready();
+    if (this.terminalError) throw this.terminalError;
+    if (this.pendingSamples.length === 0 && !this.batchInFlight) return;
+    return await new Promise<void>((resolve, reject) => {
+      this.flushWaiters.push({ resolve, reject });
+      this.scheduleBatch(0);
+    });
+  }
+
+  async queryDrilldown(options: {
+    fromMs?: number;
+    toMs?: number;
+    limit?: number;
+  } = {}): Promise<EventStoreDrilldown> {
+    await this.flush();
+    const normalized = {
+      ...options,
+      ...(options.toMs === undefined ? { toMs: this.now() } : {}),
+    };
+    return await this.request("query", { options: normalized }) as EventStoreDrilldown;
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    try {
+      await this.flush();
+      await this.request("close", {});
+    } finally {
+      this.closed = true;
+      if (this.batchTimer) clearTimeout(this.batchTimer);
+      await this.worker.terminate();
+    }
+  }
+
+  private scheduleBatch(delayMs: number): void {
+    if (this.closed || this.terminalError || this.batchInFlight) return;
+    if (this.batchTimer) clearTimeout(this.batchTimer);
+    this.batchTimer = setTimeout(() => {
+      this.batchTimer = undefined;
+      void this.pumpBatch();
+    }, delayMs);
+    this.batchTimer.unref?.();
+  }
+
+  private async pumpBatch(): Promise<void> {
+    if (this.batchInFlight || this.closed || this.terminalError) return;
+    const samples = this.pendingSamples.splice(0, EVENT_STORE_BATCH_SIZE);
+    if (samples.length === 0) {
+      this.resolveFlushWaiters();
+      return;
+    }
+    this.batchInFlight = true;
+    try {
+      await this.request("record", { samples });
+    } catch (error) {
+      this.reportError(error as Error);
+      this.rejectFlushWaiters(error as Error);
+    } finally {
+      this.batchInFlight = false;
+    }
+    if (this.pendingSamples.length > 0) this.scheduleBatch(0);
+    else this.resolveFlushWaiters();
+  }
+
+  private request(
+    type: "record" | "query" | "close",
+    payload: Record<string, unknown>
+  ): Promise<unknown> {
+    if (this.terminalError) return Promise.reject(this.terminalError);
+    const id = this.nextRequestId++;
+    return new Promise((resolve, reject) => {
+      this.pendingRequests.set(id, { resolve, reject });
+      try {
+        this.worker.postMessage({ id, type, ...payload } as WorkerCommand);
+      } catch (error) {
+        // Structured-clone errors are synchronous. Remove the request here so
+        // a malformed programmatic sample cannot leave a permanently pending
+        // entry or make close()/flush() hang later.
+        this.pendingRequests.delete(id);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
+  private onWorkerMessage(message: WorkerReply): void {
+    if ("type" in message && message.type === "ready") {
+      this.resolveReady();
+      return;
+    }
+    if (!("id" in message)) return;
+    const pending = this.pendingRequests.get(message.id);
+    if (!pending) return;
+    this.pendingRequests.delete(message.id);
+    if (message.ok) pending.resolve(message.result);
+    else pending.reject(new Error(message.error));
+  }
+
+  private resolveFlushWaiters(): void {
+    if (this.pendingSamples.length > 0 || this.batchInFlight) return;
+    const waiters = this.flushWaiters.splice(0);
+    for (const waiter of waiters) waiter.resolve();
+  }
+
+  private rejectFlushWaiters(error: Error): void {
+    const waiters = this.flushWaiters.splice(0);
+    for (const waiter of waiters) waiter.reject(error);
+  }
+
+  private fail(error: Error): void {
+    if (this.terminalError) return;
+    this.terminalError = error;
+    this.rejectReady(error);
+    this.reportError(error);
+    for (const pending of this.pendingRequests.values()) pending.reject(error);
+    this.pendingRequests.clear();
+    this.rejectFlushWaiters(error);
+  }
+
+  private reportError(error: Error): void {
+    try {
+      this.onError(error);
+    } catch {
+      // Observability callbacks must not break the worker/queue state machine.
+    }
+  }
+}
+
+async function runEventStoreWorker(data: EventStoreWorkerData): Promise<void> {
+  const port = parentPort;
+  if (!port) return;
+  try {
+    const sqlite = await import("node:sqlite");
+    const { nowMs, ...workerOptions } = data.options;
+    const engine = new EventStoreEngine(
+      {
+        ...workerOptions,
+        ...(nowMs !== undefined ? { now: () => nowMs } : {}),
+      },
+      sqlite.DatabaseSync
+    );
+    port.postMessage({ type: "ready" } satisfies WorkerReply);
+    port.on("message", (command: WorkerCommand) => {
+      try {
+        if (command.type === "record") {
+          engine.recordCalls(command.samples);
+          port.postMessage({ id: command.id, ok: true } satisfies WorkerReply);
+        } else if (command.type === "query") {
+          port.postMessage({
+            id: command.id,
+            ok: true,
+            result: engine.queryDrilldown(command.options),
+          } satisfies WorkerReply);
+        } else {
+          engine.close();
+          port.postMessage({ id: command.id, ok: true } satisfies WorkerReply);
+        }
+      } catch (error) {
+        port.postMessage({
+          id: command.id,
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        } satisfies WorkerReply);
+      }
+    });
+  } catch (error) {
+    throw error;
+  }
+}
+
 export async function openEventStore(options: EventStoreOptions): Promise<EventStore> {
-  const sqlite = await import("node:sqlite");
-  return new EventStore(options, sqlite.DatabaseSync);
+  const store = new EventStore(options);
+  await store.ready();
+  return store;
+}
+
+if (!isMainThread && (workerData as EventStoreWorkerData | undefined)?.marker === EVENT_STORE_WORKER_MARKER) {
+  void runEventStoreWorker(workerData as EventStoreWorkerData);
 }

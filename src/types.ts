@@ -37,6 +37,8 @@ export interface StdioServerConfig {
   cachePolicy?: CachePolicyConfig;
   /** Max concurrent calls to this server (omit to use global maxConcurrency) */
   maxConcurrency?: number;
+  /** Max cached cwd/header-scoped clients for this server (omit to use the global per-server cap) */
+  maxScopedClients?: number;
   /** Timeout in milliseconds for tool calls to this server (omit to use global callTimeoutMs) */
   callTimeoutMs?: number;
   /** Max inbound request payload bytes for calls targeting this server (0 = unlimited, omit to use global) */
@@ -73,6 +75,8 @@ export interface HttpServerConfig {
   cachePolicy?: CachePolicyConfig;
   /** Max concurrent calls to this server (omit to use global maxConcurrency) */
   maxConcurrency?: number;
+  /** Max cached cwd/header-scoped clients for this server (omit to use the global per-server cap) */
+  maxScopedClients?: number;
   /** Timeout in milliseconds for tool calls to this server (omit to use global callTimeoutMs) */
   callTimeoutMs?: number;
   /** Max inbound request payload bytes for calls targeting this server (0 = unlimited, omit to use global) */
@@ -304,7 +308,7 @@ export interface CallmuxConfig {
   cacheTtlSeconds?: number;
   /** Optional global cache policy; supports exact names or "*" wildcards */
   cachePolicy?: CachePolicyConfig;
-  /** Max concurrent calls for parallel() */
+  /** Service-wide max concurrent downstream tool calls */
   maxConcurrency?: number;
   /** Timeout in milliseconds for downstream startup connect/list-tools work */
   connectTimeoutMs?: number;
@@ -316,6 +320,14 @@ export interface CallmuxConfig {
   reconnectPolicy?: ReconnectPolicyConfig;
   /** Idle TTL in seconds for listener-mode session cwd stdio clients (0 = close after each call) */
   sessionCwdIdleTtlSeconds?: number;
+  /** Service-wide cap for cached or connecting cwd/header-scoped clients (default: 64) */
+  maxScopedClients?: number;
+  /** Default per-server cap for cached or connecting cwd/header-scoped clients (default: 16) */
+  maxScopedClientsPerServer?: number;
+  /** Inactivity TTL in seconds for streamable HTTP MCP sessions (default: 1800) */
+  listenerSessionInactivityTtlSeconds?: number;
+  /** Maximum live listener MCP sessions across transports (default: 1000) */
+  listenerMaxSessions?: number;
   /**
    * Local filesystem roots that listener-origin tool calls may read through
    * $file/$jsonFile/$yamlFile references. Omit to disable file-backed
@@ -326,6 +338,10 @@ export interface CallmuxConfig {
   strictStartup?: boolean;
   /** Maximum cached entries before oldest entries are evicted */
   maxCacheEntries?: number;
+  /** Maximum serialized bytes retained for one cached result */
+  maxCacheEntryBytes?: number;
+  /** Maximum serialized bytes retained across all cached results */
+  maxCacheBytes?: number;
   /** Hide proxied tools, expose only meta-tools (callmux_call, parallel, batch, etc.) */
   metaOnly?: boolean;
   /** Expose callmux meta-tools in tools/list (default: true) */
@@ -338,6 +354,10 @@ export interface CallmuxConfig {
   responseShield?: ResponseShieldConfig & {
     /** Maximum stored full results before oldest refs are evicted */
     maxStoredResults?: number;
+    /** Maximum serialized bytes retained for one stored full result */
+    maxStoredResultBytes?: number;
+    /** Maximum serialized bytes retained across all stored full results */
+    maxStoredBytes?: number;
   };
   /** Tool schema compression for prompt-token reduction */
   schemaCompression?: SchemaCompressionConfig;
@@ -375,6 +395,8 @@ export interface InstanceIdentity {
 }
 
 export interface ToolCallContext {
+  /** Cancellation for argument preparation and request-scoped work. */
+  signal?: AbortSignal;
   /** Project/session working directory resolved from MCP roots or listener metadata */
   cwd?: string;
   /** Client session identifier when available */
@@ -557,6 +579,8 @@ export interface CacheEntry {
   server?: string;
   result: CallToolResult;
   expiresAt: number;
+  /** Serialized result bytes charged against the cache memory budget. */
+  byteSize: number;
 }
 
 // ─── Upstream connection (downstream MCP server state) ─────────

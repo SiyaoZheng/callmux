@@ -1,10 +1,91 @@
 import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { CacheEntry, CachePolicyConfig } from "./types.js";
 
+const DEFAULT_MAX_CACHE_ENTRY_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_CACHE_BYTES = 128 * 1024 * 1024;
+
 export type ToolSafetyAnnotations = Pick<
   NonNullable<Tool["annotations"]>,
   "readOnlyHint" | "idempotentHint"
 >;
+
+export interface CacheLoadOptions {
+  tool: string;
+  args?: Record<string, unknown>;
+  server?: string;
+  scope?: string;
+  annotations?: ToolSafetyAnnotations;
+  /** Detaches this wait; shared work is aborted only after its last waiter leaves. */
+  signal?: AbortSignal;
+}
+
+export interface CacheLoadResult {
+  result: CallToolResult;
+  source: "cache" | "coalesced" | "load";
+}
+
+interface InFlightLoad {
+  promise: Promise<CallToolResult>;
+  controller: AbortController;
+  waiters: number;
+  settled: boolean;
+}
+
+function serializedByteLength(value: unknown): number | undefined {
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined
+      ? undefined
+      : Buffer.byteLength(serialized, "utf8");
+  } catch {
+    // Values that cannot cross the JSON/MCP wire safely should not be retained.
+    return undefined;
+  }
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  if (signal.reason !== undefined) return signal.reason;
+  const error = new Error("cache wait aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function waitForSharedResult<T>(
+  promise: Promise<T>,
+  signal?: AbortSignal,
+  onDetach?: () => void
+): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    onDetach?.();
+    return Promise.reject(abortReason(signal));
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    let detached = false;
+    const detach = () => {
+      if (detached) return;
+      detached = true;
+      signal.removeEventListener("abort", onAbort);
+      onDetach?.();
+    };
+    const onAbort = () => {
+      detach();
+      reject(abortReason(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        detach();
+        resolve(value);
+      },
+      (error) => {
+        detach();
+        reject(error);
+      }
+    );
+  });
+}
 
 function normalizeToolName(tool: string): string {
   const separator = tool.lastIndexOf("__");
@@ -51,11 +132,16 @@ function matchesPolicy(patterns: string[], candidates: string[]): boolean {
 
 export class CallCache {
   private entries = new Map<string, CacheEntry>();
+  private inFlight = new Map<string, InFlightLoad>();
   private ttlMs: number;
   private maxEntries: number;
+  private maxEntryBytes: number;
+  private maxTotalBytes: number;
+  private currentBytes = 0;
   private pruneIntervalMs: number;
   private hits = 0;
   private misses = 0;
+  private coalesced = 0;
   private nextPruneAt = 0;
   private globalPolicy?: CachePolicyConfig;
   private serverPolicies: Map<string, CachePolicyConfig>;
@@ -64,10 +150,14 @@ export class CallCache {
     ttlSeconds: number,
     globalPolicy?: CachePolicyConfig,
     serverPolicies?: Record<string, CachePolicyConfig | undefined>,
-    maxEntries = 1000
+    maxEntries = 1000,
+    maxEntryBytes = DEFAULT_MAX_CACHE_ENTRY_BYTES,
+    maxTotalBytes = DEFAULT_MAX_CACHE_BYTES
   ) {
     this.ttlMs = ttlSeconds * 1000;
     this.maxEntries = maxEntries;
+    this.maxEntryBytes = maxEntryBytes;
+    this.maxTotalBytes = maxTotalBytes;
     this.pruneIntervalMs = this.ttlMs > 0 ? Math.min(this.ttlMs, 1_000) : 0;
     this.globalPolicy = globalPolicy;
     this.serverPolicies = new Map(
@@ -175,7 +265,7 @@ export class CallCache {
   private pruneExpired(now = Date.now()): void {
     for (const [key, entry] of this.entries) {
       if (now > entry.expiresAt) {
-        this.entries.delete(key);
+        this.deleteEntry(key);
       }
     }
   }
@@ -186,12 +276,60 @@ export class CallCache {
     this.nextPruneAt = now + this.pruneIntervalMs;
   }
 
+  private deleteEntry(key: string): void {
+    const entry = this.entries.get(key);
+    if (!entry) return;
+    this.entries.delete(key);
+    this.currentBytes = Math.max(0, this.currentBytes - entry.byteSize);
+  }
+
   private evictOldest(): void {
-    while (this.entries.size > this.maxEntries) {
+    while (
+      this.entries.size > this.maxEntries ||
+      this.currentBytes > this.maxTotalBytes
+    ) {
       const oldest = this.entries.keys().next().value as string | undefined;
       if (oldest === undefined) return;
-      this.entries.delete(oldest);
+      this.deleteEntry(oldest);
     }
+  }
+
+  private waitForInFlight(
+    entry: InFlightLoad,
+    signal?: AbortSignal
+  ): Promise<CallToolResult> {
+    entry.waiters++;
+    let detached = false;
+    const detach = () => {
+      if (detached) return;
+      detached = true;
+      entry.waiters = Math.max(0, entry.waiters - 1);
+      if (
+        entry.waiters === 0 &&
+        !entry.settled &&
+        !entry.controller.signal.aborted
+      ) {
+        entry.controller.abort(
+          new Error("all callers aborted while waiting for shared cache load")
+        );
+      }
+    };
+
+    if (!signal) {
+      return new Promise<CallToolResult>((resolve, reject) => {
+        entry.promise.then(
+          (result) => {
+            detach();
+            resolve(result);
+          },
+          (error) => {
+            detach();
+            reject(error);
+          }
+        );
+      });
+    }
+    return waitForSharedResult(entry.promise, signal, detach);
   }
 
   get(
@@ -214,7 +352,7 @@ export class CallCache {
       return null;
     }
     if (now > entry.expiresAt) {
-      this.entries.delete(key);
+      this.deleteEntry(key);
       this.misses++;
       return null;
     }
@@ -240,13 +378,119 @@ export class CallCache {
     const now = Date.now();
     this.maybePruneExpired(now);
 
-    this.entries.set(this.key(tool, args, effectiveServer, scope), {
+    const key = this.key(tool, args, effectiveServer, scope);
+    // A replacement must not leave the old byte charge behind. If the new
+    // value is too large, remove the old value as well so a completed refresh
+    // cannot expose stale data under the same key.
+    this.deleteEntry(key);
+    const byteSize = serializedByteLength(result);
+    if (
+      byteSize === undefined ||
+      byteSize > this.maxEntryBytes ||
+      byteSize > this.maxTotalBytes
+    ) {
+      return;
+    }
+
+    this.entries.set(key, {
       tool,
       server: effectiveServer,
       result,
       expiresAt: now + this.ttlMs,
+      byteSize,
     });
+    this.currentBytes += byteSize;
     this.evictOldest();
+  }
+
+  async getOrLoad(
+    options: CacheLoadOptions,
+    loader: (operationSignal?: AbortSignal) => Promise<CallToolResult>
+  ): Promise<CacheLoadResult> {
+    const cached = this.get(
+      options.tool,
+      options.args,
+      options.server,
+      options.scope,
+      options.annotations
+    );
+    if (cached) return { result: cached, source: "cache" };
+    if (options.signal?.aborted) {
+      throw abortReason(options.signal);
+    }
+
+    const effectiveServer = this.effectiveServer(options.tool, options.server);
+    if (!this.canCache(options.tool, effectiveServer, options.annotations)) {
+      return {
+        // Preserve ordinary downstream cancellation semantics for calls that
+        // are not eligible for sharing. The loader owns its request signal;
+        // getOrLoad must not settle ahead of it and bypass lifecycle cleanup.
+        result: await loader(options.signal),
+        source: "load",
+      };
+    }
+
+    const key = this.key(
+      options.tool,
+      options.args,
+      effectiveServer,
+      options.scope
+    );
+    let existing = this.inFlight.get(key);
+    if (existing?.controller.signal.aborted && existing.waiters === 0) {
+      if (this.inFlight.get(key) === existing) this.inFlight.delete(key);
+      existing = undefined;
+    }
+    if (existing) {
+      this.coalesced++;
+      return {
+        result: await this.waitForInFlight(existing, options.signal),
+        source: "coalesced",
+      };
+    }
+
+    const controller = new AbortController();
+    const pending = Promise.resolve()
+      // A cacheable operation may have multiple request-scoped waiters. Its
+      // controller is aborted only after every attached waiter has left.
+      .then(() => loader(controller.signal))
+      .then((result) => {
+        if (!controller.signal.aborted) {
+          this.set(
+            options.tool,
+            options.args,
+            result,
+            effectiveServer,
+            options.scope,
+            options.annotations
+          );
+        }
+        return result;
+      });
+    const entry: InFlightLoad = {
+      promise: pending,
+      controller,
+      waiters: 0,
+      settled: false,
+    };
+    this.inFlight.set(key, entry);
+    // Register both settlement handlers so cleanup never creates a secondary
+    // unhandled rejection and only deletes the generation it installed.
+    pending.then(
+      () => {
+        entry.settled = true;
+        if (this.inFlight.get(key) === entry) this.inFlight.delete(key);
+      },
+      () => {
+        entry.settled = true;
+        if (this.inFlight.get(key) === entry) this.inFlight.delete(key);
+      }
+    );
+
+    return {
+      result: await this.waitForInFlight(entry, options.signal),
+      source: "load",
+    };
   }
 
   invalidate(tool?: string, server?: string): void {
@@ -255,12 +499,13 @@ export class CallCache {
     if (!tool) {
       if (!server) {
         this.entries.clear();
+        this.currentBytes = 0;
         return;
       }
 
       for (const [key, entry] of this.entries) {
         if (entry.server === server) {
-          this.entries.delete(key);
+          this.deleteEntry(key);
         }
       }
       return;
@@ -268,7 +513,7 @@ export class CallCache {
 
     for (const [key, entry] of this.entries) {
       if (entry.tool === tool && (server === undefined || entry.server === server)) {
-        this.entries.delete(key);
+        this.deleteEntry(key);
       }
     }
   }
@@ -287,6 +532,11 @@ export class CallCache {
     ttlSeconds: number;
     enabled: boolean;
     maxEntries: number;
+    maxEntryBytes: number;
+    maxTotalBytes: number;
+    storedBytes: number;
+    inFlight: number;
+    coalesced: number;
     hits: number;
     misses: number;
     hitRate: number;
@@ -298,6 +548,11 @@ export class CallCache {
       ttlSeconds: this.ttlMs / 1000,
       enabled: this.ttlMs > 0,
       maxEntries: this.maxEntries,
+      maxEntryBytes: this.maxEntryBytes,
+      maxTotalBytes: this.maxTotalBytes,
+      storedBytes: this.currentBytes,
+      inFlight: this.inFlight.size,
+      coalesced: this.coalesced,
       hits: this.hits,
       misses: this.misses,
       hitRate: lookups > 0 ? this.hits / lookups : 0,

@@ -3,7 +3,12 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import {
+  createServer,
+  request as httpRequest,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
 import { createConnection } from "node:net";
 import { createSign, generateKeyPairSync } from "node:crypto";
 import { spawn } from "node:child_process";
@@ -56,7 +61,7 @@ import { CallmuxProxy } from "./proxy.js";
 import { createListener } from "./library.js";
 import { mapBounded, UpstreamManager } from "./upstream.js";
 import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
-import type { CallmuxConfig, ServerConfig, StdioServerConfig } from "./types.js";
+import type { CallmuxConfig, ServerConfig, StdioServerConfig, ToolCallContext } from "./types.js";
 import { META_TOOLS } from "./meta-tools.js";
 import { errorResult } from "./results.js";
 import { formatToolText } from "./output-format.js";
@@ -79,7 +84,7 @@ import {
   renderSharedListenerStartCommand,
   setupPromptDefaults,
 } from "./setup.js";
-import { createResponseStore, ResponseStore } from "./response-store.js";
+import { createResponseStore, ResponseStore, shieldToolResult } from "./response-store.js";
 import {
   compressToolForExposure,
   resolveSchemaCompressionConfig,
@@ -371,6 +376,170 @@ test("CallCache tracks hit/miss counters and hit rate", () => {
   assert.ok(Math.abs(stats.hitRate - 1 / 3) < 1e-9);
 });
 
+test("CallCache enforces hard per-entry and aggregate byte ceilings", () => {
+  const first = textResult("a".repeat(64));
+  const second = textResult("b".repeat(64));
+  const entryBytes = Buffer.byteLength(JSON.stringify(first), "utf8");
+  const cache = new CallCache(
+    60,
+    { allowTools: ["*"] },
+    undefined,
+    100,
+    entryBytes,
+    entryBytes * 2 - 1
+  );
+
+  cache.set("get_item", { id: 1 }, first);
+  assert.equal(cache.stats().storedBytes, entryBytes);
+  cache.set("get_item", { id: 2 }, second);
+
+  assert.equal(cache.get("get_item", { id: 1 }), null);
+  assert.deepEqual(cache.get("get_item", { id: 2 }), second);
+  assert.equal(cache.stats().storedBytes, entryBytes);
+
+  cache.set("get_item", { id: 3 }, textResult("x".repeat(65)));
+  assert.equal(cache.get("get_item", { id: 3 }), null);
+  assert.equal(cache.stats().storedBytes, entryBytes);
+});
+
+test("CallCache byte accounting stays exact through replace, expiry, and clear", async () => {
+  const cache = new CallCache(0.02, { allowTools: ["*"] });
+  const small = textResult("small");
+  const larger = textResult("larger-value");
+  const smallBytes = Buffer.byteLength(JSON.stringify(small), "utf8");
+  const largerBytes = Buffer.byteLength(JSON.stringify(larger), "utf8");
+
+  cache.set("get_item", { id: 1 }, small, "github");
+  assert.equal(cache.stats().storedBytes, smallBytes);
+  cache.set("get_item", { id: 1 }, larger, "github");
+  assert.equal(cache.stats().storedBytes, largerBytes);
+  cache.set("get_item", { id: 2 }, small, "linear");
+  assert.equal(cache.stats().storedBytes, largerBytes + smallBytes);
+
+  cache.invalidate(undefined, "github");
+  assert.equal(cache.stats().storedBytes, smallBytes);
+  cache.invalidate();
+  assert.equal(cache.stats().storedBytes, 0);
+
+  cache.set("get_item", { id: 3 }, small);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(cache.stats().entries, 0);
+  assert.equal(cache.stats().storedBytes, 0);
+});
+
+test("CallCache coalesces identical safe misses and caches the leader result", async () => {
+  const cache = new CallCache(60, { allowTools: ["get_item"] });
+  let calls = 0;
+  let release!: (result: CallToolResult) => void;
+  const pendingResult = new Promise<CallToolResult>((resolve) => { release = resolve; });
+  const loader = async () => {
+    calls++;
+    return pendingResult;
+  };
+  const options = { tool: "get_item", args: { id: 1 } };
+
+  const first = cache.getOrLoad(options, loader);
+  await Promise.resolve();
+  const second = cache.getOrLoad(options, loader);
+  await Promise.resolve();
+
+  assert.equal(calls, 1);
+  assert.equal(cache.stats().inFlight, 1);
+  release(textResult("shared"));
+  const [firstLoaded, secondLoaded] = await Promise.all([first, second]);
+
+  assert.equal(firstLoaded.source, "load");
+  assert.equal(secondLoaded.source, "coalesced");
+  assert.deepEqual(firstLoaded.result, textResult("shared"));
+  assert.deepEqual(secondLoaded.result, textResult("shared"));
+  assert.equal(cache.stats().inFlight, 0);
+  assert.equal(cache.stats().coalesced, 1);
+  assert.deepEqual(cache.get("get_item", { id: 1 }), textResult("shared"));
+});
+
+test("CallCache clears rejected coalesced work and never caches error results", async () => {
+  const cache = new CallCache(60, { allowTools: ["get_item"] });
+  let calls = 0;
+  const rejecting = async (): Promise<CallToolResult> => {
+    calls++;
+    throw new Error("leader failed");
+  };
+  const options = { tool: "get_item", args: { id: 1 } };
+
+  const rejected = await Promise.allSettled([
+    cache.getOrLoad(options, rejecting),
+    cache.getOrLoad(options, rejecting),
+  ]);
+  assert.deepEqual(rejected.map((item) => item.status), ["rejected", "rejected"]);
+  assert.equal(calls, 1);
+  assert.equal(cache.stats().inFlight, 0);
+
+  const error = errorResult("downstream", "nope");
+  const [firstError, secondError] = await Promise.all([
+    cache.getOrLoad(options, async () => { calls++; return error; }),
+    cache.getOrLoad(options, async () => { calls++; return error; }),
+  ]);
+  assert.deepEqual(firstError.result, error);
+  assert.deepEqual(secondError.result, error);
+  assert.equal(calls, 2, "rejection cleanup permits one new shared load");
+  assert.equal(cache.size, 0, "resolved tool errors are shared but not retained");
+});
+
+test("CallCache abort detaches the leading waiter without cancelling shared work", async () => {
+  const cache = new CallCache(60, { allowTools: ["get_item"] });
+  let calls = 0;
+  let sharedSignal: AbortSignal | undefined;
+  let release!: (result: CallToolResult) => void;
+  const pendingResult = new Promise<CallToolResult>((resolve) => { release = resolve; });
+  const options = { tool: "get_item", args: { id: 1 } };
+  const controller = new AbortController();
+  const leader = cache.getOrLoad(
+    { ...options, signal: controller.signal },
+    async (operationSignal) => {
+      calls++;
+      sharedSignal = operationSignal;
+      assert.ok(operationSignal);
+      return pendingResult;
+    }
+  );
+  await Promise.resolve();
+
+  const waiter = cache.getOrLoad(options, async () => {
+    calls++;
+    return textResult("must-not-run");
+  });
+  controller.abort(new Error("caller left"));
+  await assert.rejects(leader, /caller left/);
+  assert.equal(sharedSignal?.aborted, false, "the remaining waiter keeps shared work alive");
+
+  release(textResult("completed"));
+  assert.deepEqual((await waiter).result, textResult("completed"));
+  assert.equal(calls, 1);
+  assert.deepEqual(cache.get("get_item", { id: 1 }), textResult("completed"));
+});
+
+test("CallCache aborts shared work after its last waiter detaches", async () => {
+  const cache = new CallCache(60, { allowTools: ["get_item"] });
+  const controller = new AbortController();
+  let operationSignal: AbortSignal | undefined;
+  const load = cache.getOrLoad(
+    { tool: "get_item", args: { id: 1 }, signal: controller.signal },
+    async (signal) => {
+      operationSignal = signal;
+      return await new Promise<CallToolResult>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    }
+  );
+  await waitFor(async () => operationSignal !== undefined, 500, 1);
+
+  controller.abort(new Error("only caller left"));
+  await assert.rejects(load, /only caller left/);
+  assert.equal(operationSignal?.aborted, true);
+  await waitFor(async () => cache.stats().inFlight === 0, 500, 1);
+  assert.equal(cache.size, 0);
+});
+
 test("CallCache respects explicit allow and deny policies", () => {
   const cache = new CallCache(
     60,
@@ -433,7 +602,7 @@ test("parallel caching is scoped by server identity", async () => {
   assert.equal(calls, 2);
 });
 
-test("per-server concurrency limits parallel calls to that server", async () => {
+test("parallel delegates per-server admission to UpstreamManager", async () => {
   let maxConcurrent = 0;
   let current = 0;
   const upstream = {
@@ -444,9 +613,7 @@ test("per-server concurrency limits parallel calls to that server", async () => 
       current--;
       return textResult("ok");
     },
-    getServerConcurrency(server: string) {
-      return server === "fragile" ? 1 : undefined;
-    },
+    getServerConcurrency() { throw new Error("handler must not create a local limiter"); },
   };
 
   await handleParallel(
@@ -462,10 +629,10 @@ test("per-server concurrency limits parallel calls to that server", async () => 
     10
   );
 
-  assert.equal(maxConcurrent, 1);
+  assert.equal(maxConcurrent, 3);
 });
 
-test("per-server concurrency limits qualified parallel tool calls without server hint", async () => {
+test("qualified parallel calls do not create a per-invocation limiter", async () => {
   let maxConcurrent = 0;
   let current = 0;
   const upstream = {
@@ -476,9 +643,7 @@ test("per-server concurrency limits qualified parallel tool calls without server
       current--;
       return textResult("ok");
     },
-    getServerConcurrency(server: string) {
-      return server === "fragile" ? 1 : undefined;
-    },
+    getServerConcurrency() { throw new Error("handler must not create a local limiter"); },
   };
 
   await handleParallel(
@@ -494,10 +659,10 @@ test("per-server concurrency limits qualified parallel tool calls without server
     10
   );
 
-  assert.equal(maxConcurrent, 1);
+  assert.equal(maxConcurrent, 3);
 });
 
-test("per-server concurrency limits unique unqualified parallel tool calls", async () => {
+test("unqualified parallel calls do not create a per-invocation limiter", async () => {
   let maxConcurrent = 0;
   let current = 0;
   const upstream = {
@@ -508,9 +673,7 @@ test("per-server concurrency limits unique unqualified parallel tool calls", asy
       current--;
       return textResult("ok");
     },
-    getServerConcurrency(server: string) {
-      return server === "fragile" ? 1 : undefined;
-    },
+    getServerConcurrency() { throw new Error("handler must not create a local limiter"); },
     resolveServer(toolName: string) {
       return { client: {}, actualName: toolName, server: "fragile" };
     },
@@ -529,10 +692,10 @@ test("per-server concurrency limits unique unqualified parallel tool calls", asy
     10
   );
 
-  assert.equal(maxConcurrent, 1);
+  assert.equal(maxConcurrent, 3);
 });
 
-test("batch respects per-server concurrency limit", async () => {
+test("batch delegates per-server admission to UpstreamManager", async () => {
   let maxConcurrent = 0;
   let current = 0;
   const upstream = {
@@ -543,7 +706,7 @@ test("batch respects per-server concurrency limit", async () => {
       current--;
       return textResult("ok");
     },
-    getServerConcurrency() { return 2; },
+    getServerConcurrency() { throw new Error("handler must not create a local limiter"); },
   };
 
   await handleBatch(
@@ -562,10 +725,10 @@ test("batch respects per-server concurrency limit", async () => {
     10
   );
 
-  assert.equal(maxConcurrent, 2);
+  assert.equal(maxConcurrent, 4);
 });
 
-test("batch respects per-server concurrency limit for qualified tool without server hint", async () => {
+test("qualified batch calls do not create a per-invocation limiter", async () => {
   let maxConcurrent = 0;
   let current = 0;
   const upstream = {
@@ -576,9 +739,7 @@ test("batch respects per-server concurrency limit for qualified tool without ser
       current--;
       return textResult("ok");
     },
-    getServerConcurrency(server: string) {
-      return server === "limited" ? 2 : undefined;
-    },
+    getServerConcurrency() { throw new Error("handler must not create a local limiter"); },
   };
 
   await handleBatch(
@@ -596,10 +757,10 @@ test("batch respects per-server concurrency limit for qualified tool without ser
     10
   );
 
-  assert.equal(maxConcurrent, 2);
+  assert.equal(maxConcurrent, 4);
 });
 
-test("batch respects per-server concurrency limit for unique unqualified tool", async () => {
+test("unqualified batch calls do not create a per-invocation limiter", async () => {
   let maxConcurrent = 0;
   let current = 0;
   const upstream = {
@@ -610,9 +771,7 @@ test("batch respects per-server concurrency limit for unique unqualified tool", 
       current--;
       return textResult("ok");
     },
-    getServerConcurrency(server: string) {
-      return server === "limited" ? 2 : undefined;
-    },
+    getServerConcurrency() { throw new Error("handler must not create a local limiter"); },
     resolveServer(toolName: string) {
       return { client: {}, actualName: toolName, server: "limited" };
     },
@@ -633,7 +792,7 @@ test("batch respects per-server concurrency limit for unique unqualified tool", 
     10
   );
 
-  assert.equal(maxConcurrent, 2);
+  assert.equal(maxConcurrent, 4);
 });
 
 test("batch coerces string arguments from downstream tool schema", async () => {
@@ -769,6 +928,218 @@ test("invalid concurrency fails fast instead of hanging", async () => {
       details: { maxConcurrency: 0 },
     },
   });
+});
+
+test("UpstreamManager admission persists across direct and meta-tool fan-out", async () => {
+  const upstream = new UpstreamManager();
+  const started: string[] = [];
+  const releases: Array<() => void> = [];
+  let active = 0;
+  let maxActive = 0;
+
+  const internal = upstream as unknown as {
+    connectOne: (name: string, config: ServerConfig) => Promise<unknown>;
+  };
+  internal.connectOne = async (name, config) => {
+    const tool: Tool = { name: "work", inputSchema: { type: "object" } };
+    return {
+      name,
+      config,
+      client: {
+        async callTool() {
+          started.push(name);
+          active++;
+          maxActive = Math.max(maxActive, active);
+          await new Promise<void>((resolve) => releases.push(resolve));
+          active--;
+          return textResult(name);
+        },
+        async close() {},
+      },
+      transport: { async close() {} },
+      resolvedTransport: "stdio",
+      allTools: [tool],
+      tools: [tool],
+      connectDurationMs: 0,
+    };
+  };
+
+  await upstream.connect(
+    {
+      alpha: { command: "ignored", maxConcurrency: 1 },
+      beta: { command: "ignored", maxConcurrency: 2 },
+    },
+    { maxConcurrency: 2 }
+  );
+
+  const direct = upstream.callTool("alpha__work");
+  const parallel = handleParallel(
+    upstream,
+    new CallCache(0),
+    {
+      calls: [
+        { tool: "alpha__work", arguments: {} },
+        { tool: "beta__work", arguments: {} },
+      ],
+    },
+    2
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(started, ["alpha", "beta"]);
+  assert.equal(maxActive, 2);
+
+  releases.shift()?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, ["alpha", "beta", "alpha"]);
+
+  while (releases.length > 0) releases.shift()?.();
+  await Promise.all([direct, parallel]);
+  await upstream.close();
+});
+
+test("queued downstream admission is abortable without consuming capacity", async () => {
+  const upstream = new UpstreamManager();
+  let calls = 0;
+  let releaseFirst: (() => void) | undefined;
+  const internal = upstream as unknown as {
+    connectOne: (name: string, config: ServerConfig) => Promise<unknown>;
+  };
+  internal.connectOne = async (name, config) => {
+    const tool: Tool = { name: "work", inputSchema: { type: "object" } };
+    return {
+      name,
+      config,
+      client: {
+        async callTool() {
+          calls++;
+          await new Promise<void>((resolve) => {
+            releaseFirst = resolve;
+          });
+          return textResult("ok");
+        },
+        async close() {},
+      },
+      transport: { async close() {} },
+      resolvedTransport: "stdio",
+      allTools: [tool],
+      tools: [tool],
+      connectDurationMs: 0,
+    };
+  };
+
+  await upstream.connect({ only: { command: "ignored" } }, { maxConcurrency: 1 });
+  const first = upstream.callTool("work");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const controller = new AbortController();
+  const queued = upstream.callTool("work", {}, undefined, { signal: controller.signal });
+  controller.abort();
+  const result = await queued;
+
+  assert.equal(calls, 1);
+  assert.equal(result.isError, true);
+  assert.equal(
+    (result.structuredContent as { error?: { code?: string } } | undefined)?.error?.code,
+    "tool_call_aborted"
+  );
+
+  releaseFirst?.();
+  await first;
+  await upstream.close();
+});
+
+test("argument preparation and SDK AbortError return tool_call_aborted", async () => {
+  let calls = 0;
+  const upstream = new UpstreamManager() as unknown as {
+    clients: Map<string, { callTool: () => Promise<CallToolResult> }>;
+    toolMap: Map<string, { server: string; tool: Tool }>;
+    exposedToolsByServer: Map<string, Set<string>>;
+    callTool: UpstreamManager["callTool"];
+  };
+  upstream.clients = new Map([
+    [
+      "only",
+      {
+        async callTool() {
+          calls++;
+          const error = new Error("request cancelled");
+          error.name = "AbortError";
+          throw error;
+        },
+      },
+    ],
+  ]);
+  const tool: Tool = { name: "work", inputSchema: { type: "object" } };
+  upstream.toolMap = new Map([["work", { server: "only", tool }]]);
+  upstream.exposedToolsByServer = new Map([["only", new Set(["work"])]]);
+
+  const preAborted = new AbortController();
+  preAborted.abort();
+  const preparedAbort = await upstream.callTool(
+    "work",
+    { value: { $text: { lines: ["never"] } } },
+    undefined,
+    { signal: preAborted.signal }
+  );
+  assert.equal(
+    (preparedAbort.structuredContent as { error?: { code?: string } } | undefined)?.error?.code,
+    "tool_call_aborted"
+  );
+  assert.equal(calls, 0);
+
+  const downstreamAbort = await upstream.callTool("work");
+  assert.equal(
+    (downstreamAbort.structuredContent as { error?: { code?: string } } | undefined)?.error?.code,
+    "tool_call_aborted"
+  );
+  assert.equal(calls, 1);
+});
+
+test("aborting a reconnect waiter leaves shared reconnect work running", async () => {
+  let resolveReconnect!: (value: boolean) => void;
+  const sharedReconnect = new Promise<boolean>((resolve) => {
+    resolveReconnect = resolve;
+  });
+  const upstream = new UpstreamManager() as unknown as {
+    serverConfigs: Map<string, ServerConfig>;
+    serverInfoMap: Map<string, { state: string; connectDurationMs: number; totalTools: number; exposedTools: number; transport: "stdio" }>;
+    reconnects: Map<string, Promise<boolean>>;
+    toolMap: Map<string, { server: string; tool: Tool }>;
+    exposedToolsByServer: Map<string, Set<string>>;
+    callTool: UpstreamManager["callTool"];
+  };
+  const tool: Tool = { name: "work", inputSchema: { type: "object" } };
+  upstream.serverConfigs = new Map([["only", { command: "ignored" }]]);
+  upstream.serverInfoMap = new Map([
+    [
+      "only",
+      {
+        state: "disconnected",
+        connectDurationMs: 0,
+        totalTools: 1,
+        exposedTools: 1,
+        transport: "stdio",
+      },
+    ],
+  ]);
+  upstream.reconnects = new Map([["only", sharedReconnect]]);
+  upstream.toolMap = new Map([["work", { server: "only", tool }]]);
+  upstream.exposedToolsByServer = new Map([["only", new Set(["work"])]]);
+
+  const controller = new AbortController();
+  const call = upstream.callTool("work", {}, undefined, { signal: controller.signal });
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.abort();
+  const result = await call;
+
+  assert.equal(
+    (result.structuredContent as { error?: { code?: string } } | undefined)?.error?.code,
+    "tool_call_aborted"
+  );
+  assert.equal(upstream.reconnects.get("only"), sharedReconnect);
+  resolveReconnect(false);
+  await sharedReconnect;
 });
 
 test("pipeline reuses cached read-only step results", async () => {
@@ -4101,6 +4472,7 @@ test("file reference resolution bounds read concurrency and aggregate bytes", as
   const upstream = new UpstreamManager() as any;
   let active = 0;
   let maxActive = 0;
+  upstream.canonicalFileReferencePath = async (filePath: string) => filePath;
   upstream.readFileReferenceBounded = async () => {
     active += 1;
     maxActive = Math.max(maxActive, active);
@@ -4125,6 +4497,91 @@ test("file reference resolution bounds read concurrency and aggregate bytes", as
     }),
     /file reference bytes exceed per-call limit \(16000000\)/i
   );
+});
+
+test("file reference resolution deduplicates canonical aliases while preserving per-ref limits", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-file-ref-dedup-"));
+  const filePath = join(dir, "shared.json");
+  const aliasPath = join(dir, "alias.json");
+  await writeFile(filePath, '{"ok":true}', "utf8");
+  await symlink(filePath, aliasPath);
+
+  const upstream = new UpstreamManager() as any;
+  const originalRead = upstream.readFileReferenceBounded.bind(upstream);
+  let reads = 0;
+  upstream.readFileReferenceBounded = async (...args: unknown[]) => {
+    reads++;
+    return originalRead(...args);
+  };
+
+  try {
+    const resolved = await upstream.resolveToolArguments({
+      text: { $file: filePath },
+      parsed: { $jsonFile: aliasPath },
+    });
+    assert.deepEqual(resolved, {
+      text: '{"ok":true}',
+      parsed: { ok: true },
+    });
+    assert.equal(reads, 1);
+
+    reads = 0;
+    await assert.rejects(
+      upstream.resolveToolArguments({
+        permissive: { $file: filePath, maxBytes: 64 },
+        strict: { $file: aliasPath, maxBytes: 4 },
+      }),
+      /arguments\.strict.*exceeds maxBytes \(11 > 4\)/i
+    );
+    assert.equal(reads, 1);
+
+    reads = 0;
+    upstream.readFileReferenceBounded = async () => {
+      reads++;
+      return Buffer.alloc(8_000_001);
+    };
+    await assert.rejects(
+      upstream.resolveToolArguments({
+        first: { $file: filePath, maxBytes: 9_000_000 },
+        second: { $file: aliasPath, maxBytes: 9_000_000 },
+      }),
+      /file reference bytes exceed per-call limit \(16000000\)/i
+    );
+    assert.equal(reads, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("file reference worker scheduling stops promptly when its call is aborted", async () => {
+  const upstream = new UpstreamManager() as any;
+  const controller = new AbortController();
+  let readsStarted = 0;
+  upstream.canonicalFileReferencePath = async (filePath: string) => filePath;
+  upstream.readFileReferenceBounded = async (...args: unknown[]) => {
+    readsStarted++;
+    if (readsStarted === 1) {
+      controller.abort(new Error("test file reference abort"));
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    (args[4] as AbortSignal | undefined)?.throwIfAborted();
+    return Buffer.from("unused");
+  };
+
+  await assert.rejects(
+    upstream.resolveToolArguments(
+      {
+        files: Array.from(
+          { length: 12 },
+          (_, index) => ({ $file: `/virtual/${index}` })
+        ),
+      },
+      undefined,
+      { signal: controller.signal }
+    ),
+    /test file reference abort/i
+  );
+  assert.ok(readsStarted <= 4, `expected at most 4 reads, got ${readsStarted}`);
 });
 
 test("UpstreamManager returns structured error when $file path is missing", async () => {
@@ -4959,6 +5416,92 @@ test("scoped-client release never decrements or closes a replacement generation"
   assert.equal(upstream.sessionClients.get(key), replacement);
 });
 
+test("scoped-client caps evict only the least-recently-used idle generation", async () => {
+  let oldIdleClosed = 0;
+  let activeClosed = 0;
+  const makeScoped = (
+    server: string,
+    activeCalls: number,
+    lastUsedAt: number,
+    onClose: () => void
+  ) => ({
+    client: { async close() { onClose(); } },
+    transport: {},
+    tools: new Set<string>(),
+    activeCalls,
+    kind: "stdio-cwd" as const,
+    server,
+    label: server,
+    lastUsedAt,
+  });
+  const oldIdle = makeScoped("alpha", 0, 1, () => oldIdleClosed++);
+  const active = makeScoped("alpha", 1, 2, () => activeClosed++);
+  const upstream = new UpstreamManager() as unknown as {
+    serverConfigs: Map<string, ServerConfig>;
+    sessionClients: Map<string, unknown>;
+    sessionClientConnects: Map<string, unknown>;
+    maxScopedClients: number;
+    maxScopedClientsPerServer: number;
+    reserveScopedClientCapacity: (server: string) => Promise<void>[];
+  };
+  upstream.serverConfigs = new Map([
+    ["alpha", { command: "ignored", maxScopedClients: 2 }],
+  ]);
+  upstream.sessionClients = new Map([
+    ["alpha\0cwd:/old", oldIdle],
+    ["alpha\0cwd:/active", active],
+  ]);
+  upstream.sessionClientConnects = new Map();
+  upstream.maxScopedClients = 3;
+  upstream.maxScopedClientsPerServer = 2;
+
+  await Promise.all(upstream.reserveScopedClientCapacity("alpha"));
+
+  assert.equal(oldIdleClosed, 1);
+  assert.equal(activeClosed, 0);
+  assert.equal(upstream.sessionClients.has("alpha\0cwd:/old"), false);
+  assert.equal(upstream.sessionClients.get("alpha\0cwd:/active"), active);
+});
+
+test("scoped-client caps count pending connects and never evict active clients", () => {
+  const upstream = new UpstreamManager() as unknown as {
+    serverConfigs: Map<string, ServerConfig>;
+    sessionClients: Map<string, unknown>;
+    sessionClientConnects: Map<string, unknown>;
+    maxScopedClients: number;
+    maxScopedClientsPerServer: number;
+    reserveScopedClientCapacity: (server: string) => Promise<void>[];
+  };
+  upstream.serverConfigs = new Map([["alpha", { command: "ignored" }]]);
+  upstream.sessionClients = new Map([
+    [
+      "alpha\0cwd:/active",
+      {
+        client: {},
+        transport: {},
+        tools: new Set<string>(),
+        activeCalls: 1,
+        kind: "stdio-cwd",
+        server: "alpha",
+        label: "active",
+        lastUsedAt: 1,
+      },
+    ],
+  ]);
+  upstream.sessionClientConnects = new Map([
+    ["alpha\0cwd:/connecting", { promise: new Promise(() => undefined), close: async () => {} }],
+  ]);
+  upstream.maxScopedClients = 2;
+  upstream.maxScopedClientsPerServer = 2;
+
+  assert.throws(
+    () => upstream.reserveScopedClientCapacity("alpha"),
+    /all scoped clients are active or connecting/
+  );
+  assert.equal(upstream.sessionClients.size, 1);
+  assert.equal(upstream.sessionClientConnects.size, 1);
+});
+
 test("close aborts and drains a pending session-scoped connection", async () => {
   const upstream = new UpstreamManager();
   const cwd = await mkdtemp(join(tmpdir(), "callmux-session-pending-close-"));
@@ -4988,6 +5531,54 @@ test("close aborts and drains a pending session-scoped connection", async () => 
     await pendingCall;
     assert.equal((upstream as any).sessionClientConnects.size, 0);
     assert.equal((upstream as any).sessionClients.size, 0);
+  } finally {
+    await upstream.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("aborting one scoped-connect waiter preserves shared connection creation", async () => {
+  const upstream = new UpstreamManager();
+  const cwd = await mkdtemp(join(tmpdir(), "callmux-session-pending-abort-"));
+
+  try {
+    await upstream.connect({
+      fake: fakeMcpServer("fake", {
+        FAKE_MCP_TOOLS: JSON.stringify([{ name: "get_item" }]),
+      }),
+    });
+    (upstream as any).serverConfigs.set("fake", fakeMcpServer("fake", {
+      FAKE_MCP_TOOLS: JSON.stringify([{ name: "get_item" }]),
+      FAKE_MCP_START_DELAY_MS: "400",
+    }));
+
+    const controller = new AbortController();
+    const first = upstream.callTool(
+      "get_item",
+      { id: 1 },
+      undefined,
+      { cwd, sessionId: "first", transport: "mcp", signal: controller.signal }
+    );
+    while ((upstream as any).sessionClientConnects.size === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    controller.abort();
+    const aborted = await first;
+    assert.equal(
+      (aborted.structuredContent as { error?: { code?: string } } | undefined)?.error?.code,
+      "tool_call_aborted"
+    );
+    assert.equal((upstream as any).sessionClientConnects.size, 1);
+
+    const second = await upstream.callTool(
+      "get_item",
+      { id: 2 },
+      undefined,
+      { cwd, sessionId: "second", transport: "mcp" }
+    );
+    assert.equal(second.isError, undefined);
+    assert.equal((upstream as any).sessionClientConnects.size, 0);
+    assert.equal((upstream as any).sessionClients.size, 1);
   } finally {
     await upstream.close();
     await rm(cwd, { recursive: true, force: true });
@@ -5912,6 +6503,42 @@ test("handleCall passes through to upstream and caches result", async () => {
     arguments: { id: 1 },
   });
   assert.deepEqual(cached, result);
+});
+
+test("handleCall coalesces concurrent identical cache misses", async () => {
+  const cache = new CallCache(60, { allowTools: ["get_issue"] });
+  let calls = 0;
+  let release!: (result: CallToolResult) => void;
+  const pendingResult = new Promise<CallToolResult>((resolve) => { release = resolve; });
+  const upstream = createMockUpstream([
+    { server: "github", tool: mockTool("get_issue") },
+  ]) as unknown as UpstreamManager;
+  (upstream as unknown as {
+    clients: Map<string, { callTool: () => Promise<CallToolResult> }>;
+  }).clients.set("github", {
+    async callTool() {
+      calls++;
+      return pendingResult;
+    },
+  });
+
+  const first = handleCall(upstream, cache, {
+    tool: "get_issue",
+    arguments: { id: 1 },
+  });
+  await waitFor(async () => calls === 1, 500, 1);
+  const second = handleCall(upstream, cache, {
+    tool: "get_issue",
+    arguments: { id: 1 },
+  });
+  await Promise.resolve();
+
+  assert.equal(calls, 1);
+  release(textResult("shared"));
+  assert.deepEqual(await first, textResult("shared"));
+  assert.deepEqual(await second, textResult("shared"));
+  assert.equal(calls, 1);
+  assert.equal(cache.stats().coalesced, 1);
 });
 
 test("handleCall resolves the call once instead of preparing twice", async () => {
@@ -7072,12 +7699,25 @@ test("loadConfig parses startup timeout settings from file", async () => {
     await writeFile(
       configPath,
       JSON.stringify({
-        servers: { github: { command: "node", args: ["server.js"], callTimeoutMs: 3000 } },
+        servers: {
+          github: {
+            command: "node",
+            args: ["server.js"],
+            callTimeoutMs: 3000,
+            maxScopedClients: 7,
+          },
+        },
         connectTimeoutMs: 1000,
         callTimeoutMs: 2000,
         reloadDrainTimeoutMs: 4000,
         sessionCwdIdleTtlSeconds: 300,
+        maxScopedClients: 40,
+        maxScopedClientsPerServer: 8,
+        listenerSessionInactivityTtlSeconds: 900,
+        listenerMaxSessions: 250,
         strictStartup: true,
+        maxCacheEntryBytes: 4096,
+        maxCacheBytes: 16384,
       })
     );
 
@@ -7086,8 +7726,15 @@ test("loadConfig parses startup timeout settings from file", async () => {
     assert.equal(config.callTimeoutMs, 2000);
     assert.equal(config.reloadDrainTimeoutMs, 4000);
     assert.equal((config.servers.github as StdioServerConfig).callTimeoutMs, 3000);
+    assert.equal((config.servers.github as StdioServerConfig).maxScopedClients, 7);
     assert.equal(config.sessionCwdIdleTtlSeconds, 300);
+    assert.equal(config.maxScopedClients, 40);
+    assert.equal(config.maxScopedClientsPerServer, 8);
+    assert.equal(config.listenerSessionInactivityTtlSeconds, 900);
+    assert.equal(config.listenerMaxSessions, 250);
     assert.equal(config.strictStartup, true);
+    assert.equal(config.maxCacheEntryBytes, 4096);
+    assert.equal(config.maxCacheBytes, 16384);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -7144,6 +7791,8 @@ test("loadConfig parses response shield settings from file", async () => {
           maxStringChars: 200,
           maxArrayItems: 10,
           maxStoredResults: 5,
+          maxStoredResultBytes: 2000,
+          maxStoredBytes: 8000,
           allowTools: ["get_*", "list_*"],
         },
       })
@@ -7155,6 +7804,8 @@ test("loadConfig parses response shield settings from file", async () => {
     assert.equal(config.responseShield?.maxStringChars, 200);
     assert.equal(config.responseShield?.maxArrayItems, 10);
     assert.equal(config.responseShield?.maxStoredResults, 5);
+    assert.equal(config.responseShield?.maxStoredResultBytes, 2000);
+    assert.equal(config.responseShield?.maxStoredBytes, 8000);
     assert.deepEqual(config.responseShield?.allowTools, ["get_*", "list_*"]);
     assert.equal(
       (config.servers.github as StdioServerConfig).responseShield?.enabled,
@@ -7195,28 +7846,34 @@ test("loadConfig parses dashboard settings from file", async () => {
   }
 });
 
-test("loadConfig rejects per-server response shield maxStoredResults", async () => {
+test("loadConfig rejects global stored-result limits in per-server response shield config", async () => {
   const dir = await mkdtemp(join(tmpdir(), "callmux-response-shield-invalid-"));
   const configPath = join(dir, "config.json");
 
   try {
-    await writeFile(
-      configPath,
-      JSON.stringify({
-        servers: {
-          github: {
-            command: "node",
-            args: ["server.js"],
-            responseShield: { maxStoredResults: 5 },
+    for (const field of [
+      "maxStoredResults",
+      "maxStoredResultBytes",
+      "maxStoredBytes",
+    ]) {
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          servers: {
+            github: {
+              command: "node",
+              args: ["server.js"],
+              responseShield: { [field]: 5 },
+            },
           },
-        },
-      })
-    );
+        })
+      );
 
-    await assert.rejects(
-      () => loadConfig(configPath),
-      /maxStoredResults is only supported in global responseShield/
-    );
+      await assert.rejects(
+        () => loadConfig(configPath),
+        new RegExp(`${field} is only supported in global responseShield`)
+      );
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -7701,7 +8358,7 @@ test("AbuseController refunds the global slot when a principal-rate check denies
   assert.equal(controller.acquire(principal("c")).result.code, "abuse_rate_limit");
 });
 
-test("PrometheusMetrics escapes newlines in label values", () => {
+test("PrometheusMetrics rejects caller-controlled raw paths and caps label cardinality", () => {
   const metrics = new PrometheusMetrics({ enabled: true });
   metrics.onRequestStart();
   metrics.onRequestComplete({
@@ -7710,10 +8367,36 @@ test("PrometheusMetrics escapes newlines in label values", () => {
     status: 200,
     durationMs: 5,
   });
+  metrics.onRequestStart();
+  metrics.onRequestComplete({
+    method: "GET",
+    path: "/ignored",
+    route: "/safe|synthetic=label",
+    status: 200,
+    durationMs: 1,
+  });
+  for (let index = 0; index < 300; index++) {
+    metrics.onRequestStart();
+    metrics.onRequestComplete({
+      method: "GET",
+      path: `/raw-${index}`,
+      route: `/template-${index}`,
+      status: 200,
+      durationMs: 1,
+    });
+  }
   const text = metrics.renderPrometheusText();
-  // The injected newline must be escaped so it can't forge a metric line.
+  // Raw path input is never retained, and novel templates converge on one
+  // bounded overflow series after the fixed cardinality budget is reached.
   assert.ok(!text.includes("\ninjected_metric 1"));
-  assert.ok(text.includes("\\ninjected_metric 1"));
+  assert.ok(!text.includes("foo"));
+  assert.ok(!text.includes("synthetic"));
+  assert.ok(text.includes('path="/__unmatched__"'));
+  assert.ok(text.includes('path="/__overflow__"'));
+  const requestSeries = text
+    .split("\n")
+    .filter((line) => line.startsWith("callmux_http_requests_total{"));
+  assert.ok(requestSeries.length <= 256);
 });
 
 test("VERSION matches package.json", async () => {
@@ -10340,6 +11023,8 @@ test("ResponseStore scopes stored results to their owner", () => {
   const store = new ResponseStore();
   const owned = store.store("big_tool", textResult("owned-payload"), "principal:bearer:alice");
   const unowned = store.store("big_tool", textResult("public-payload"));
+  assert.ok(owned);
+  assert.ok(unowned);
 
   // The owner retrieves their own entry.
   assert.equal(store.get(owned.ref, "principal:bearer:alice")?.ref, owned.ref);
@@ -10359,15 +11044,64 @@ test("ResponseStore scopes stored results to their owner", () => {
   assert.equal(store.get(unowned.ref, undefined)?.ref, unowned.ref);
 });
 
-test("ResponseStore enforces a total-byte ceiling independent of entry count", () => {
-  // 1 KiB ceiling; each entry ~2 KiB, so only the newest survives.
-  const store = new ResponseStore(100, 1024);
+test("ResponseStore never retains an entry above its total-byte ceiling", () => {
+  // 1 KiB aggregate ceiling; each entry is ~2 KiB and must be rejected even
+  // when the store is otherwise empty.
+  const store = new ResponseStore(100, 1024, 4096);
   const first = store.store("t", textResult("a".repeat(2048)));
   const second = store.store("t", textResult("b".repeat(2048)));
 
-  assert.equal(store.get(first.ref), undefined, "oldest evicted past the byte ceiling");
-  assert.equal(store.get(second.ref)?.ref, second.ref, "newest is always retained");
-  assert.ok(store.stats().storedBytes <= 4096);
+  assert.equal(first, undefined);
+  assert.equal(second, undefined);
+  assert.equal(store.stats().entries, 0);
+  assert.equal(store.stats().storedBytes, 0);
+  assert.equal(store.stats().rejectedOversize, 2);
+});
+
+test("ResponseStore enforces per-result bytes and evicts to reloaded limits", () => {
+  const small = textResult("a".repeat(64));
+  const entryBytes = Buffer.byteLength(JSON.stringify(small), "utf8");
+  const store = new ResponseStore(10, entryBytes * 2, entryBytes);
+  const first = store.store("t", small);
+  const second = store.store("t", textResult("b".repeat(64)));
+  assert.ok(first);
+  assert.ok(second);
+  assert.equal(store.stats().storedBytes, entryBytes * 2);
+
+  assert.equal(store.store("t", textResult("x".repeat(65))), undefined);
+  assert.equal(store.stats().storedBytes, entryBytes * 2);
+
+  store.configureLimits({
+    maxEntries: 10,
+    maxTotalBytes: entryBytes,
+    maxEntryBytes: entryBytes,
+  });
+  assert.equal(store.get(first.ref), undefined);
+  assert.equal(store.get(second.ref)?.ref, second.ref);
+  assert.equal(store.stats().storedBytes, entryBytes);
+
+  store.setMaxEntryBytes(entryBytes - 1);
+  assert.equal(store.stats().entries, 0);
+  assert.equal(store.stats().storedBytes, 0);
+});
+
+test("response shielding omits retrieval refs for results above storage ceilings", () => {
+  const store = new ResponseStore(10, 1024, 512);
+  const shielded = shieldToolResult(
+    store,
+    "large_tool",
+    textResult("x".repeat(2048)),
+    { maxResultBytes: 64, maxStringChars: 32, maxArrayItems: 2 }
+  );
+  const callmux = (shielded.structuredContent as {
+    _callmux: Record<string, unknown>;
+  })._callmux;
+
+  assert.equal(callmux.truncated, true);
+  assert.equal(callmux.retained, false);
+  assert.equal(callmux.ref, undefined);
+  assert.equal(callmux.retrieval, undefined);
+  assert.equal(store.stats().entries, 0);
 });
 
 test("listener applyReloadedState swaps structural listener state", () => {
@@ -10377,7 +11111,11 @@ test("listener applyReloadedState swaps structural listener state", () => {
   const cacheB = new CallCache(30, undefined, {}, 50);
   const responseStore = createResponseStore({
     servers: {},
-    responseShield: { maxStoredResults: 4 },
+    responseShield: {
+      maxStoredResults: 4,
+      maxStoredResultBytes: 4096,
+      maxStoredBytes: 16384,
+    },
   });
   const listener = new CallmuxListener({
     port: 0,
@@ -10398,7 +11136,11 @@ test("listener applyReloadedState swaps structural listener state", () => {
       maxConcurrency: 3,
       metaOnly: true,
       descriptionMaxLength: 12,
-      responseShield: { maxStoredResults: 2 },
+      responseShield: {
+        maxStoredResults: 2,
+        maxStoredResultBytes: 2048,
+        maxStoredBytes: 4096,
+      },
     },
     upstream: upstreamB,
     cache: cacheB,
@@ -10424,6 +11166,8 @@ test("listener applyReloadedState swaps structural listener state", () => {
   assert.equal(internals.options.responseStore, responseStore);
   assert.equal(internals.responseStore, responseStore);
   assert.equal(responseStore.stats().maxEntries, 2);
+  assert.equal(responseStore.stats().maxStoredResultBytes, 2048);
+  assert.equal(responseStore.stats().maxStoredBytes, 4096);
   assert.equal(internals.options.allTools[0].name, "new_tool");
   assert.equal(internals.options.maxConcurrency, 3);
   assert.equal(internals.options.config.metaOnly, true);
@@ -10679,6 +11423,162 @@ test("listener /health returns ok with session count", async () => {
     const body = await res.json();
     assert.equal(body.status, "ok");
     assert.equal(body.sessions, 0);
+  } finally {
+    await listener.close();
+  }
+});
+
+test("listener bounds streamable HTTP sessions with idle LRU eviction and inactivity TTL", async () => {
+  const listener = new CallmuxListener({
+    port: 0,
+    host: "127.0.0.1",
+    config: {
+      servers: {},
+      listenerMaxSessions: 1,
+      listenerSessionInactivityTtlSeconds: 1,
+    },
+    upstream: new UpstreamManager(),
+    cache: new CallCache(0),
+    allTools: [],
+    maxConcurrency: 10,
+  });
+  await listener.start();
+  try {
+    const port = listenerPort(listener);
+    const headers = {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+    };
+    const initialize = async (id: number): Promise<string> => {
+      const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-11-25",
+            capabilities: {},
+            clientInfo: { name: `capacity-${id}`, version: "1.0" },
+          },
+        }),
+      });
+      assert.equal(response.status, 200);
+      await parseMcpResponseBody(response);
+      const sessionId = response.headers.get("mcp-session-id");
+      assert.ok(sessionId);
+      return sessionId;
+    };
+
+    const first = await initialize(1);
+    const second = await initialize(2);
+    assert.notEqual(second, first);
+    const internals = listener as unknown as {
+      sessions: Map<string, { lastActivityMs: number }>;
+      pruneExpiredSessions: (now: number) => void;
+    };
+    assert.deepEqual([...internals.sessions.keys()], [second]);
+
+    const stale = await fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: "POST",
+      headers: { ...headers, "mcp-session-id": first },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" }),
+    });
+    assert.equal(stale.status, 404);
+
+    const lastActivity = internals.sessions.get(second)?.lastActivityMs;
+    assert.ok(lastActivity);
+    internals.pruneExpiredSessions(lastActivity + 1_001);
+    assert.equal(internals.sessions.size, 0);
+  } finally {
+    await listener.close();
+  }
+});
+
+test("listener protects a streamable session from LRU eviction while its POST body is arriving", async () => {
+  const listener = new CallmuxListener({
+    port: 0,
+    host: "127.0.0.1",
+    config: { servers: {}, listenerMaxSessions: 1 },
+    upstream: new UpstreamManager(),
+    cache: new CallCache(0),
+    allTools: [],
+    maxConcurrency: 10,
+  });
+  await listener.start();
+
+  try {
+    const port = listenerPort(listener);
+    const headers = {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+    };
+    const initializeBody = (id: number) => JSON.stringify({
+      jsonrpc: "2.0",
+      id,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-11-25",
+        capabilities: {},
+        clientInfo: { name: `slow-body-${id}`, version: "1.0" },
+      },
+    });
+    const firstResponse = await fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: "POST",
+      headers,
+      body: initializeBody(1),
+    });
+    assert.equal(firstResponse.status, 200);
+    await parseMcpResponseBody(firstResponse);
+    const firstSessionId = firstResponse.headers.get("mcp-session-id");
+    assert.ok(firstSessionId);
+
+    const callBody = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/list",
+    });
+    let slowRequest!: ReturnType<typeof httpRequest>;
+    const slowResponse = new Promise<number>((resolve, reject) => {
+      slowRequest = httpRequest({
+        host: "127.0.0.1",
+        port,
+        path: "/mcp",
+        method: "POST",
+        headers: {
+          ...headers,
+          "mcp-session-id": firstSessionId,
+          "content-length": Buffer.byteLength(callBody),
+        },
+      }, (response) => {
+        response.resume();
+        response.once("end", () => resolve(response.statusCode ?? 0));
+      });
+      slowRequest.once("error", reject);
+    });
+    slowRequest.flushHeaders();
+    slowRequest.write(callBody.slice(0, 1));
+
+    await waitFor(async () => {
+      const session = (listener as unknown as {
+        sessions: Map<string, { activeRequests: number }>;
+      }).sessions.get(firstSessionId);
+      return session?.activeRequests === 1;
+    });
+    const capacityResponse = await fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: "POST",
+      headers,
+      body: initializeBody(3),
+    });
+    assert.equal(capacityResponse.status, 503);
+    slowRequest.end(callBody.slice(1));
+
+    assert.equal(await slowResponse, 200);
+    assert.deepEqual(
+      [...(listener as unknown as { sessions: Map<string, unknown> }).sessions.keys()],
+      [firstSessionId]
+    );
   } finally {
     await listener.close();
   }
@@ -10984,6 +11884,71 @@ test("listener dashboard supports root mount", async () => {
   } finally {
     await listener.close();
   }
+});
+
+test("listener dashboard SSE coalesces backpressure and bounds retained frames", async () => {
+  const listener = new CallmuxListener({
+    port: 0,
+    host: "127.0.0.1",
+    config: { servers: {}, dashboard: { enabled: true } },
+    upstream: new UpstreamManager(),
+    cache: new CallCache(0),
+    allTools: [],
+    maxConcurrency: 10,
+  });
+  const chunks: string[] = [];
+  const response = Object.assign(new EventEmitter(), {
+    writable: true,
+    writeHead() {},
+    write(chunk: string) {
+      chunks.push(chunk);
+      // Backpressure the initial snapshot; later writes can drain normally.
+      return chunks.length !== 1;
+    },
+  }) as unknown as ServerResponse;
+  const internals = listener as unknown as {
+    handleDashboardEvents: (res: ServerResponse) => void;
+    runtimeEvents: RuntimeEventStore;
+  };
+
+  internals.handleDashboardEvents(response);
+  assert.equal(chunks.length, 1);
+  internals.runtimeEvents.append({
+    type: "config_reload",
+    timestamp: new Date().toISOString(),
+    success: false,
+    error: "first",
+  });
+  internals.runtimeEvents.append({
+    type: "config_reload",
+    timestamp: new Date().toISOString(),
+    success: false,
+    error: "latest",
+  });
+  assert.equal(chunks.length, 1);
+
+  response.emit("drain");
+  assert.equal(chunks.length, 2);
+  assert.ok(chunks[1].includes("latest"));
+  assert.ok(!chunks[1].includes("first"));
+
+  internals.runtimeEvents.append({
+    type: "config_reload",
+    timestamp: new Date().toISOString(),
+    success: false,
+    error: "x".repeat(300_000),
+  });
+  assert.ok(chunks.at(-1)?.includes('"type":"stream_reset"'));
+  assert.ok(Buffer.byteLength(chunks.at(-1) ?? "") < 1024);
+
+  response.emit("close");
+  const afterClose = chunks.length;
+  internals.runtimeEvents.append({
+    type: "config_reload",
+    timestamp: new Date().toISOString(),
+    success: true,
+  });
+  assert.equal(chunks.length, afterClose);
 });
 
 test("management overlay applies server additions and deletions", async () => {
@@ -13578,6 +14543,10 @@ test("listener serves prometheus metrics endpoint and tracks request counters", 
   try {
     const health = await fetch(`http://127.0.0.1:${port}/health`);
     assert.equal(health.status, 200);
+    for (let index = 0; index < 20; index++) {
+      const missing = await fetch(`http://127.0.0.1:${port}/attacker-${index}`);
+      assert.equal(missing.status, 404);
+    }
 
     const metrics = await fetch(`http://127.0.0.1:${port}/metrics`);
     assert.equal(metrics.status, 200);
@@ -13587,6 +14556,8 @@ test("listener serves prometheus metrics endpoint and tracks request counters", 
     const body = await metrics.text();
     assert.match(body, /callmux_http_requests_total/);
     assert.match(body, /path="\/health"/);
+    assert.match(body, /path="\/__unmatched__"/);
+    assert.doesNotMatch(body, /attacker-/);
     assert.match(body, /callmux_http_inflight_requests/);
   } finally {
     await listener.close();
@@ -13737,6 +14708,31 @@ test("listener enforces global abuse rate limit", async () => {
     });
     assert.equal(second.status, 429);
     assert.equal(second.headers.get("retry-after"), "60");
+  } finally {
+    await listener.close();
+  }
+});
+
+test("listener applies configured abuse limits to health, metrics, and unmatched routes", async () => {
+  const listener = new CallmuxListener({
+    port: 0,
+    host: "127.0.0.1",
+    config: {
+      servers: {},
+      abuseControls: { globalRequestsPerMinute: 1 },
+      metrics: { enabled: true },
+    },
+    upstream: new UpstreamManager(),
+    cache: new CallCache(0),
+    allTools: [],
+    maxConcurrency: 10,
+  });
+  await listener.start();
+  try {
+    const port = listenerPort(listener);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/health`)).status, 200);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/metrics`)).status, 429);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/arbitrary-404`)).status, 429);
   } finally {
     await listener.close();
   }
@@ -14589,6 +15585,7 @@ test("listener dashboard exposes in-flight and client-aborted tool calls", async
   // in_flight -> client_aborted -> cleanup sequence is fully deterministic and
   // never races the wall-clock call timeout (the source of past flakiness).
   let releaseCall: (() => void) | undefined;
+  let downstreamSignal: AbortSignal | undefined;
 
   try {
     await upstream.connect({
@@ -14600,15 +15597,18 @@ test("listener dashboard exposes in-flight and client-aborted tool calls", async
     }));
     // Keep the real connected upstream (so server/targetTool resolve through
     // real metadata) but make the actual call controllable.
-    (upstream as unknown as { callTool: () => Promise<CallToolResult> }).callTool =
-      () =>
+    (upstream as unknown as { callTool: (_name?: unknown, _args?: unknown, _server?: unknown, context?: ToolCallContext) => Promise<CallToolResult> }).callTool =
+      (_name, _args, _server, context) =>
         new Promise<CallToolResult>((resolve) => {
+          downstreamSignal = context?.signal;
           releaseCall = () => resolve(textResult("released"));
         });
     // The passthrough executes via callPrepared; stub it identically so the
     // downstream call stays controllable.
-    (upstream as unknown as { callPrepared: () => Promise<CallToolResult> }).callPrepared =
-      (upstream as unknown as { callTool: () => Promise<CallToolResult> }).callTool;
+    (upstream as unknown as { callPrepared: (_prepared?: unknown, context?: ToolCallContext) => Promise<CallToolResult> }).callPrepared =
+      (_prepared, context) =>
+        (upstream as unknown as { callTool: (_name?: unknown, _args?: unknown, _server?: unknown, context?: ToolCallContext) => Promise<CallToolResult> })
+          .callTool(undefined, undefined, undefined, context);
     listener = new CallmuxListener({
       port: 0,
       host: "127.0.0.1",
@@ -14670,16 +15670,26 @@ test("listener dashboard exposes in-flight and client-aborted tool calls", async
     controller.abort();
     await callPromise;
 
-    await waitFor(async () => {
-      const diagnostics = (listener as any).getRuntimeDiagnostics() as {
-        activeToolCalls?: Array<{ status: string; server?: string; targetTool?: string }>;
-      };
-      return diagnostics.activeToolCalls?.some((call) =>
-        call.status === "client_aborted" &&
-        call.server === "fake" &&
-        call.targetTool === "get_item"
-      ) === true;
-    }, 1000, 10);
+    await waitFor(async () => downstreamSignal?.aborted === true, 1000, 10);
+
+    // Cancellation now reaches the handler and downstream immediately, so the
+    // active entry may be cleaned up before diagnostics can sample its brief
+    // client_aborted state. The durable lifecycle event records the transition.
+    await waitFor(async () =>
+      ((listener as any).runtimeEvents.list() as Array<{
+        type: string;
+        lifecycle?: string;
+        server?: string;
+        targetTool?: string;
+      }>).some((event) =>
+        event.type === "tool_call_lifecycle" &&
+        event.lifecycle === "client_aborted" &&
+        event.server === "fake" &&
+        event.targetTool === "get_item"
+      ),
+      1000,
+      10
+    );
 
     const lifecycleEvents = ((listener as any).runtimeEvents.list() as Array<{
       type: string;

@@ -12,10 +12,10 @@ const DEFAULT_MAX_RESULT_BYTES = 64 * 1024;
 const DEFAULT_MAX_STRING_CHARS = 8192;
 const DEFAULT_MAX_ARRAY_ITEMS = 50;
 const DEFAULT_MAX_STORED_RESULTS = 100;
+const DEFAULT_MAX_STORED_RESULT_BYTES = 64 * 1024 * 1024;
 // Hard ceiling on the total bytes held across all stored responses, independent
 // of the entry count, so a handful of very large results can't grow memory
-// without bound. Eviction is oldest-first; a single result larger than this is
-// still kept (as the sole entry) so it stays retrievable.
+// without bound. Eviction is oldest-first.
 const DEFAULT_MAX_STORED_BYTES = 256 * 1024 * 1024;
 const DEFAULT_RESULT_PAGE_LIMIT = 50;
 const MAX_RESULT_PAGE_LIMIT = 100;
@@ -157,7 +157,11 @@ function serverResponseShieldConfig(
 }
 
 export function createResponseStore(config: CallmuxConfig): ResponseStore {
-  return new ResponseStore(config.responseShield?.maxStoredResults);
+  return new ResponseStore(
+    config.responseShield?.maxStoredResults,
+    config.responseShield?.maxStoredBytes,
+    config.responseShield?.maxStoredResultBytes
+  );
 }
 
 export function resolveResponseShieldOptions(
@@ -489,10 +493,12 @@ export class ResponseStore {
   private entries = new Map<string, StoredResponse>();
   private totalStored = 0;
   private currentBytes = 0;
+  private rejectedOversize = 0;
 
   constructor(
     private maxEntries = DEFAULT_MAX_STORED_RESULTS,
-    private maxTotalBytes = DEFAULT_MAX_STORED_BYTES
+    private maxTotalBytes = DEFAULT_MAX_STORED_BYTES,
+    private maxEntryBytes = DEFAULT_MAX_STORED_RESULT_BYTES
   ) {}
 
   setMaxEntries(maxEntries = DEFAULT_MAX_STORED_RESULTS): void {
@@ -500,13 +506,40 @@ export class ResponseStore {
     this.evictToLimits();
   }
 
-  store(tool: string, result: CallToolResult, owner?: string): StoredResponse {
+  setMaxTotalBytes(maxTotalBytes = DEFAULT_MAX_STORED_BYTES): void {
+    this.maxTotalBytes = maxTotalBytes;
+    this.evictToLimits();
+  }
+
+  setMaxEntryBytes(maxEntryBytes = DEFAULT_MAX_STORED_RESULT_BYTES): void {
+    this.maxEntryBytes = maxEntryBytes;
+    this.evictToLimits();
+  }
+
+  configureLimits(options: {
+    maxEntries?: number;
+    maxTotalBytes?: number;
+    maxEntryBytes?: number;
+  } = {}): void {
+    this.maxEntries = options.maxEntries ?? DEFAULT_MAX_STORED_RESULTS;
+    this.maxTotalBytes = options.maxTotalBytes ?? DEFAULT_MAX_STORED_BYTES;
+    this.maxEntryBytes = options.maxEntryBytes ?? DEFAULT_MAX_STORED_RESULT_BYTES;
+    this.evictToLimits();
+  }
+
+  store(tool: string, result: CallToolResult, owner?: string): StoredResponse | undefined {
+    const entryBytes = byteLength(result);
+    if (entryBytes > this.maxEntryBytes || entryBytes > this.maxTotalBytes) {
+      this.rejectedOversize++;
+      return undefined;
+    }
+
     const ref = `r_${randomUUID()}`;
     const entry: StoredResponse = {
       ref,
       tool,
       createdAt: Date.now(),
-      byteSize: byteLength(result),
+      byteSize: entryBytes,
       result,
       ...(owner !== undefined ? { owner } : {}),
     };
@@ -523,12 +556,23 @@ export class ResponseStore {
     return this.ownerAllows(entry, owner) ? entry : undefined;
   }
 
-  stats(): { entries: number; maxEntries: number; storedBytes: number; totalStored: number } {
+  stats(): {
+    entries: number;
+    maxEntries: number;
+    storedBytes: number;
+    maxStoredBytes: number;
+    maxStoredResultBytes: number;
+    totalStored: number;
+    rejectedOversize: number;
+  } {
     return {
       entries: this.entries.size,
       maxEntries: this.maxEntries,
       storedBytes: this.currentBytes,
+      maxStoredBytes: this.maxTotalBytes,
+      maxStoredResultBytes: this.maxEntryBytes,
       totalStored: this.totalStored,
+      rejectedOversize: this.rejectedOversize,
     };
   }
 
@@ -539,12 +583,19 @@ export class ResponseStore {
   }
 
   private evictToLimits(): void {
-    // Evict oldest-first past either bound. The byte bound keeps at least one
-    // entry so a lone oversized result stays retrievable rather than being
-    // stored and immediately dropped.
+    // A lowered per-entry limit applies immediately to existing entries.
+    for (const [ref, entry] of this.entries) {
+      if (entry.byteSize <= this.maxEntryBytes && entry.byteSize <= this.maxTotalBytes) {
+        continue;
+      }
+      this.entries.delete(ref);
+      this.currentBytes = Math.max(0, this.currentBytes - entry.byteSize);
+    }
+
+    // Evict oldest-first past either aggregate bound.
     while (
       this.entries.size > this.maxEntries ||
-      (this.currentBytes > this.maxTotalBytes && this.entries.size > 1)
+      this.currentBytes > this.maxTotalBytes
     ) {
       const oldest = this.entries.keys().next().value as string | undefined;
       if (oldest === undefined) return;
@@ -660,7 +711,6 @@ export function shieldToolResult(
 
   if (!shouldShield) return result;
 
-  const entry = store.store(shieldTarget.tool, result, options.owner);
   const shape = summarizeDataShape(dataFromResult(result));
   const preview =
     compactedBytes <= resolvedOptions.maxResultBytes
@@ -673,6 +723,26 @@ export function shieldToolResult(
           },
         ],
       };
+
+  const entry = store.store(shieldTarget.tool, result, options.owner);
+  if (!entry) {
+    return jsonResult({
+      _callmux: {
+        truncated: true,
+        retained: false,
+        tool: shieldTarget.tool,
+        ...(shieldTarget.server ? { server: shieldTarget.server } : {}),
+        originalBytes,
+        previewBytes: byteLength(preview),
+        shape,
+        message:
+          "Response was truncated but exceeded the configured stored-result memory limit, " +
+          "so the full result was not retained. Increase responseShield.maxStoredResultBytes " +
+          "and responseShield.maxStoredBytes only if the listener has sufficient memory.",
+      },
+      preview,
+    }, { outputFormat: options.outputFormat });
+  }
 
   return jsonResult({
     _callmux: {

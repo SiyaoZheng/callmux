@@ -29,11 +29,14 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 30_000;
 const DEFAULT_CALL_TIMEOUT_MS = 180_000;
 const DEFAULT_CLOSE_TIMEOUT_MS = 1_000;
 const DEFAULT_SESSION_CWD_IDLE_TTL_SECONDS = 600;
+const DEFAULT_MAX_SCOPED_CLIENTS = 64;
+const DEFAULT_MAX_SCOPED_CLIENTS_PER_SERVER = 16;
 const DEFAULT_FILE_REF_MAX_BYTES = 1_000_000; // 1 MB
 const HARD_FILE_REF_MAX_BYTES = 10_000_000; // 10 MB
 const MAX_FILE_REFS_PER_CALL = 32;
 const MAX_FILE_REF_TOTAL_BYTES_PER_CALL = 16_000_000; // 16 MB
 const MAX_FILE_REF_READ_CONCURRENCY = 4;
+const FILE_REF_READ_CHUNK_BYTES = 256 * 1024;
 const MAX_ENV_REF_FILE_BYTES = 64 * 1024;
 // Reference keys and their permitted companion keys. Used both to resolve refs
 // and to detect a ref accidentally passed as a JSON-encoded string.
@@ -97,6 +100,8 @@ interface UpstreamConnectOptions {
   connectTimeoutMs?: number;
   reconnectPolicy?: ReconnectPolicyConfig;
   sessionCwdIdleTtlSeconds?: number;
+  maxScopedClients?: number;
+  maxScopedClientsPerServer?: number;
   fileReferenceRoots?: string[];
   strictStartup?: boolean;
 }
@@ -142,6 +147,7 @@ interface ScopedClient {
   server: string;
   label: string;
   cwd?: string;
+  lastUsedAt: number;
   idleTimer?: ReturnType<typeof setTimeout>;
 }
 
@@ -153,6 +159,8 @@ interface ScopedClientLease {
 interface PendingScopedClient {
   promise: Promise<ScopedClient>;
   close: () => Promise<void>;
+  waiters: number;
+  settled: boolean;
 }
 
 interface ClientSelection {
@@ -160,12 +168,175 @@ interface ClientSelection {
   scopedLease?: ScopedClientLease;
 }
 
+interface AdmissionWaiter {
+  server: string;
+  serverLimit: number;
+  signal?: AbortSignal;
+  resolve: (release: () => void) => void;
+  reject: (error: Error) => void;
+  onAbort?: () => void;
+}
+
+class ToolCallWaitAbortedError extends Error {
+  constructor(message = "tool call was aborted while waiting for shared downstream work") {
+    super(message);
+    this.name = "AbortError";
+  }
+}
+
+class ScopedClientCapacityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ScopedClientCapacityError";
+  }
+}
+
+/** Persistent, service-wide admission with FIFO order among eligible waiters. */
+class CallAdmissionController {
+  private active = 0;
+  private activeByServer = new Map<string, number>();
+  private queue: AdmissionWaiter[] = [];
+  private closed = false;
+
+  constructor(private readonly globalLimit: number) {}
+
+  acquire(
+    server: string,
+    serverLimit: number,
+    signal?: AbortSignal
+  ): Promise<() => void> {
+    if (signal?.aborted) {
+      return Promise.reject(
+        new ToolCallWaitAbortedError(
+          "tool call was aborted while waiting for downstream admission"
+        )
+      );
+    }
+    if (this.closed) return Promise.reject(new Error("upstream manager is closing"));
+
+    return new Promise<() => void>((resolve, reject) => {
+      const waiter: AdmissionWaiter = {
+        server,
+        serverLimit,
+        signal,
+        resolve,
+        reject,
+      };
+      waiter.onAbort = () => {
+        const index = this.queue.indexOf(waiter);
+        if (index === -1) return;
+        this.queue.splice(index, 1);
+        reject(
+          new ToolCallWaitAbortedError(
+            "tool call was aborted while waiting for downstream admission"
+          )
+        );
+        this.drain();
+      };
+      signal?.addEventListener("abort", waiter.onAbort, { once: true });
+      this.queue.push(waiter);
+      if (signal?.aborted) {
+        waiter.onAbort();
+        return;
+      }
+      this.drain();
+    });
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    const waiters = this.queue.splice(0);
+    for (const waiter of waiters) {
+      if (waiter.onAbort) {
+        waiter.signal?.removeEventListener("abort", waiter.onAbort);
+      }
+      waiter.reject(new Error("upstream manager is closing"));
+    }
+  }
+
+  private drain(): void {
+    while (!this.closed && this.active < this.globalLimit) {
+      const index = this.queue.findIndex(
+        (waiter) =>
+          (this.activeByServer.get(waiter.server) ?? 0) < waiter.serverLimit
+      );
+      if (index === -1) return;
+
+      const [waiter] = this.queue.splice(index, 1);
+      if (waiter.onAbort) {
+        waiter.signal?.removeEventListener("abort", waiter.onAbort);
+      }
+      this.active++;
+      this.activeByServer.set(
+        waiter.server,
+        (this.activeByServer.get(waiter.server) ?? 0) + 1
+      );
+      let released = false;
+      waiter.resolve(() => {
+        if (released) return;
+        released = true;
+        this.active = Math.max(0, this.active - 1);
+        const serverActive = Math.max(
+          0,
+          (this.activeByServer.get(waiter.server) ?? 0) - 1
+        );
+        if (serverActive === 0) this.activeByServer.delete(waiter.server);
+        else this.activeByServer.set(waiter.server, serverActive);
+        this.drain();
+      });
+    }
+  }
+}
+
+function waitForSharedWork<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(new ToolCallWaitAbortedError());
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = () => finish(() => reject(new ToolCallWaitAbortedError()));
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    promise.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error))
+    );
+  });
+}
+
+function isAbortError(error: unknown): boolean {
+  return Boolean(
+    error &&
+    typeof error === "object" &&
+    (error as { name?: unknown }).name === "AbortError"
+  );
+}
+
 interface FileReferenceResolutionState {
   listenerOrigin: boolean;
+  signal?: AbortSignal;
   opaqueArgumentKeys?: ReadonlySet<string>;
-  fileTasks: Array<() => Promise<void>>;
+  fileTasks: FileReferenceTask[];
   referenceCount: number;
   totalBytes: number;
+}
+
+interface FileReferenceTask {
+  filePath: string;
+  maxBytes: number;
+  path: string;
+  refKey: "$file" | "$jsonFile" | "$yamlFile";
+  assign: (resolved: unknown) => void;
 }
 
 function errorMessage(error: unknown): string {
@@ -739,13 +910,18 @@ export class UpstreamManager {
     fastFailDuringBackoff: true,
   };
   private sessionCwdIdleTtlMs = DEFAULT_SESSION_CWD_IDLE_TTL_SECONDS * 1000;
+  private maxScopedClients = DEFAULT_MAX_SCOPED_CLIENTS;
+  private maxScopedClientsPerServer = DEFAULT_MAX_SCOPED_CLIENTS_PER_SERVER;
   private fileReferenceRoots: string[] = [];
   private unresolvedSessionCwdCounts = new Map<string, number>();
   private unresolvedSessionCwdWarned = new Set<string>();
   private closing = false;
   private lifecycleGeneration = 0;
+  private callAdmission: CallAdmissionController;
 
-  constructor(private callTimeoutMs = DEFAULT_CALL_TIMEOUT_MS) {}
+  constructor(private callTimeoutMs = DEFAULT_CALL_TIMEOUT_MS) {
+    this.callAdmission = new CallAdmissionController(20);
+  }
 
   private effectiveCallTimeoutMs(server: string, context?: ToolCallContext): number {
     return context?.timeoutMs ?? this.serverConfigs.get(server)?.callTimeoutMs ?? this.callTimeoutMs;
@@ -801,6 +977,7 @@ export class UpstreamManager {
   private async resetConnectionState(): Promise<void> {
     this.closing = true;
     this.lifecycleGeneration++;
+    this.callAdmission.close();
     for (const timer of this.reconnectTimers.values()) {
       clearTimeout(timer);
     }
@@ -836,6 +1013,8 @@ export class UpstreamManager {
     this.removedTools.clear();
     this.serverInfoMap.clear();
     this.serverConcurrency.clear();
+    this.maxScopedClients = DEFAULT_MAX_SCOPED_CLIENTS;
+    this.maxScopedClientsPerServer = DEFAULT_MAX_SCOPED_CLIENTS_PER_SERVER;
     this.fileReferenceRoots = [];
     this.closing = false;
   }
@@ -1437,10 +1616,12 @@ export class UpstreamManager {
 
   private async reconnectServer(
     name: string,
-    trigger: "background" | "call"
+    trigger: "background" | "call",
+    signal?: AbortSignal
   ): Promise<boolean> {
     const existing = this.reconnects.get(name);
-    if (existing) return existing;
+    if (existing) return waitForSharedWork(existing, signal);
+    if (signal?.aborted) throw new ToolCallWaitAbortedError();
 
     const config = this.serverConfigs.get(name);
     if (!config) return false;
@@ -1545,7 +1726,7 @@ export class UpstreamManager {
     })();
 
     this.reconnects.set(name, promise);
-    return promise;
+    return waitForSharedWork(promise, signal);
   }
 
   private downstreamUnavailable(server: string, toolName: string): CallToolResult {
@@ -1740,6 +1921,71 @@ export class UpstreamManager {
       );
   }
 
+  private scopedClientKeys(server?: string): Set<string> {
+    const keys = new Set<string>();
+    const prefix = server === undefined ? undefined : `${server}\0`;
+    for (const key of this.sessionClients.keys()) {
+      if (prefix === undefined || key.startsWith(prefix)) keys.add(key);
+    }
+    for (const key of this.sessionClientConnects.keys()) {
+      if (prefix === undefined || key.startsWith(prefix)) keys.add(key);
+    }
+    return keys;
+  }
+
+  private evictOldestIdleScopedClient(server?: string): Promise<void> | undefined {
+    const prefix = server === undefined ? undefined : `${server}\0`;
+    const candidate = Array.from(this.sessionClients.entries())
+      .filter(
+        ([key, scoped]) =>
+          (prefix === undefined || key.startsWith(prefix)) &&
+          scoped.activeCalls === 0 &&
+          !this.sessionClientConnects.has(key)
+      )
+      .sort((left, right) => left[1].lastUsedAt - right[1].lastUsedAt)[0];
+    if (!candidate) return undefined;
+
+    const [key, scoped] = candidate;
+    if (scoped.idleTimer) clearTimeout(scoped.idleTimer);
+    if (!this.deleteSessionClientIfCurrent(key, scoped)) return undefined;
+    return this.closeQuietly(scoped.client, scoped.transport);
+  }
+
+  /**
+   * Reserve logical capacity before starting any asynchronous connection work.
+   * Evicted clients are removed synchronously, then fully closed before the new
+   * transport is created. Active and connecting clients are never evicted.
+   */
+  private reserveScopedClientCapacity(server: string): Promise<void>[] {
+    const closes: Promise<void>[] = [];
+    const perServerLimit =
+      this.serverConfigs.get(server)?.maxScopedClients ?? this.maxScopedClientsPerServer;
+
+    while (this.scopedClientKeys(server).size >= perServerLimit) {
+      const close = this.evictOldestIdleScopedClient(server);
+      if (!close) {
+        throw new ScopedClientCapacityError(
+          `scoped client capacity exhausted for server "${server}" ` +
+            `(${perServerLimit}); all scoped clients are active or connecting`
+        );
+      }
+      closes.push(close);
+    }
+
+    while (this.scopedClientKeys().size >= this.maxScopedClients) {
+      const close = this.evictOldestIdleScopedClient();
+      if (!close) {
+        throw new ScopedClientCapacityError(
+          `global scoped client capacity exhausted (${this.maxScopedClients}); ` +
+            `all scoped clients are active or connecting`
+        );
+      }
+      closes.push(close);
+    }
+
+    return closes;
+  }
+
   private refreshSessionClientIdleTimer(
     key: string,
     server: string,
@@ -1774,11 +2020,68 @@ export class UpstreamManager {
       clearTimeout(scoped.idleTimer);
       scoped.idleTimer = undefined;
     }
+    scoped.lastUsedAt = Date.now();
     scoped.activeCalls++;
   }
 
   private releaseSessionClient(scoped: ScopedClient): void {
     scoped.activeCalls = Math.max(0, scoped.activeCalls - 1);
+    scoped.lastUsedAt = Date.now();
+  }
+
+  private cleanupPendingScopedClient(
+    key: string,
+    pending: PendingScopedClient
+  ): void {
+    if (!pending.settled || pending.waiters > 0) return;
+    if (this.sessionClientConnects.get(key) === pending) {
+      this.sessionClientConnects.delete(key);
+    }
+  }
+
+  private retireUnclaimedPendingScopedClient(
+    key: string,
+    pending: PendingScopedClient
+  ): void {
+    if (!pending.settled || pending.waiters > 0) return;
+    const scoped = this.sessionClients.get(key);
+    if (!scoped || scoped.activeCalls > 0) return;
+    if (this.sessionCwdIdleTtlMs === 0) {
+      this.closeSessionClientAfterCall(key, scoped);
+    } else {
+      this.refreshSessionClientIdleTimer(key, scoped.server, scoped.label, scoped);
+    }
+  }
+
+  private trackPendingScopedClient(
+    key: string,
+    pending: PendingScopedClient
+  ): void {
+    void pending.promise.then(() => {
+      pending.settled = true;
+      this.cleanupPendingScopedClient(key, pending);
+      this.retireUnclaimedPendingScopedClient(key, pending);
+    }, () => {
+      pending.settled = true;
+      this.cleanupPendingScopedClient(key, pending);
+    });
+  }
+
+  private async awaitPendingScopedClient(
+    key: string,
+    pending: PendingScopedClient,
+    signal?: AbortSignal
+  ): Promise<ScopedClient> {
+    pending.waiters++;
+    try {
+      const scoped = await waitForSharedWork(pending.promise, signal);
+      this.acquireSessionClient(scoped);
+      return scoped;
+    } finally {
+      pending.waiters = Math.max(0, pending.waiters - 1);
+      this.cleanupPendingScopedClient(key, pending);
+      this.retireUnclaimedPendingScopedClient(key, pending);
+    }
   }
 
   private releaseScopedClientLease(lease: ScopedClientLease): void {
@@ -1815,8 +2118,10 @@ export class UpstreamManager {
 
   private async getSessionClient(
     server: string,
-    cwd: string
+    cwd: string,
+    signal?: AbortSignal
   ): Promise<ScopedClient | null> {
+    if (signal?.aborted) throw new ToolCallWaitAbortedError();
     const config = this.serverConfigs.get(server);
     if (!config || !isStdioServerConfig(config)) return null;
 
@@ -1829,15 +2134,18 @@ export class UpstreamManager {
 
     const connecting = this.sessionClientConnects.get(key);
     if (connecting) {
-      const scoped = await connecting.promise;
-      this.acquireSessionClient(scoped);
-      return scoped;
+      return this.awaitPendingScopedClient(key, connecting, signal);
     }
 
+    const evictionCloses = this.reserveScopedClientCapacity(server);
     const lifecycleGeneration = this.lifecycleGeneration;
     let transport: Transport | undefined;
     let client: Client | undefined;
     const promise = (async () => {
+      await Promise.all(evictionCloses);
+      if (this.closing || this.lifecycleGeneration !== lifecycleGeneration) {
+        throw new Error(`session-scoped server "${server}" connect became stale`);
+      }
       transport = await this.createStdioTransport(config, cwd);
       if (this.closing || this.lifecycleGeneration !== lifecycleGeneration) {
         throw new Error(`session-scoped server "${server}" connect became stale`);
@@ -1864,6 +2172,7 @@ export class UpstreamManager {
           server,
           label: cwd,
           cwd,
+          lastUsedAt: Date.now(),
         };
         if (this.closing || this.lifecycleGeneration !== lifecycleGeneration) {
           throw new Error(`session-scoped server "${server}" connect became stale`);
@@ -1889,23 +2198,20 @@ export class UpstreamManager {
     const pending: PendingScopedClient = {
       promise,
       close: () => this.closeQuietly(client, transport),
+      waiters: 0,
+      settled: false,
     };
     this.sessionClientConnects.set(key, pending);
-    try {
-      const scoped = await promise;
-      this.acquireSessionClient(scoped);
-      return scoped;
-    } finally {
-      if (this.sessionClientConnects.get(key) === pending) {
-        this.sessionClientConnects.delete(key);
-      }
-    }
+    this.trackPendingScopedClient(key, pending);
+    return this.awaitPendingScopedClient(key, pending, signal);
   }
 
   private async getForwardedHeaderClient(
     server: string,
-    forwardedHeaders: Record<string, string>
+    forwardedHeaders: Record<string, string>,
+    signal?: AbortSignal
   ): Promise<ScopedClient | null> {
+    if (signal?.aborted) throw new ToolCallWaitAbortedError();
     const config = this.serverConfigs.get(server);
     if (!config || !isHttpServerConfig(config)) return null;
 
@@ -1919,17 +2225,20 @@ export class UpstreamManager {
 
     const connecting = this.sessionClientConnects.get(key);
     if (connecting) {
-      const scoped = await connecting.promise;
-      this.acquireSessionClient(scoped);
-      return scoped;
+      return this.awaitPendingScopedClient(key, connecting, signal);
     }
 
+    const evictionCloses = this.reserveScopedClientCapacity(server);
     const label = `forwarded headers: ${Object.keys(forwardedHeaders).sort().join(", ")}`;
     const lifecycleGeneration = this.lifecycleGeneration;
     let transport: Transport | undefined;
     let client: Client | undefined;
     const promise = (async () => {
       try {
+        await Promise.all(evictionCloses);
+        if (this.closing || this.lifecycleGeneration !== lifecycleGeneration) {
+          throw new Error(`session-scoped server "${server}" connect became stale`);
+        }
         const connected = await this.connectWithFallback(
           server,
           config,
@@ -1956,6 +2265,7 @@ export class UpstreamManager {
           kind: "http-forward-headers",
           server,
           label,
+          lastUsedAt: Date.now(),
         };
         if (this.closing || this.lifecycleGeneration !== lifecycleGeneration) {
           throw new Error(`session-scoped server "${server}" connect became stale`);
@@ -1981,17 +2291,12 @@ export class UpstreamManager {
     const pending: PendingScopedClient = {
       promise,
       close: () => this.closeQuietly(client, transport),
+      waiters: 0,
+      settled: false,
     };
     this.sessionClientConnects.set(key, pending);
-    try {
-      const scoped = await promise;
-      this.acquireSessionClient(scoped);
-      return scoped;
-    } finally {
-      if (this.sessionClientConnects.get(key) === pending) {
-        this.sessionClientConnects.delete(key);
-      }
-    }
+    this.trackPendingScopedClient(key, pending);
+    return this.awaitPendingScopedClient(key, pending, signal);
   }
 
   private async clientForCall(
@@ -1999,9 +2304,14 @@ export class UpstreamManager {
     toolName: string,
     context?: ToolCallContext
   ): Promise<ClientSelection | { error: CallToolResult } | undefined> {
+    if (context?.signal?.aborted) throw new ToolCallWaitAbortedError();
     const forwardedHeaders = this.forwardedHeadersForServer(server, context);
     if (forwardedHeaders) {
-      const scoped = await this.getForwardedHeaderClient(server, forwardedHeaders);
+      const scoped = await this.getForwardedHeaderClient(
+        server,
+        forwardedHeaders,
+        context?.signal
+      );
       if (scoped) {
         return {
           client: scoped.client,
@@ -2014,7 +2324,7 @@ export class UpstreamManager {
     }
 
     if (this.shouldUseSessionCwd(server, context)) {
-      const scoped = await this.getSessionClient(server, context.cwd);
+      const scoped = await this.getSessionClient(server, context.cwd, context.signal);
       if (scoped) {
         return {
           client: scoped.client,
@@ -2039,7 +2349,7 @@ export class UpstreamManager {
       ) {
         return { error: this.downstreamUnavailable(server, toolName) };
       }
-      const reconnected = await this.reconnectServer(server, "call");
+      const reconnected = await this.reconnectServer(server, "call", context?.signal);
       if (!reconnected) {
         return { error: this.downstreamUnavailable(server, toolName) };
       }
@@ -2059,11 +2369,15 @@ export class UpstreamManager {
     const activeEntries = entries.filter(([, config]) => !config.disabled);
     this.serverConfigs = new Map(entries);
     const maxConcurrency = options.maxConcurrency ?? 20;
+    this.callAdmission = new CallAdmissionController(maxConcurrency);
     const connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
     this.connectTimeoutMs = connectTimeoutMs;
     this.reconnectPolicy = this.normalizeReconnectPolicy(options.reconnectPolicy);
     this.sessionCwdIdleTtlMs =
       (options.sessionCwdIdleTtlSeconds ?? DEFAULT_SESSION_CWD_IDLE_TTL_SECONDS) * 1000;
+    this.maxScopedClients = options.maxScopedClients ?? DEFAULT_MAX_SCOPED_CLIENTS;
+    this.maxScopedClientsPerServer =
+      options.maxScopedClientsPerServer ?? DEFAULT_MAX_SCOPED_CLIENTS_PER_SERVER;
     this.fileReferenceRoots = await Promise.all(
       (options.fileReferenceRoots ?? []).map(async (root) =>
         realpath(resolvePath(root))
@@ -2378,14 +2692,17 @@ export class UpstreamManager {
   private async canonicalFileReferencePath(
     filePath: string,
     path: string,
-    listenerOrigin: boolean
+    listenerOrigin: boolean,
+    signal?: AbortSignal
   ): Promise<string> {
+    signal?.throwIfAborted();
     if (listenerOrigin && this.fileReferenceRoots.length === 0) {
       throw new Error(
         `file reference at ${path} is disabled for listener calls; configure fileReferenceRoots`
       );
     }
     const canonical = await realpath(resolvePath(filePath));
+    signal?.throwIfAborted();
     if (
       this.fileReferenceRoots.length > 0 &&
       !this.fileReferenceRoots.some((root) => this.pathIsWithinRoot(canonical, root))
@@ -2401,14 +2718,22 @@ export class UpstreamManager {
     filePath: string,
     maxBytes: number,
     path: string,
-    listenerOrigin: boolean
+    listenerOrigin: boolean,
+    signal?: AbortSignal,
+    canonicalPath?: string
   ): Promise<Buffer> {
-    const canonical = await this.canonicalFileReferencePath(filePath, path, listenerOrigin);
+    const canonical = canonicalPath ?? await this.canonicalFileReferencePath(
+      filePath,
+      path,
+      listenerOrigin,
+      signal
+    );
     return this.readOpenedRegularFileBounded(
       canonical,
       maxBytes,
       `file reference at ${path}`,
-      filePath
+      filePath,
+      signal
     );
   }
 
@@ -2416,8 +2741,10 @@ export class UpstreamManager {
     canonicalPath: string,
     maxBytes: number,
     label: string,
-    displayPath: string
+    displayPath: string,
+    signal?: AbortSignal
   ): Promise<Buffer> {
+    signal?.throwIfAborted();
     // O_NONBLOCK keeps opening a FIFO/device from stalling before fstat can
     // reject it. It has no effect on ordinary regular-file reads.
     const handle = await open(
@@ -2425,7 +2752,9 @@ export class UpstreamManager {
       fsConstants.O_RDONLY | fsConstants.O_NONBLOCK
     );
     try {
+      signal?.throwIfAborted();
       const stats = await handle.stat();
+      signal?.throwIfAborted();
       if (!stats.isFile()) {
         throw new Error(`${label} must resolve to a regular file: ${displayPath}`);
       }
@@ -2437,12 +2766,14 @@ export class UpstreamManager {
       const buffer = Buffer.allocUnsafe(maxBytes + 1);
       let total = 0;
       while (total < buffer.length) {
+        signal?.throwIfAborted();
         const { bytesRead } = await handle.read(
           buffer,
           total,
-          buffer.length - total,
+          Math.min(FILE_REF_READ_CHUNK_BYTES, buffer.length - total),
           null
         );
+        signal?.throwIfAborted();
         if (bytesRead === 0) break;
         total += bytesRead;
       }
@@ -2455,20 +2786,23 @@ export class UpstreamManager {
     }
   }
 
-  private async runFileReferenceTasks(
-    state: FileReferenceResolutionState
+  private async runBoundedFileWork<T>(
+    items: readonly T[],
+    signal: AbortSignal | undefined,
+    work: (item: T, index: number) => Promise<void>
   ): Promise<void> {
     let nextIndex = 0;
     let firstError: unknown;
     const workers = Array.from(
       {
-        length: Math.min(MAX_FILE_REF_READ_CONCURRENCY, state.fileTasks.length),
+        length: Math.min(MAX_FILE_REF_READ_CONCURRENCY, items.length),
       },
       async () => {
-        while (firstError === undefined && nextIndex < state.fileTasks.length) {
-          const task = state.fileTasks[nextIndex++];
+        while (firstError === undefined && nextIndex < items.length) {
+          const index = nextIndex++;
           try {
-            await task();
+            signal?.throwIfAborted();
+            await work(items[index], index);
           } catch (error) {
             firstError ??= error;
           }
@@ -2476,7 +2810,113 @@ export class UpstreamManager {
       }
     );
     await Promise.all(workers);
+    signal?.throwIfAborted();
     if (firstError !== undefined) throw firstError;
+  }
+
+  private async runFileReferenceTasks(
+    state: FileReferenceResolutionState
+  ): Promise<void> {
+    state.signal?.throwIfAborted();
+    if (state.fileTasks.length === 0) return;
+
+    // Count every syntactic reference against the per-call count and expanded-
+    // byte budgets, but canonicalize and read each underlying file only once.
+    // Aliases (including symlinks) therefore cannot multiply filesystem I/O,
+    // while repeated argument expansion cannot bypass the existing budgets.
+    // Each reference also keeps its own maxBytes and parser semantics.
+    const canonicalByInput = new Map<string, Promise<string>>();
+    const canonicalPaths = new Array<string>(state.fileTasks.length);
+    await this.runBoundedFileWork(
+      state.fileTasks,
+      state.signal,
+      async (task, index) => {
+        let pending = canonicalByInput.get(task.filePath);
+        if (!pending) {
+          pending = this.canonicalFileReferencePath(
+            task.filePath,
+            task.path,
+            state.listenerOrigin,
+            state.signal
+          );
+          canonicalByInput.set(task.filePath, pending);
+        }
+        canonicalPaths[index] = await pending;
+      }
+    );
+
+    const grouped = new Map<string, FileReferenceTask[]>();
+    for (let index = 0; index < state.fileTasks.length; index++) {
+      const canonical = canonicalPaths[index];
+      const tasks = grouped.get(canonical);
+      if (tasks) tasks.push(state.fileTasks[index]);
+      else grouped.set(canonical, [state.fileTasks[index]]);
+    }
+
+    await this.runBoundedFileWork(
+      Array.from(grouped.entries()),
+      state.signal,
+      async ([canonical, tasks]) => {
+        // A failure at any duplicate rejects the whole call, so use the
+        // strictest bound. This preserves per-reference maxBytes semantics and
+        // avoids reading data that a stricter alias already makes invalid.
+        const representative = tasks.reduce((strictest, task) =>
+          task.maxBytes < strictest.maxBytes ? task : strictest
+        );
+        const bytes = await this.readFileReferenceBounded(
+          representative.filePath,
+          representative.maxBytes,
+          representative.path,
+          state.listenerOrigin,
+          state.signal,
+          canonical
+        );
+        state.signal?.throwIfAborted();
+
+        // Keep this defensive check for files changed during the open/read
+        // window; the strictest shared read normally guarantees every bound.
+        for (const task of tasks) {
+          if (bytes.length > task.maxBytes) {
+            throw new Error(
+              `file reference at ${task.path} exceeds maxBytes ` +
+              `(${bytes.length} > ${task.maxBytes}): ${task.filePath}`
+            );
+          }
+        }
+
+        // Aggregate bytes bound materialized arguments. Repeated references
+        // therefore count repeatedly even though their filesystem read is
+        // deduplicated, preventing a small unique input set from expanding to
+        // an unexpectedly large downstream request.
+        state.totalBytes += bytes.length * tasks.length;
+        if (state.totalBytes > MAX_FILE_REF_TOTAL_BYTES_PER_CALL) {
+          throw new Error(
+            `file reference bytes exceed per-call limit (${MAX_FILE_REF_TOTAL_BYTES_PER_CALL})`
+          );
+        }
+
+        const content = bytes.toString("utf8");
+        for (const task of tasks) {
+          state.signal?.throwIfAborted();
+          if (task.refKey === "$file") {
+            task.assign(content);
+            continue;
+          }
+          try {
+            task.assign(
+              task.refKey === "$jsonFile"
+                ? JSON.parse(content) as unknown
+                : parseYaml(content) as unknown
+            );
+          } catch (error) {
+            throw new Error(
+              `failed to parse ${task.refKey} at ${task.path} (${task.filePath}): ` +
+              errorMessage(error)
+            );
+          }
+        }
+      }
+    );
   }
 
   private async resolveFileReferences(
@@ -2498,6 +2938,7 @@ export class UpstreamManager {
     }];
 
     while (work.length > 0) {
+      state.signal?.throwIfAborted();
       const item = work.pop()!;
       if (item.opaque) {
         item.assign(item.value);
@@ -2547,35 +2988,12 @@ export class UpstreamManager {
           );
         }
         const filePath = current[refKey] as string;
-        state.fileTasks.push(async () => {
-          const bytes = await this.readFileReferenceBounded(
-            filePath,
-            maxBytes,
-            item.path,
-            state.listenerOrigin
-          );
-          state.totalBytes += bytes.length;
-          if (state.totalBytes > MAX_FILE_REF_TOTAL_BYTES_PER_CALL) {
-            throw new Error(
-              `file reference bytes exceed per-call limit (${MAX_FILE_REF_TOTAL_BYTES_PER_CALL})`
-            );
-          }
-          const content = bytes.toString("utf8");
-          if (refKey === "$file") {
-            item.assign(content);
-            return;
-          }
-          try {
-            item.assign(
-              refKey === "$jsonFile"
-                ? JSON.parse(content) as unknown
-                : parseYaml(content) as unknown
-            );
-          } catch (error) {
-            throw new Error(
-              `failed to parse ${refKey} at ${item.path} (${filePath}): ${errorMessage(error)}`
-            );
-          }
+        state.fileTasks.push({
+          filePath,
+          maxBytes,
+          path: item.path,
+          refKey,
+          assign: item.assign,
         });
         continue;
       }
@@ -2626,6 +3044,7 @@ export class UpstreamManager {
     // still go on to schema coercion like any other literal.
     const state: FileReferenceResolutionState = {
       listenerOrigin: context?.transport === "cli" || context?.transport === "mcp",
+      ...(context?.signal ? { signal: context.signal } : {}),
       ...(opaqueArgumentKeys && opaqueArgumentKeys.size > 0 ? { opaqueArgumentKeys } : {}),
       fileTasks: [],
       referenceCount: 0,
@@ -2690,6 +3109,21 @@ export class UpstreamManager {
         ...(clientCoercions.length > 0 ? { clientCoercions } : {}),
       };
     } catch (error) {
+      if (options?.context?.signal?.aborted || isAbortError(error)) {
+        return {
+          error: errorResult(
+            "tool_call_aborted",
+            "tool call was aborted during argument preparation",
+            {
+              tool: toolName,
+              ...(serverHint ? { server: serverHint } : {}),
+              retryable: false,
+              safeToRetry: true,
+              executionState: "not_started",
+            }
+          ),
+        };
+      }
       return {
         error: errorResult("argument_resolution_failed", errorMessage(error), {
           tool: toolName,
@@ -2885,6 +3319,31 @@ export class UpstreamManager {
         : undefined;
     let callClient: Client | undefined;
     const acquiredScopedLeases: ScopedClientLease[] = [];
+    let releaseAdmission: (() => void) | undefined;
+
+    try {
+      releaseAdmission = await this.callAdmission.acquire(
+        prepared.server,
+        this.serverConfigs.get(prepared.server)?.maxConcurrency ?? Number.MAX_SAFE_INTEGER,
+        context?.signal
+      );
+    } catch (error) {
+      if (error instanceof ToolCallWaitAbortedError) {
+        return errorResult("tool_call_aborted", error.message, {
+          tool: toolName,
+          ...(serverHint ? { server: serverHint } : {}),
+          retryable: false,
+          safeToRetry: true,
+          executionState: "not_started",
+        });
+      }
+      return errorResult("downstream_unavailable", errorMessage(error), {
+        tool: toolName,
+        ...(serverHint ? { server: serverHint } : {}),
+        retryable: true,
+        executionState: "not_started",
+      });
+    }
 
     try {
       const invoke = async (forceReconnect = false): Promise<CallToolResult> => {
@@ -2907,7 +3366,12 @@ export class UpstreamManager {
               arguments: prepared.resolvedArguments,
             },
             undefined,
-            timeoutMs > 0 ? { timeout: timeoutMs } : undefined
+            timeoutMs > 0 || context?.signal
+              ? {
+                  ...(timeoutMs > 0 ? { timeout: timeoutMs } : {}),
+                  ...(context?.signal ? { signal: context.signal } : {}),
+                }
+              : undefined
           ),
           timeoutMs,
           `"${prepared.server}" tool "${prepared.actualName}" call`
@@ -2918,6 +3382,33 @@ export class UpstreamManager {
       const result = await invoke();
       return result;
     } catch (error) {
+      if (error instanceof ToolCallWaitAbortedError) {
+        return errorResult("tool_call_aborted", error.message, {
+          tool: toolName,
+          ...(serverHint ? { server: serverHint } : {}),
+          retryable: false,
+          safeToRetry: true,
+          executionState: "not_started",
+        });
+      }
+      if (context?.signal?.aborted || isAbortError(error)) {
+        return errorResult("tool_call_aborted", "downstream tool call was aborted", {
+          tool: toolName,
+          ...(serverHint ? { server: serverHint } : {}),
+          retryable: false,
+          safeToRetry: false,
+          executionState: "unknown",
+        });
+      }
+      if (error instanceof ScopedClientCapacityError) {
+        return errorResult("scoped_client_capacity", error.message, {
+          tool: toolName,
+          ...(serverHint ? { server: serverHint } : {}),
+          retryable: true,
+          safeToRetry: true,
+          executionState: "not_started",
+        });
+      }
       const normalized = normalizeToolCallFailure(error);
       const initialExecutionState = executionStateForFailure(normalized.category);
       let retryAttempted = false;
@@ -2938,9 +3429,31 @@ export class UpstreamManager {
           scopedKey
         );
         if (retrySafe) {
-          const reconnected = scopedKey
-            ? true
-            : await this.reconnectServer(prepared.server, "call");
+          let reconnected: boolean;
+          try {
+            reconnected = scopedKey
+              ? true
+              : await this.reconnectServer(
+                  prepared.server,
+                  "call",
+                  context?.signal
+                );
+          } catch (reconnectError) {
+            if (
+              reconnectError instanceof ToolCallWaitAbortedError ||
+              context?.signal?.aborted ||
+              isAbortError(reconnectError)
+            ) {
+              return errorResult("tool_call_aborted", "tool call was aborted during reconnect", {
+                tool: toolName,
+                ...(serverHint ? { server: serverHint } : {}),
+                retryable: false,
+                safeToRetry: initialExecutionState === "not_started",
+                executionState: initialExecutionState,
+              });
+            }
+            throw reconnectError;
+          }
           if (reconnected) {
             retryAttempted = true;
             try {
@@ -2962,7 +3475,12 @@ export class UpstreamManager {
                       arguments: prepared.resolvedArguments,
                     },
                     undefined,
-                    timeoutMs > 0 ? { timeout: timeoutMs } : undefined
+                    timeoutMs > 0 || context?.signal
+                      ? {
+                          ...(timeoutMs > 0 ? { timeout: timeoutMs } : {}),
+                          ...(context?.signal ? { signal: context.signal } : {}),
+                        }
+                      : undefined
                   ),
                   timeoutMs,
                   `"${prepared.server}" tool "${prepared.actualName}" retry call`
@@ -2970,6 +3488,20 @@ export class UpstreamManager {
                 return result as unknown as CallToolResult;
               })();
             } catch (retryError) {
+              if (
+                retryError instanceof ToolCallWaitAbortedError ||
+                context?.signal?.aborted ||
+                isAbortError(retryError)
+              ) {
+                return errorResult("tool_call_aborted", "downstream retry was aborted", {
+                  tool: toolName,
+                  ...(serverHint ? { server: serverHint } : {}),
+                  retryable: false,
+                  safeToRetry: false,
+                  executionState: "unknown",
+                  retryAttempted: true,
+                });
+              }
               const retryNormalized = normalizeToolCallFailure(retryError);
               const retrySafeForCaller = Boolean(
                 context?.retryOnReconnect ||
@@ -3020,6 +3552,7 @@ export class UpstreamManager {
       for (const lease of acquiredScopedLeases.reverse()) {
         this.releaseScopedClientLease(lease);
       }
+      releaseAdmission?.();
     }
   }
 
@@ -3072,6 +3605,7 @@ export class UpstreamManager {
   async close(): Promise<void> {
     this.closing = true;
     this.lifecycleGeneration++;
+    this.callAdmission.close();
     for (const timer of this.reconnectTimers.values()) {
       clearTimeout(timer);
     }

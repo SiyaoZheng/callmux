@@ -53,7 +53,7 @@ test("event store records call rows and drill-down breakdowns", async () => {
       targets: [{ server: "github", tool: "issue_write", count: 1 }],
     });
 
-    const drilldown = store.queryDrilldown({ fromMs: T0 - 10_000, toMs: T0 + 10_000 });
+    const drilldown = await store.queryDrilldown({ fromMs: T0 - 10_000, toMs: T0 + 10_000 });
     assert.equal(drilldown.totals.calls, 2);
     assert.equal(drilldown.totals.errors, 1);
     assert.equal(drilldown.totals.avgDurationMs, 50);
@@ -75,7 +75,7 @@ test("event store records call rows and drill-down breakdowns", async () => {
       lastSeenAt: new Date(T0 - 1_000).toISOString(),
     }]);
   } finally {
-    store.close();
+    await store.close();
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -100,13 +100,13 @@ test("event store prunes by max rows and age", async () => {
     store.recordCall({ timestampMs: T0 - 1_000, tool: "two", durationMs: 1, ok: true });
     store.recordCall({ timestampMs: T0, tool: "three", durationMs: 1, ok: true });
 
-    const drilldown = store.queryDrilldown({ fromMs: T0 - 3 * 24 * 60 * 60_000, toMs: T0 + 1 });
+    const drilldown = await store.queryDrilldown({ fromMs: T0 - 3 * 24 * 60 * 60_000, toMs: T0 + 1 });
     assert.equal(drilldown.totals.calls, 2);
     assert.equal(drilldown.byTool.some((row) => row.name === "old"), false);
     assert.equal(drilldown.byTool.some((row) => row.name === "one"), false);
     assert.deepEqual(drilldown.byTool.map((row) => row.name).sort(), ["three", "two"]);
   } finally {
-    store.close();
+    await store.close();
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -172,13 +172,70 @@ test("event store migrates an existing database that predates the transport colu
   try {
     store.recordCall({ timestampMs: T0, tool: "new_tool", transport: "cli", durationMs: 5, ok: true });
 
-    const drilldown = store.queryDrilldown({ fromMs: T0 - 60_000, toMs: T0 + 1 });
+    const drilldown = await store.queryDrilldown({ fromMs: T0 - 60_000, toMs: T0 + 1 });
     assert.equal(drilldown.totals.calls, 2);
     // Pre-migration rows have no transport recorded; they group under "mcp".
     assert.equal(drilldown.byTransport.find((row) => row.name === "mcp")?.calls, 1);
     assert.equal(drilldown.byTransport.find((row) => row.name === "cli")?.calls, 1);
   } finally {
-    store.close();
+    await store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("event store batches queued writes before sending them to the SQLite worker", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-event-batch-"));
+  const store = await openEventStore({ path: join(dir, "events.sqlite") });
+  const worker = (store as unknown as {
+    worker: { postMessage: (message: unknown) => void };
+  }).worker;
+  const originalPostMessage = worker.postMessage.bind(worker);
+  const batchSizes: number[] = [];
+  worker.postMessage = (message: unknown) => {
+    const command = message as { type?: string; samples?: unknown[] };
+    if (command.type === "record") batchSizes.push(command.samples?.length ?? 0);
+    originalPostMessage(message);
+  };
+
+  try {
+    for (let index = 0; index < 205; index++) {
+      store.recordCall({ tool: `tool-${index}`, durationMs: 1, ok: true });
+    }
+    await store.flush();
+    assert.deepEqual(batchSizes, [100, 100, 5]);
+    assert.equal((await store.queryDrilldown()).totals.calls, 205);
+  } finally {
+    await store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("event store cleans up a synchronous worker post failure", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-event-clone-failure-"));
+  const reported: Error[] = [];
+  const store = await openEventStore({
+    path: join(dir, "events.sqlite"),
+    onError: (error) => {
+      reported.push(error);
+      throw new Error("observer failure must be isolated");
+    },
+  });
+
+  try {
+    store.recordCall({
+      tool: "invalid-sample",
+      durationMs: 1,
+      ok: true,
+      nonCloneable: () => undefined,
+    } as never);
+    await assert.rejects(store.flush(), /clone|function/i);
+    assert.equal(
+      (store as unknown as { pendingRequests: Map<number, unknown> }).pendingRequests.size,
+      0
+    );
+    assert.equal(reported.length, 1);
+  } finally {
+    await store.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

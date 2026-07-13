@@ -201,6 +201,8 @@ Audit records include correlation `requestId`, principal metadata, status code, 
 | `path` | string | `"/metrics"` | Metrics path |
 | `allowUnauthenticated` | boolean | `false` | Allow unauthenticated access to metrics |
 
+HTTP metrics use fixed route templates rather than literal request paths and enforce a hard label-series cardinality budget. Configured abuse-control rate limits apply before authentication to every listener endpoint, including metrics, health, dashboard, management, and unmatched/404 routes.
+
 ---
 
 ## Payload Size Limits

@@ -148,7 +148,9 @@ For stdio servers in listener mode, callmux resolves a downstream call's project
 
 This makes relative paths in downstream servers behave like they would in a per-project MCP process.
 
-Session-cwd stdio clients are reused per `server + cwd` pair and retired after `sessionCwdIdleTtlSeconds` of inactivity (default: 600s).
+Session-cwd stdio clients are reused per `server + cwd` pair and retired after `sessionCwdIdleTtlSeconds` of inactivity (default: 600s). Scoped cwd and forwarded-header clients are bounded by `maxScopedClients` globally and `maxScopedClientsPerServer` per server; an individual server can override the latter with `servers.<name>.maxScopedClients`. At capacity, callmux evicts only the least-recently-used idle client and never an active or connecting client.
+
+Listener MCP sessions are also bounded: inactive streamable HTTP sessions expire after `listenerSessionInactivityTtlSeconds` (default: 1800s), and `listenerMaxSessions` (default: 1000) caps live streamable HTTP plus legacy SSE sessions. When the cap is reached, callmux evicts the least-recently-used idle session; active sessions are never evicted.
 
 If a stdio server should always run from the configured/process cwd regardless of client session, set `cwdMode: "global"` for that server.
 

@@ -22,7 +22,12 @@ import {
   handleCacheClear,
   handleStatus,
 } from "./handlers.js";
-import type { CallmuxConfig, InstanceIdentity, ServerConfig } from "./types.js";
+import type {
+  CallmuxConfig,
+  InstanceIdentity,
+  ServerConfig,
+  ToolCallContext,
+} from "./types.js";
 import { isOutputFormat, type OutputFormat } from "./output-format.js";
 import {
   createResponseStore,
@@ -98,7 +103,9 @@ export class CallmuxProxy {
           server.cachePolicy,
         ])
       ),
-      config.maxCacheEntries ?? 1000
+      config.maxCacheEntries ?? 1000,
+      config.maxCacheEntryBytes,
+      config.maxCacheBytes
     );
     this.maxConcurrency = config.maxConcurrency ?? 20;
     this.connectTimeoutMs = config.connectTimeoutMs ?? 30_000;
@@ -118,10 +125,11 @@ export class CallmuxProxy {
       tools: this.currentTools(),
     }));
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    this.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       return this.handleToolCall(
         request.params.name,
-        request.params.arguments
+        request.params.arguments,
+        { signal: extra.signal }
       );
     });
   }
@@ -135,6 +143,8 @@ export class CallmuxProxy {
         connectTimeoutMs: this.connectTimeoutMs,
         reconnectPolicy: this.config.reconnectPolicy,
         sessionCwdIdleTtlSeconds: this.config.sessionCwdIdleTtlSeconds,
+        maxScopedClients: this.config.maxScopedClients,
+        maxScopedClientsPerServer: this.config.maxScopedClientsPerServer,
         fileReferenceRoots: this.config.fileReferenceRoots,
         strictStartup: this.config.strictStartup ?? false,
       }
@@ -221,7 +231,8 @@ export class CallmuxProxy {
 
   private async handleToolCall(
     name: string,
-    args?: Record<string, unknown>
+    args?: Record<string, unknown>,
+    context?: ToolCallContext
   ): Promise<CallToolResult> {
     // Meta-tools
     switch (name) {
@@ -233,7 +244,7 @@ export class CallmuxProxy {
             this.cache,
             args,
             this.maxConcurrency,
-            undefined,
+            context,
             this.config.outputFormat
           ),
           this.outputFormatFor(args)
@@ -247,7 +258,7 @@ export class CallmuxProxy {
             this.cache,
             args,
             this.maxConcurrency,
-            undefined,
+            context,
             this.config.outputFormat
           ),
           this.outputFormatFor(args)
@@ -260,7 +271,7 @@ export class CallmuxProxy {
             this.upstream,
             this.cache,
             args,
-            undefined,
+            context,
             this.config.outputFormat
           ),
           this.outputFormatFor(args)
@@ -280,7 +291,7 @@ export class CallmuxProxy {
             this.upstream,
             this.cache,
             args,
-            undefined,
+            context,
             this.config.outputFormat
           ),
           this.outputFormatFor(args)
@@ -312,7 +323,7 @@ export class CallmuxProxy {
           this.upstream,
           this.cache,
           args,
-          undefined,
+          context,
           this.config.outputFormat
         ), this.outputFormatFor(args));
 
@@ -325,7 +336,7 @@ export class CallmuxProxy {
             this.config.recipes,
             args,
             this.maxConcurrency,
-            undefined,
+            context,
             this.config.outputFormat
           ),
           this.outputFormatFor(args)
@@ -337,7 +348,7 @@ export class CallmuxProxy {
           this.cache,
           this.config.recipes,
           args,
-          undefined,
+          context,
           this.config.outputFormat
         ), this.outputFormatFor(args));
 
@@ -360,14 +371,10 @@ export class CallmuxProxy {
 
     const target = this.responseShieldTarget(name, args);
     const maybePrepare = this.upstream as UpstreamManager & {
-      prepareToolCall?: (
-        toolName: string,
-        args?: Record<string, unknown>,
-        serverHint?: string
-      ) => ReturnType<UpstreamManager["prepareToolCall"]>;
+      prepareToolCall?: UpstreamManager["prepareToolCall"];
     };
     const prepared = typeof maybePrepare.prepareToolCall === "function"
-      ? await maybePrepare.prepareToolCall(name, args)
+      ? await maybePrepare.prepareToolCall(name, args, undefined, { context })
       : undefined;
     if (prepared && "error" in prepared) return prepared.error;
     const cacheArgs = prepared?.resolvedArguments ?? args;
@@ -378,33 +385,42 @@ export class CallmuxProxy {
       cacheScopeForCall?: UpstreamManager["cacheScopeForCall"];
     };
     const cacheScope = typeof maybeScoped.cacheScopeForCall === "function"
-      ? maybeScoped.cacheScopeForCall(name, cacheServer)
+      ? maybeScoped.cacheScopeForCall(name, cacheServer, context)
       : undefined;
-    const cached = this.cache.get(
-      name,
-      cacheArgs,
-      cacheServer,
-      cacheScope,
-      prepared?.annotations
-    );
-    if (cached) return this.shieldResult(target, cached);
-
     // When we have a prepared resolution, reuse it via callPrepared so we don't
     // resolve arguments (and re-scan first-pass $file output for further refs) a
     // second time inside callTool; fall back to callTool for harnesses whose
     // upstream lacks prepareToolCall.
-    const result = prepared
-      ? await this.upstream.callPrepared(prepared, {
-          retryOnReconnect: this.cache.isSafeToRetry(
-            name,
-            cacheServer,
-            prepared.annotations
-          ),
-        })
-      : await this.upstream.callTool(name, cacheArgs, cacheServer, {
-          retryOnReconnect: this.cache.isSafeToRetry(name, cacheServer),
-        });
-    this.cache.set(name, cacheArgs, result, cacheServer, cacheScope, prepared?.annotations);
+    const { result } = await this.cache.getOrLoad(
+      {
+        tool: name,
+        args: cacheArgs,
+        server: cacheServer,
+        scope: cacheScope,
+        annotations: prepared?.annotations,
+        signal: context?.signal,
+      },
+      (operationSignal) => {
+        const { signal: _ignored, ...contextWithoutSignal } = context ?? {};
+        const operationContext = {
+          ...contextWithoutSignal,
+          ...(operationSignal ? { signal: operationSignal } : {}),
+        };
+        return prepared
+        ? this.upstream.callPrepared(prepared, {
+            ...operationContext,
+            retryOnReconnect: this.cache.isSafeToRetry(
+              name,
+              cacheServer,
+              prepared.annotations
+            ),
+          })
+        : this.upstream.callTool(name, cacheArgs, cacheServer, {
+            ...operationContext,
+            retryOnReconnect: this.cache.isSafeToRetry(name, cacheServer),
+          });
+      }
+    );
     return this.shieldResult(target, result);
   }
 

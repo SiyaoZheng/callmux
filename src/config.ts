@@ -215,7 +215,11 @@ function parseResponseShieldConfig(
   value: unknown,
   optionName: string,
   allowMaxStoredResults: boolean
-): (ResponseShieldConfig & { maxStoredResults?: number }) | undefined {
+): (ResponseShieldConfig & {
+  maxStoredResults?: number;
+  maxStoredResultBytes?: number;
+  maxStoredBytes?: number;
+}) | undefined {
   if (value === undefined) return undefined;
   if (!isRecord(value)) {
     throw new Error(`${optionName} must be an object`);
@@ -240,6 +244,17 @@ function parseResponseShieldConfig(
           throw new Error(`${optionName}.maxStoredResults is only supported in global responseShield`);
         })()
     : undefined;
+  const parseGlobalStoredLimit = (
+    field: "maxStoredResultBytes" | "maxStoredBytes"
+  ): number | undefined => {
+    if (value[field] === undefined) return undefined;
+    if (!allowMaxStoredResults) {
+      throw new Error(`${optionName}.${field} is only supported in global responseShield`);
+    }
+    return parsePositiveInteger(value[field], `${optionName}.${field}`);
+  };
+  const maxStoredResultBytes = parseGlobalStoredLimit("maxStoredResultBytes");
+  const maxStoredBytes = parseGlobalStoredLimit("maxStoredBytes");
 
   if (
     enabled === undefined &&
@@ -248,7 +263,9 @@ function parseResponseShieldConfig(
     maxArrayItems === undefined &&
     !allowTools &&
     !denyTools &&
-    maxStoredResults === undefined
+    maxStoredResults === undefined &&
+    maxStoredResultBytes === undefined &&
+    maxStoredBytes === undefined
   ) {
     return undefined;
   }
@@ -261,6 +278,8 @@ function parseResponseShieldConfig(
     ...(allowTools ? { allowTools } : {}),
     ...(denyTools ? { denyTools } : {}),
     ...(maxStoredResults !== undefined ? { maxStoredResults } : {}),
+    ...(maxStoredResultBytes !== undefined ? { maxStoredResultBytes } : {}),
+    ...(maxStoredBytes !== undefined ? { maxStoredBytes } : {}),
   };
 }
 
@@ -1268,6 +1287,9 @@ function parseServerConfig(
   const maxConcurrency = value.maxConcurrency !== undefined
     ? parsePositiveInteger(value.maxConcurrency, `servers.${serverName}.maxConcurrency`)
     : undefined;
+  const maxScopedClients = value.maxScopedClients !== undefined
+    ? parsePositiveInteger(value.maxScopedClients, `servers.${serverName}.maxScopedClients`)
+    : undefined;
   const callTimeoutMs = value.callTimeoutMs !== undefined
     ? parsePositiveInteger(value.callTimeoutMs, `servers.${serverName}.callTimeoutMs`)
     : undefined;
@@ -1286,6 +1308,7 @@ function parseServerConfig(
     ...(cachePolicy ? { cachePolicy } : {}),
     ...(responseShield ? { responseShield } : {}),
     ...(maxConcurrency !== undefined ? { maxConcurrency } : {}),
+    ...(maxScopedClients !== undefined ? { maxScopedClients } : {}),
     ...(callTimeoutMs !== undefined ? { callTimeoutMs } : {}),
     ...(requestBodyMaxBytes !== undefined ? { requestBodyMaxBytes } : {}),
     ...(schemaCompression ? { schemaCompression } : {}),
@@ -1484,6 +1507,38 @@ async function parseConfigDocument(
             ),
           }
         : {}),
+      ...(parsed.listenerSessionInactivityTtlSeconds !== undefined
+        ? {
+            listenerSessionInactivityTtlSeconds: parseNonNegativeInteger(
+              parsed.listenerSessionInactivityTtlSeconds,
+              "listenerSessionInactivityTtlSeconds"
+            ),
+          }
+        : {}),
+      ...(parsed.listenerMaxSessions !== undefined
+        ? {
+            listenerMaxSessions: parsePositiveInteger(
+              parsed.listenerMaxSessions,
+              "listenerMaxSessions"
+            ),
+          }
+        : {}),
+      ...(parsed.maxScopedClients !== undefined
+        ? {
+            maxScopedClients: parsePositiveInteger(
+              parsed.maxScopedClients,
+              "maxScopedClients"
+            ),
+          }
+        : {}),
+      ...(parsed.maxScopedClientsPerServer !== undefined
+        ? {
+            maxScopedClientsPerServer: parsePositiveInteger(
+              parsed.maxScopedClientsPerServer,
+              "maxScopedClientsPerServer"
+            ),
+          }
+        : {}),
       ...(fileReferenceRoots
         ? { fileReferenceRoots: Array.from(new Set(fileReferenceRoots)) }
         : {}),
@@ -1500,6 +1555,22 @@ async function parseConfigDocument(
             maxCacheEntries: parsePositiveInteger(
               parsed.maxCacheEntries,
               "maxCacheEntries"
+            ),
+          }
+        : {}),
+      ...(parsed.maxCacheEntryBytes !== undefined
+        ? {
+            maxCacheEntryBytes: parsePositiveInteger(
+              parsed.maxCacheEntryBytes,
+              "maxCacheEntryBytes"
+            ),
+          }
+        : {}),
+      ...(parsed.maxCacheBytes !== undefined
+        ? {
+            maxCacheBytes: parsePositiveInteger(
+              parsed.maxCacheBytes,
+              "maxCacheBytes"
             ),
           }
         : {}),

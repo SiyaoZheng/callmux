@@ -101,6 +101,10 @@ const METRICS_RANGES: MetricsRange[] = ["1h", "today", "yesterday", "7d", "30d"]
 const REQUEST_ID_HEADER = "x-request-id";
 const CWD_HEADER = "x-callmux-cwd";
 const CLIENT_HEADER = "x-callmux-client";
+const DEFAULT_LISTENER_SESSION_INACTIVITY_TTL_MS = 30 * 60_000;
+const DEFAULT_LISTENER_MAX_SESSIONS = 1_000;
+const SESSION_SWEEP_MAX_INTERVAL_MS = 60_000;
+const DASHBOARD_SSE_MAX_FRAME_BYTES = 256 * 1024;
 
 async function settleWithin<T>(
   promise: Promise<T> | T | undefined,
@@ -129,6 +133,8 @@ interface SessionEntry {
   forwardedHeaders?: Record<string, string>;
   clientKind?: "stdio-bridge" | "cli";
   rootsAttempted?: boolean;
+  lastActivityMs: number;
+  activeRequests: number;
 }
 
 interface RequestContext {
@@ -139,6 +145,7 @@ interface RequestContext {
   remoteIp?: string;
   principal?: AuthorizationPrincipal;
   payload?: unknown;
+  abortController: AbortController;
   // Set when the request was rejected because it carried a stale/unknown
   // Mcp-Session-Id (a 404 telling the client to re-initialize). Expected churn
   // after a restart — tagged so the dashboard can classify it as benign rather
@@ -241,6 +248,7 @@ export class CallmuxListener {
   private metricsPath: string | undefined;
   private eventStore: EventStore | undefined;
   private eventStorePath: string | undefined;
+  private eventStoreMutation: Promise<void> = Promise.resolve();
   private metricsDirty = false;
   private metricsFlushInFlight: Promise<void> | undefined;
   private metricsFlushTimer: ReturnType<typeof setInterval> | undefined;
@@ -251,6 +259,10 @@ export class CallmuxListener {
   private unsubscribeToolSuiteChanges: (() => void) | undefined;
   private lastReloadAt: string | undefined;
   private lastReloadError: string | undefined;
+  private sessionInactivityTtlMs: number;
+  private maxSessions: number;
+  private pendingSessionInitializations = 0;
+  private sessionSweepTimer: ReturnType<typeof setInterval> | undefined;
 
   constructor(options: ListenerOptions) {
     this.options = options;
@@ -280,6 +292,8 @@ export class CallmuxListener {
     this.eventStorePath = this.resolveEventStorePath(options.configPath, options.config);
     this.subscribeToolSuiteChanges(options.upstream);
     this.preReadMaxBytes = this.computePreReadMaxBytes();
+    this.sessionInactivityTtlMs = this.resolveSessionInactivityTtlMs(options.config);
+    this.maxSessions = options.config.listenerMaxSessions ?? DEFAULT_LISTENER_MAX_SESSIONS;
     this.validateSecurityPosture(options.config, this.authConfig);
   }
 
@@ -322,6 +336,10 @@ export class CallmuxListener {
     this.runtimeEvents.setMaxEvents(nextDashboardConfig.maxEvents);
     void this.refreshEventStore(config);
     this.preReadMaxBytes = this.computePreReadMaxBytes();
+    this.sessionInactivityTtlMs = this.resolveSessionInactivityTtlMs(config);
+    this.maxSessions = config.listenerMaxSessions ?? DEFAULT_LISTENER_MAX_SESSIONS;
+    this.startSessionSweeper();
+    void this.enforceSessionCapacity();
   }
 
   applyReloadedState(next: {
@@ -334,7 +352,11 @@ export class CallmuxListener {
     managementOverlay?: ManagementOverlay;
   }): void {
     this.applyRuntimeConfig(next.config);
-    this.responseStore.setMaxEntries(next.config.responseShield?.maxStoredResults);
+    this.responseStore.configureLimits({
+      maxEntries: next.config.responseShield?.maxStoredResults,
+      maxTotalBytes: next.config.responseShield?.maxStoredBytes,
+      maxEntryBytes: next.config.responseShield?.maxStoredResultBytes,
+    });
     this.unsubscribeToolSuiteChanges?.();
     this.options = {
       ...this.options,
@@ -470,6 +492,7 @@ export class CallmuxListener {
     // onto the restored history instead of a fresh empty store.
     await this.loadMetrics();
     await this.refreshEventStore(this.options.config);
+    this.startSessionSweeper();
     if (this.metricsPath) {
       this.metricsFlushTimer = setInterval(() => {
         void this.flushMetrics();
@@ -510,12 +533,16 @@ export class CallmuxListener {
   }
 
   async close(): Promise<void> {
+    if (this.sessionSweepTimer) {
+      clearInterval(this.sessionSweepTimer);
+      this.sessionSweepTimer = undefined;
+    }
     if (this.metricsFlushTimer) {
       clearInterval(this.metricsFlushTimer);
       this.metricsFlushTimer = undefined;
     }
     await this.flushMetrics();
-    this.closeEventStore();
+    await this.closeEventStore();
     this.unsubscribeToolSuiteChanges?.();
     this.unsubscribeToolSuiteChanges = undefined;
     const sessions = Array.from(this.sessions.entries());
@@ -598,11 +625,12 @@ export class CallmuxListener {
       path,
       startTimeMs: Date.now(),
       remoteIp: req.socket.remoteAddress ?? undefined,
+      abortController: new AbortController(),
     };
 
     this.metrics.onRequestStart();
     res.setHeader(REQUEST_ID_HEADER, requestId);
-    this.attachRequestCompletion(res, context);
+    this.attachRequestCompletion(req, res, context);
 
     try {
       if (!this.isSourceIpAllowed(req)) {
@@ -661,7 +689,7 @@ export class CallmuxListener {
           } else if (this.isManagementPath(path)) {
             await this.handleManagement(req, res, path, context);
           } else if (this.isDashboardPath(path)) {
-            this.handleDashboard(req, res, path, context);
+            await this.handleDashboard(req, res, path, context);
           } else if (path === "/sse" && req.method === "GET") {
             await this.handleSseConnect(req, res, context);
           } else if (path === "/messages" && req.method === "POST") {
@@ -719,6 +747,39 @@ export class CallmuxListener {
     if (!this.managementConfig.enabled) return false;
     const base = this.managementConfig.path;
     return path === base || path.startsWith(`${base}/`);
+  }
+
+  /** Return only fixed route templates; raw request segments never reach metrics labels. */
+  private metricsRouteTemplate(path: string): string {
+    if (path === "/mcp" || path === "/sse" || path === "/messages" ||
+        path === "/health" || path === "/ready") {
+      return path;
+    }
+    if (this.metrics.isEnabled() && path === this.metrics.getPath()) {
+      return this.metrics.getPath();
+    }
+    if (this.dashboardConfig.enabled) {
+      const base = this.dashboardConfig.path;
+      if (this.isDashboardBasePath(path, base)) return base;
+      for (const child of ["data", "events", "series", "drilldown"]) {
+        const route = this.dashboardChildPath(base, child);
+        if (path === route) return route;
+      }
+    }
+    if (this.managementConfig.enabled && this.isManagementPath(path)) {
+      const base = this.managementConfig.path;
+      const relative = path === base ? "" : path.slice(base.length + 1).replace(/\/+$/, "");
+      if (relative === "" || relative === "config/effective" ||
+          relative === "servers" || relative === "cache/clear") {
+        return relative ? `${base}/${relative}` : base;
+      }
+      if (/^servers\/[^/]+$/.test(relative)) return `${base}/servers/{server}`;
+      if (/^servers\/[^/]+\/restart$/.test(relative)) {
+        return `${base}/servers/{server}/restart`;
+      }
+      return `${base}/{unmatched}`;
+    }
+    return "/__unmatched__";
   }
 
   private async handleManagement(
@@ -1000,12 +1061,12 @@ export class CallmuxListener {
     await this.options.onManagementConfigChange(config, trigger, overlay);
   }
 
-  private handleDashboard(
+  private async handleDashboard(
     req: IncomingMessage,
     res: ServerResponse,
     path: string,
     context: RequestContext
-  ): void {
+  ): Promise<void> {
     if (req.method !== "GET") {
       this.writeJson(res, 405, context, { error: "Method not allowed" });
       return;
@@ -1041,7 +1102,7 @@ export class CallmuxListener {
     }
 
     if (path === this.dashboardChildPath(base, "drilldown")) {
-      this.handleDashboardDrilldown(req, res, context);
+      await this.handleDashboardDrilldown(req, res, context);
       return;
     }
 
@@ -1118,11 +1179,11 @@ export class CallmuxListener {
     });
   }
 
-  private handleDashboardDrilldown(
+  private async handleDashboardDrilldown(
     req: IncomingMessage,
     res: ServerResponse,
     context: RequestContext
-  ): void {
+  ): Promise<void> {
     if (!this.eventStore) {
       this.writeJson(res, 200, context, {
         enabled: false,
@@ -1138,16 +1199,17 @@ export class CallmuxListener {
     const rawLimit = Number(params.get("limit"));
     const limit = Number.isInteger(rawLimit) && rawLimit > 0 ? rawLimit : 25;
     const window = this.metricsStore.series(range);
+    const drilldown = await this.eventStore.queryDrilldown({
+      fromMs: window.from,
+      toMs: window.to,
+      limit,
+    });
     this.writeJson(res, 200, context, {
       enabled: true,
       range,
       from: window.from,
       to: window.to,
-      ...this.eventStore.queryDrilldown({
-        fromMs: window.from,
-        toMs: window.to,
-        limit,
-      }),
+      ...drilldown,
     });
   }
 
@@ -1182,6 +1244,9 @@ export class CallmuxListener {
         maxRows: config.eventStore.maxRows ?? DEFAULT_EVENT_STORE_MAX_ROWS,
         retentionDays: config.eventStore.retentionDays ?? DEFAULT_EVENT_STORE_RETENTION_DAYS,
         pruneEvery: config.eventStore.pruneEvery ?? DEFAULT_EVENT_STORE_PRUNE_EVERY,
+        onError: (error) => {
+          process.stderr.write(`[callmux] event store worker error: ${error.message}\n`);
+        },
       });
     } catch (error) {
       process.stderr.write(
@@ -1193,21 +1258,31 @@ export class CallmuxListener {
 
   private async refreshEventStore(config: CallmuxConfig): Promise<void> {
     const nextPath = this.resolveEventStorePath(this.options.configPath, config);
-    this.closeEventStore();
-    this.eventStorePath = nextPath;
-    this.eventStore = await this.openEventStore(nextPath, config);
+    const run = this.eventStoreMutation.then(async () => {
+      await this.closeEventStoreNow();
+      this.eventStorePath = nextPath;
+      this.eventStore = await this.openEventStore(nextPath, config);
+    });
+    this.eventStoreMutation = run.catch(() => undefined);
+    await run;
   }
 
-  private closeEventStore(): void {
+  private async closeEventStore(): Promise<void> {
+    const run = this.eventStoreMutation.then(() => this.closeEventStoreNow());
+    this.eventStoreMutation = run.catch(() => undefined);
+    await run;
+  }
+
+  private async closeEventStoreNow(): Promise<void> {
     if (!this.eventStore) return;
+    const store = this.eventStore;
+    this.eventStore = undefined;
     try {
-      this.eventStore.close();
+      await store.close();
     } catch (error) {
       process.stderr.write(
         `[callmux] could not close event store: ${(error as Error).message}\n`
       );
-    } finally {
-      this.eventStore = undefined;
     }
   }
 
@@ -1271,18 +1346,37 @@ export class CallmuxListener {
       "Connection": "keep-alive",
     });
     let active = true;
+    let blocked = false;
+    let pendingLatest: string | undefined;
     let unsubscribe = () => {};
     const stop = () => {
       if (!active) return;
       active = false;
+      pendingLatest = undefined;
       unsubscribe();
     };
     // A write to a half-closed socket emits 'error' on res; without this
     // guard + handler an unhandled error would crash the daemon (EPIPE).
     const safeWrite = (chunk: string) => {
       if (!active || !res.writable) return;
+      if (blocked) {
+        // Coalesce while the socket is backpressured. Dashboard events are a
+        // live view with a snapshot endpoint, so retaining only the newest
+        // update is preferable to an unbounded per-subscriber response queue.
+        pendingLatest = chunk;
+        return;
+      }
       try {
-        res.write(chunk);
+        if (!res.write(chunk)) {
+          blocked = true;
+          res.once("drain", () => {
+            if (!active) return;
+            blocked = false;
+            const pending = pendingLatest;
+            pendingLatest = undefined;
+            if (pending) safeWrite(pending);
+          });
+        }
       } catch {
         stop();
       }
@@ -1290,11 +1384,121 @@ export class CallmuxListener {
     res.on("close", stop);
     res.on("error", stop);
     unsubscribe = this.runtimeEvents.subscribe((event) => {
-      safeWrite(`data: ${JSON.stringify(event)}\n\n`);
+      safeWrite(this.dashboardSseFrame(event));
     });
-    safeWrite(
-      `event: snapshot\ndata: ${JSON.stringify(this.createDashboardSnapshot())}\n\n`
+    safeWrite(this.dashboardSseFrame(this.createDashboardSnapshot(), "snapshot"));
+  }
+
+  private dashboardSseFrame(value: unknown, eventName?: string): string {
+    let data: string;
+    try {
+      data = JSON.stringify(value);
+    } catch {
+      data = "";
+    }
+    const prefix = eventName ? `event: ${eventName}\n` : "";
+    const frame = `${prefix}data: ${data}\n\n`;
+    if (data && Buffer.byteLength(frame) <= DASHBOARD_SSE_MAX_FRAME_BYTES) {
+      return frame;
+    }
+
+    // A default message makes the dashboard refetch /data. Keep it compact so
+    // a single pathological event cannot become the one retained backpressure
+    // frame while a client is stalled.
+    return `data: ${JSON.stringify({
+      type: "stream_reset",
+      reason: data ? "frame_too_large" : "serialization_failed",
+    })}\n\n`;
+  }
+
+  private resolveSessionInactivityTtlMs(config: CallmuxConfig): number {
+    const seconds = config.listenerSessionInactivityTtlSeconds;
+    if (seconds === undefined) return DEFAULT_LISTENER_SESSION_INACTIVITY_TTL_MS;
+    return Math.min(Number.MAX_SAFE_INTEGER, seconds * 1_000);
+  }
+
+  private startSessionSweeper(): void {
+    if (this.sessionSweepTimer) clearInterval(this.sessionSweepTimer);
+    if (this.sessionInactivityTtlMs <= 0) {
+      this.sessionSweepTimer = undefined;
+      return;
+    }
+    const intervalMs = Math.max(
+      1_000,
+      Math.min(SESSION_SWEEP_MAX_INTERVAL_MS, Math.ceil(this.sessionInactivityTtlMs / 2))
     );
+    this.sessionSweepTimer = setInterval(() => {
+      this.pruneExpiredSessions();
+    }, intervalMs);
+    this.sessionSweepTimer.unref?.();
+  }
+
+  private pruneExpiredSessions(now = Date.now()): void {
+    if (this.sessionInactivityTtlMs <= 0) return;
+    for (const [id, session] of this.sessions) {
+      // Legacy SSE sessions are tied to an open response and are removed by
+      // its close event. TTL applies to resumable streamable HTTP sessions.
+      if (!(session.transport instanceof StreamableHTTPServerTransport)) continue;
+      if (session.activeRequests > 0) continue;
+      if (now - session.lastActivityMs < this.sessionInactivityTtlMs) continue;
+      this.removeSession(id, session, "inactivity TTL");
+    }
+  }
+
+  private reserveSessionSlot(): boolean {
+    this.pruneExpiredSessions();
+    while (this.sessions.size + this.pendingSessionInitializations >= this.maxSessions) {
+      const idle = [...this.sessions.entries()]
+        .filter(([, session]) => session.activeRequests === 0)
+        .sort((left, right) => left[1].lastActivityMs - right[1].lastActivityMs)[0];
+      if (!idle) return false;
+      this.removeSession(idle[0], idle[1], "session capacity LRU eviction");
+    }
+    this.pendingSessionInitializations += 1;
+    return true;
+  }
+
+  private releaseSessionReservation(): void {
+    this.pendingSessionInitializations = Math.max(0, this.pendingSessionInitializations - 1);
+  }
+
+  private async enforceSessionCapacity(): Promise<void> {
+    this.pruneExpiredSessions();
+    while (this.sessions.size > this.maxSessions) {
+      const idle = [...this.sessions.entries()]
+        .filter(([, session]) => session.activeRequests === 0)
+        .sort((left, right) => left[1].lastActivityMs - right[1].lastActivityMs)[0];
+      if (!idle) return;
+      this.removeSession(idle[0], idle[1], "reconfigured session capacity");
+    }
+  }
+
+  private removeSession(id: string, expected: SessionEntry, reason: string): void {
+    if (this.sessions.get(id) !== expected) return;
+    this.sessions.delete(id);
+    void Promise.allSettled([
+      settleWithin(expected.transport.close?.(), DEFAULT_LISTENER_CLOSE_TIMEOUT_MS),
+      settleWithin(expected.server.close(), DEFAULT_LISTENER_CLOSE_TIMEOUT_MS),
+    ]).catch(() => undefined);
+    if (reason) {
+      process.stderr.write(`[callmux] listener session ${id} closed (${reason})\n`);
+    }
+  }
+
+  private async withSessionActivity<T>(
+    id: string,
+    session: SessionEntry,
+    fn: () => Promise<T>
+  ): Promise<T> {
+    if (this.sessions.get(id) !== session) throw new Error("listener session is no longer active");
+    session.lastActivityMs = Date.now();
+    session.activeRequests += 1;
+    try {
+      return await fn();
+    } finally {
+      session.activeRequests = Math.max(0, session.activeRequests - 1);
+      session.lastActivityMs = Date.now();
+    }
   }
 
   // ─── Streamable HTTP ────────────────────────────────────────────
@@ -1319,9 +1523,12 @@ export class CallmuxListener {
           );
           return;
         }
+        const transport = session.transport;
         this.setSessionCwdFromHeader(session, req);
         this.setSessionForwardedHeadersFromRequest(session, req);
-        await session.transport.handleRequest(req, res);
+        await this.withSessionActivity(sessionId, session, () =>
+          transport.handleRequest(req, res)
+        );
         return;
       }
 
@@ -1352,28 +1559,52 @@ export class CallmuxListener {
       return;
     }
 
-    const requestedLimit = this.parsePerRequestLimitOverride(req);
-    const readLimit = requestedLimit === undefined
-      ? this.preReadMaxBytes
-      : requestedLimit === 0
-        ? undefined
-        : requestedLimit;
-    const { body, bytes } = await readBody(req, readLimit);
-    const parsed = this.parseJsonBody(body);
-    if (parsed === INVALID_JSON_BODY) {
-      this.writeJsonRpcError(res, 400, context, -32700, "Parse error");
-      return;
-    }
-    const jsonRpcId = this.extractJsonRpcId(parsed);
-    context.payload = parsed;
-    const effectiveLimit = this.resolveEffectiveRequestBodyMaxBytes(parsed, requestedLimit);
-    if (effectiveLimit !== undefined && bytes > effectiveLimit) {
-      throw new PayloadTooLargeError(effectiveLimit);
-    }
+    // Claim an existing session before reading its request body. Otherwise a
+    // slow/chunked POST can look idle long enough for the TTL sweeper or LRU
+    // capacity eviction to close it while its body is still arriving.
+    const existingSession = sessionId ? this.sessions.get(sessionId) : undefined;
+    const existingStreamableSession =
+      existingSession?.transport instanceof StreamableHTTPServerTransport
+        ? existingSession
+        : undefined;
 
-    if (sessionId && this.sessions.has(sessionId)) {
-      const session = this.sessions.get(sessionId)!;
-      if (!(session.transport instanceof StreamableHTTPServerTransport)) {
+    const handlePost = async (): Promise<void> => {
+      const requestedLimit = this.parsePerRequestLimitOverride(req);
+      const readLimit = requestedLimit === undefined
+        ? this.preReadMaxBytes
+        : requestedLimit === 0
+          ? undefined
+          : requestedLimit;
+      const { body, bytes } = await readBody(req, readLimit);
+      const parsed = this.parseJsonBody(body);
+      if (parsed === INVALID_JSON_BODY) {
+        this.writeJsonRpcError(res, 400, context, -32700, "Parse error");
+        return;
+      }
+      const jsonRpcId = this.extractJsonRpcId(parsed);
+      context.payload = parsed;
+      const effectiveLimit = this.resolveEffectiveRequestBodyMaxBytes(parsed, requestedLimit);
+      if (effectiveLimit !== undefined && bytes > effectiveLimit) {
+        throw new PayloadTooLargeError(effectiveLimit);
+      }
+
+      // Parse the bounded request before protocol errors so JSON-RPC responses
+      // preserve the caller's id (required by clients detecting a stale
+      // session after listener restart). Only a valid streamable session is
+      // claimed during that read; unknown ids have no state to protect.
+      if (sessionId && !existingSession) {
+        context.sessionReinit = true;
+        this.writeJsonRpcError(
+          res,
+          404,
+          context,
+          -32001,
+          "Not Found: Unknown session. Re-initialize and retry with a new MCP-Session-Id.",
+          jsonRpcId
+        );
+        return;
+      }
+      if (existingSession && !existingStreamableSession) {
         this.writeJsonRpcError(
           res,
           400,
@@ -1384,62 +1615,98 @@ export class CallmuxListener {
         );
         return;
       }
-      this.setSessionCwdFromHeader(session, req);
-      this.setSessionForwardedHeadersFromRequest(session, req);
-      await session.transport.handleRequest(req, res, parsed);
-      return;
-    }
+      if (existingStreamableSession && sessionId) {
+        const transport = existingStreamableSession.transport as StreamableHTTPServerTransport;
+        this.setSessionCwdFromHeader(existingStreamableSession, req);
+        this.setSessionForwardedHeadersFromRequest(existingStreamableSession, req);
+        await transport.handleRequest(req, res, parsed);
+        return;
+      }
 
-    if (sessionId && !this.sessions.has(sessionId)) {
-      // Unknown session id -> 404 Not Found (see the non-POST branch above and
-      // the MCP SDK transport contract). This is the re-init signal a stale
-      // bridge expects after a restart; tagged benign so it doesn't read as an
-      // error in the dashboard.
-      context.sessionReinit = true;
+      if (!sessionId && isInitializeRequest(parsed)) {
+        if (!this.reserveSessionSlot()) {
+          res.setHeader("Retry-After", "1");
+          this.writeJsonRpcError(
+            res,
+            503,
+            context,
+            -32002,
+            "Listener session capacity reached; close an existing session and retry.",
+            jsonRpcId
+          );
+          return;
+        }
+        let reservationHeld = true;
+        const releaseReservedSlot = () => {
+          if (!reservationHeld) return;
+          reservationHeld = false;
+          this.releaseSessionReservation();
+        };
+        let server: Server | undefined;
+        let transport: StreamableHTTPServerTransport | undefined;
+        try {
+          transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => randomUUID(),
+            onsessioninitialized: (sid: string) => {
+              releaseReservedSlot();
+              this.sessions.set(sid, {
+                transport: transport!,
+                server: server!,
+                ...this.sessionCwdFromHeader(req),
+                ...this.sessionForwardedHeadersFromRequest(req),
+                lastActivityMs: Date.now(),
+                activeRequests: 1,
+              });
+            },
+          });
+
+          transport.onclose = () => {
+            const sid = transport?.sessionId;
+            if (!sid) return;
+            const session = this.sessions.get(sid);
+            if (!session || session.transport !== transport) return;
+            this.sessions.delete(sid);
+            void settleWithin(session.server.close(), DEFAULT_LISTENER_CLOSE_TIMEOUT_MS);
+          };
+
+          server = this.createSession(transport);
+          await server.connect(transport);
+          await transport.handleRequest(req, res, parsed);
+        } finally {
+          releaseReservedSlot();
+          const sid = transport?.sessionId;
+          const initialized = sid ? this.sessions.get(sid) : undefined;
+          if (initialized && initialized.transport === transport) {
+            initialized.activeRequests = Math.max(0, initialized.activeRequests - 1);
+            initialized.lastActivityMs = Date.now();
+          } else {
+            // Construction/connect failures that never initialized a session
+            // have no future owner to close these objects. Bound both closes so
+            // a broken SDK transport cannot hang the request cleanup path.
+            await Promise.allSettled([
+              settleWithin(transport?.close?.(), DEFAULT_LISTENER_CLOSE_TIMEOUT_MS),
+              settleWithin(server?.close(), DEFAULT_LISTENER_CLOSE_TIMEOUT_MS),
+            ]);
+          }
+        }
+        return;
+      }
+
       this.writeJsonRpcError(
         res,
-        404,
+        400,
         context,
-        -32001,
-        "Not Found: Unknown session. Re-initialize and retry with a new MCP-Session-Id.",
+        -32000,
+        "Bad Request: No valid session. Send initialize first, then include MCP-Session-Id.",
         jsonRpcId
       );
-      return;
+    };
+
+    if (existingStreamableSession && sessionId) {
+      await this.withSessionActivity(sessionId, existingStreamableSession, handlePost);
+    } else {
+      await handlePost();
     }
-
-    if (!sessionId && req.method === "POST" && isInitializeRequest(parsed)) {
-      let server: Server;
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => randomUUID(),
-        onsessioninitialized: (sid: string) => {
-          this.sessions.set(sid, {
-            transport,
-            server,
-            ...this.sessionCwdFromHeader(req),
-            ...this.sessionForwardedHeadersFromRequest(req),
-          });
-        },
-      });
-
-      transport.onclose = () => {
-        const sid = (transport as StreamableHTTPServerTransport).sessionId;
-        if (sid) this.sessions.delete(sid);
-      };
-
-      server = this.createSession(transport);
-      await server.connect(transport);
-      await transport.handleRequest(req, res, parsed);
-      return;
-    }
-
-    this.writeJsonRpcError(
-      res,
-      400,
-      context,
-      -32000,
-      "Bad Request: No valid session. Send initialize first, then include MCP-Session-Id.",
-      jsonRpcId
-    );
   }
 
   private transportName(transport: Transport): "streamable-http" | "sse" | "unknown" {
@@ -1455,20 +1722,49 @@ export class CallmuxListener {
     res: ServerResponse,
     _context: RequestContext
   ): Promise<void> {
-    const transport = new SSEServerTransport("/messages", res);
-    const server = this.createSession(transport);
-    this.sessions.set(transport.sessionId, {
-      transport,
-      server,
-      ...this.sessionCwdFromHeader(req),
-      ...this.sessionForwardedHeadersFromRequest(req),
-    });
+    if (!this.reserveSessionSlot()) {
+      res.setHeader("Retry-After", "1");
+      this.writeJson(res, 503, _context, {
+        error: "Listener session capacity reached; close an existing session and retry.",
+      });
+      return;
+    }
+    let reservationHeld = true;
+    let transport: SSEServerTransport | undefined;
+    try {
+      transport = new SSEServerTransport("/messages", res);
+      const server = this.createSession(transport);
+      const entry: SessionEntry = {
+        transport,
+        server,
+        ...this.sessionCwdFromHeader(req),
+        ...this.sessionForwardedHeadersFromRequest(req),
+        lastActivityMs: Date.now(),
+        activeRequests: 1,
+      };
+      this.sessions.set(transport.sessionId, entry);
+      this.releaseSessionReservation();
+      reservationHeld = false;
 
-    res.on("close", () => {
-      this.sessions.delete(transport.sessionId);
-    });
+      // Closing the legacy event stream owns the whole session. Remove by
+      // identity so a delayed close can never delete a replacement entry, and
+      // close the paired MCP Server instead of leaving it retained.
+      res.once("close", () => this.removeSession(transport!.sessionId, entry, ""));
 
-    await server.connect(transport);
+      await server.connect(transport);
+    } catch (error) {
+      if (transport) {
+        const entry = this.sessions.get(transport.sessionId);
+        if (entry?.transport === transport) {
+          this.removeSession(transport.sessionId, entry, "SSE connect failed");
+        } else {
+          void settleWithin(transport.close?.(), DEFAULT_LISTENER_CLOSE_TIMEOUT_MS);
+        }
+      }
+      throw error;
+    } finally {
+      if (reservationHeld) this.releaseSessionReservation();
+    }
   }
 
   private async handleSseMessage(
@@ -1494,6 +1790,7 @@ export class CallmuxListener {
       });
       return;
     }
+    const transport = session.transport;
     this.setSessionCwdFromHeader(session, req);
     this.setSessionForwardedHeadersFromRequest(session, req);
 
@@ -1517,7 +1814,9 @@ export class CallmuxListener {
     if (effectiveLimit !== undefined && bytes > effectiveLimit) {
       throw new PayloadTooLargeError(effectiveLimit);
     }
-    await session.transport.handlePostMessage(req, res, parsed);
+    await this.withSessionActivity(sessionId, session, () =>
+      transport.handlePostMessage(req, res, parsed)
+    );
   }
 
   private normalizeSessionCwd(value: unknown): string | undefined {
@@ -1620,9 +1919,19 @@ export class CallmuxListener {
   private async resolveToolCallContext(
     session: SessionEntry | undefined,
     server: Server,
-    extra: { _meta?: unknown; sessionId?: string; sendRequest?: unknown }
+    extra: {
+      _meta?: unknown;
+      sessionId?: string;
+      sendRequest?: unknown;
+      signal?: AbortSignal;
+    }
   ): Promise<ToolCallContext> {
+    const signal = combineAbortSignals(
+      extra.signal,
+      this.requestContext.getStore()?.abortController.signal
+    );
     const context: ToolCallContext = {
+      ...(signal ? { signal } : {}),
       ...(extra.sessionId ? { sessionId: extra.sessionId } : {}),
       ...(session?.forwardedHeaders ? { forwardedHeaders: session.forwardedHeaders } : {}),
       transport: session?.clientKind === "cli" ? "cli" : "mcp",
@@ -1644,7 +1953,10 @@ export class CallmuxListener {
 
     session.rootsAttempted = true;
     try {
-      const result = await server.listRoots(undefined, { timeout: 1_000 });
+      const result = await server.listRoots(undefined, {
+        timeout: 1_000,
+        ...(signal ? { signal } : {}),
+      });
       const cwd = this.cwdFromRoots(result.roots);
       if (cwd) {
         session.cwd = cwd;
@@ -1658,9 +1970,14 @@ export class CallmuxListener {
 
   private bareToolCallContext(
     session: SessionEntry | undefined,
-    extra: { sessionId?: string }
+    extra: { sessionId?: string; signal?: AbortSignal }
   ): ToolCallContext {
+    const signal = combineAbortSignals(
+      extra.signal,
+      this.requestContext.getStore()?.abortController.signal
+    );
     return {
+      ...(signal ? { signal } : {}),
       ...(extra.sessionId ? { sessionId: extra.sessionId } : {}),
       ...(session?.forwardedHeaders ? { forwardedHeaders: session.forwardedHeaders } : {}),
       transport: session?.clientKind === "cli" ? "cli" : "mcp",
@@ -1963,42 +2280,33 @@ export class CallmuxListener {
             break;
           }
           const cacheScope = upstream.cacheScopeForCall(name, prepared.server, toolContext);
-          const cached = cache.get(
-            name,
-            prepared.resolvedArguments,
-            prepared.server,
-            cacheScope,
-            prepared.annotations
+          // Reuse the already-prepared resolution instead of re-running
+          // prepareToolCall inside callTool. A second resolution pass would
+          // re-read refs and could resolve attacker-shaped nested ref content.
+          const loaded = await cache.getOrLoad(
+            {
+              tool: name,
+              args: prepared.resolvedArguments,
+              server: prepared.server,
+              scope: cacheScope,
+              annotations: prepared.annotations,
+              signal: toolContext.signal,
+            },
+            (operationSignal) => {
+              const { signal: _ignored, ...contextWithoutSignal } = toolContext;
+              return upstream.callPrepared(prepared, {
+                ...contextWithoutSignal,
+                ...(operationSignal ? { signal: operationSignal } : {}),
+                retryOnReconnect: cache.isSafeToRetry(
+                  name,
+                  prepared.server,
+                  prepared.annotations
+                ),
+              });
+            }
           );
-          if (cached) {
-            cacheHit = true;
-            result = this.shieldResult(target, cached, undefined, responseOwner);
-          } else {
-            // Reuse the already-prepared resolution instead of re-running
-            // prepareToolCall inside callTool. A second resolution pass would
-            // (a) re-read every $file/$jsonFile ref and, worse, (b) re-scan the
-            // FIRST pass's output for refs — so $jsonFile content containing a
-            // nested {"$file": ...} would be resolved on the second pass and
-            // sent downstream, and the cache key (pass 1) would no longer match
-            // the executed arguments (pass 2).
-            const upstreamResult = await upstream.callPrepared(prepared, {
-              ...toolContext,
-              retryOnReconnect: cache.isSafeToRetry(
-                name,
-                prepared.server,
-                prepared.annotations
-              ),
-            });
-            cache.set(
-              name,
-              prepared.resolvedArguments,
-              upstreamResult,
-              prepared.server,
-              cacheScope,
-              prepared.annotations
-            );
-            result = this.shieldResult(target, upstreamResult, undefined, responseOwner);
-          }
+          cacheHit = loaded.source === "cache";
+          result = this.shieldResult(target, loaded.result, undefined, responseOwner);
           break;
         }
       }
@@ -2777,6 +3085,7 @@ export class CallmuxListener {
   }
 
   private attachRequestCompletion(
+    req: IncomingMessage,
     res: ServerResponse,
     context: RequestContext
   ): void {
@@ -2786,6 +3095,9 @@ export class CallmuxListener {
       completed = true;
       const aborted = reason === "close" && !res.writableEnded;
       if (aborted) {
+        context.abortController.abort(
+          new RequestBodyAbortedError("client disconnected before the response completed")
+        );
         this.markActiveToolCallsForRequestAborted(context.requestId);
       }
       const durationMs = Date.now() - context.startTimeMs;
@@ -2793,6 +3105,7 @@ export class CallmuxListener {
       this.metrics.onRequestComplete({
         method: context.method,
         path: context.path,
+        route: this.metricsRouteTemplate(context.path),
         status,
         durationMs,
       });
@@ -2823,6 +3136,13 @@ export class CallmuxListener {
 
     res.once("finish", () => finalize("finish"));
     res.once("close", () => finalize("close"));
+    req.once("aborted", () => {
+      if (!context.abortController.signal.aborted) {
+        context.abortController.abort(
+          new RequestBodyAbortedError("client aborted the HTTP request")
+        );
+      }
+    });
   }
 
   private authorizeToolCall(
@@ -3098,8 +3418,8 @@ export class CallmuxListener {
   }
 
   private acquireAbuseLease(
-    req: IncomingMessage,
-    path: string,
+    _req: IncomingMessage,
+    _path: string,
     principal: AuthorizationPrincipal | undefined,
     options: {
       includeGlobalRate: boolean;
@@ -3113,15 +3433,6 @@ export class CallmuxListener {
   } {
     if (!this.abuseController) {
       return { allowed: true, reason: "No abuse controller configured" };
-    }
-
-    const method = (req.method ?? "GET").toUpperCase();
-    const shouldApply =
-      (path === "/mcp" && method === "POST") ||
-      (path === "/messages" && method === "POST") ||
-      (path === "/sse" && method === "GET");
-    if (!shouldApply) {
-      return { allowed: true, reason: "Endpoint excluded from abuse controls" };
     }
 
     const { result, lease } = this.abuseController.acquire(principal, options);
@@ -3329,6 +3640,15 @@ function positiveTimeoutMs(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0
     ? value
     : undefined;
+}
+
+function combineAbortSignals(
+  ...values: Array<AbortSignal | undefined>
+): AbortSignal | undefined {
+  const signals = [...new Set(values.filter((value): value is AbortSignal => Boolean(value)))];
+  if (signals.length === 0) return undefined;
+  if (signals.length === 1) return signals[0];
+  return AbortSignal.any(signals);
 }
 
 function sumDefined(...values: Array<number | undefined>): number | undefined {
