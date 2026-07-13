@@ -293,7 +293,7 @@ The fastest way to go from zero to configured:
 npx -y callmux setup
 ```
 
-The wizard detects existing MCP servers, lets you pick from a curated list or add custom ones, auto-discovers tools via probing, configures caching, offers meta-only mode, and attaches to your client (Claude Code, Codex) automatically.
+The wizard detects existing MCP servers, lets you pick from a curated list or add custom ones, auto-discovers tools via probing, configures caching, offers meta-only mode, and attaches to your client (Claude Code, Codex) automatically. Downstream credentials use `env:` references when available; credentials entered in the wizard are masked and stored in private `0600` sidecar files rather than embedded in the main config.
 
 ---
 

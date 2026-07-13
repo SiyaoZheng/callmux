@@ -21,6 +21,31 @@ interface BridgeOptions {
   callTimeoutMs?: number;
 }
 
+type ExecutionState = "not_started" | "unknown";
+
+class BridgeOperationFailure extends Error {
+  constructor(
+    error: unknown,
+    readonly executionState: ExecutionState,
+    readonly retryAttempted: boolean
+  ) {
+    super(error instanceof Error ? error.message : String(error));
+    this.name = "BridgeOperationFailure";
+  }
+}
+
+function bridgeExecutionState(error: unknown): ExecutionState {
+  return isPreExecutionBridgeError(error) ? "not_started" : "unknown";
+}
+
+function combineExecutionStates(
+  ...states: ExecutionState[]
+): ExecutionState {
+  return states.every((state) => state === "not_started")
+    ? "not_started"
+    : "unknown";
+}
+
 function bridgeHeaders(options: BridgeOptions): Record<string, string> {
   return {
     ...(options.headers ?? {}),
@@ -109,10 +134,14 @@ export class CallmuxBridge {
             request.params.arguments,
             this.options.callTimeoutMs
           )
-        )) as unknown as CallToolResult;
+        ), { idempotent: this.toolAllowsReplay(request.params.name) }) as unknown as CallToolResult;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        const code = isReconnectableBridgeError(error)
+        const reconnectable = isReconnectableBridgeError(error);
+        const executionState = error instanceof BridgeOperationFailure
+          ? error.executionState
+          : bridgeExecutionState(error);
+        const code = reconnectable
           ? "bridge_upstream_unavailable"
           : "bridge_tool_call_failed";
         if (code === "bridge_upstream_unavailable") {
@@ -123,7 +152,14 @@ export class CallmuxBridge {
         return errorResult(code, message, {
           tool: request.params.name,
           url: this.options.url,
-          retryable: code === "bridge_upstream_unavailable",
+          retryable: reconnectable,
+          safeToRetry:
+            executionState === "not_started" ||
+            this.toolAllowsReplay(request.params.name),
+          executionState,
+          ...(error instanceof BridgeOperationFailure && error.retryAttempted
+            ? { retryAttempted: true }
+            : {}),
           ...(this.lastConnectError ? { lastConnectError: this.lastConnectError } : {}),
         });
       }
@@ -160,9 +196,19 @@ export class CallmuxBridge {
         throw error;
       }
 
+      const initialExecutionState = bridgeExecutionState(error);
+
       // Reconnect regardless — the connection is known-bad — so the next call
       // (or a caller-driven retry) lands on a live upstream.
-      await this.reconnectUpstream();
+      try {
+        await this.reconnectUpstream();
+      } catch (reconnectError) {
+        throw new BridgeOperationFailure(
+          reconnectError,
+          initialExecutionState,
+          false
+        );
+      }
 
       // Only replay the operation automatically when it's safe to do so:
       //  - idempotent reads (tools/list), or
@@ -174,7 +220,18 @@ export class CallmuxBridge {
       // re-invoking it would double any side effects. Re-throw those instead
       // and let the handler surface a retryable error the model can act on.
       if (options.idempotent || isPreExecutionBridgeError(error)) {
-        return operation(await this.ensureUpstream());
+        try {
+          return await operation(await this.ensureUpstream());
+        } catch (retryError) {
+          throw new BridgeOperationFailure(
+            retryError,
+            combineExecutionStates(
+              initialExecutionState,
+              bridgeExecutionState(retryError)
+            ),
+            true
+          );
+        }
       }
       throw error;
     }
@@ -187,6 +244,14 @@ export class CallmuxBridge {
       throw new Error("bridge is not connected to upstream MCP server");
     }
     return this.client;
+  }
+
+  private toolAllowsReplay(name: string): boolean {
+    const annotations = this.cachedTools.find((tool) => tool.name === name)?.annotations;
+    return (
+      annotations?.readOnlyHint === true ||
+      annotations?.idempotentHint === true
+    );
   }
 
   private async reconnectUpstream(): Promise<void> {

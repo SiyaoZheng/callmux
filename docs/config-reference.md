@@ -41,8 +41,10 @@ callmux also accepts MCP-compatible format (`{ "mcpServers": { ... } }`) so you 
 | `maxConcurrency` | integer | `20` | Global max concurrent calls for parallel/batch |
 | `connectTimeoutMs` | integer | `30000` | Timeout for downstream startup connect + list-tools |
 | `callTimeoutMs` | integer | `180000` | Timeout for downstream tool calls |
+| `reloadDrainTimeoutMs` | integer | longest call timeout + `1000` | Maximum time to drain active calls from an old upstream generation after hot reload |
 | `reconnectPolicy` | object | retry forever | Downstream reconnect/backoff policy (see [Resilience](#resilience)) |
 | `sessionCwdIdleTtlSeconds` | integer | `600` | Idle TTL for listener-mode session-cwd stdio clients (`0` = close after each call) |
+| `fileReferenceRoots` | string[] | - | Local roots listener-origin `$file`/`$jsonFile`/`$yamlFile` references may read; relative roots resolve beside the config file |
 | `requestBodyMaxBytes` | integer | `1048576` | Global max inbound request payload bytes (`0` = unlimited) |
 | `allowRequestBodyMaxOverride` | boolean | `false` | Allow per-request `x-callmux-max-body-bytes` header override |
 | `allowInsecureRemoteListener` | boolean | `false` | Permit non-loopback listener startup without auth (unsafe) |
@@ -80,7 +82,8 @@ Local process servers use `command` to launch:
 |:------|:-----|:---------|:------------|
 | `command` | string | yes | Command to launch the MCP server |
 | `args` | string[] | - | Arguments passed to the command |
-| `env` | object | - | Environment variables for the process |
+| `env` | object | - | Literal environment variables for the process; avoid for secrets |
+| `envRefs` | object | - | Secret environment values loaded at process start from `env:NAME` or `file:PATH`; overrides the same key in `env` |
 | `cwd` | string | - | Working directory |
 | `cwdMode` | `"global"` or `"session"` | - | Listener-mode cwd behavior. Omit for session/project cwd when available; use `"global"` to force configured/process cwd |
 | `requireSessionCwd` | boolean | `false` | For session-cwd servers (path-sensitive tools like tokenlean): refuse a call with an actionable error when the caller's working directory can't be resolved (no roots, no `x-callmux-cwd` header, no `_meta.callmux.cwd`), instead of silently running relative paths against callmux's own cwd (`$HOME` for a daemon). Unresolved calls are always counted under `unresolvedSessionCwd` in runtime diagnostics regardless of this flag |
@@ -93,6 +96,25 @@ Local process servers use `command` to launch:
 | `cachePolicy` | object | - | Per-server cache allow/deny rules |
 | `responseShield` | object | - | Per-server response shielding overrides |
 | `schemaCompression` | object | - | Per-server schema compression overrides |
+
+Keep downstream credentials out of the main config with `envRefs`:
+
+```json
+{
+  "servers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "envRefs": {
+        "GITHUB_TOKEN": "env:GITHUB_TOKEN",
+        "SECONDARY_TOKEN": "file:./secrets/github-secondary-token"
+      }
+    }
+  }
+}
+```
+
+Environment references must use a valid variable name. Relative file paths resolve from the config directory. Referenced values are loaded only when the downstream process starts, and missing or empty values fail that server's connection without exposing the secret in status or audit output. `callmux setup` prefers an existing environment variable; when you enter a credential instead, it stores the value in a private sidecar file and writes only its absolute `file:` reference to config.
 
 ---
 
@@ -386,6 +408,26 @@ Initial endpoints:
 
 Any argument object can use file references. callmux reads the file and replaces the reference with file content before forwarding to the downstream MCP tool.
 
+File-backed references from a shared HTTP listener are disabled by default because
+their paths refer to the callmux host, not the remote caller. Enable them explicitly
+with local roots:
+
+```json
+{
+  "fileReferenceRoots": ["./agent-inputs", "/var/lib/callmux/uploads"]
+}
+```
+
+Relative roots are resolved beside the config file. callmux resolves both roots and
+requested files through `realpath`, so symlinks cannot be used to escape a configured
+root. Local stdio-mode callers retain unrestricted legacy file-reference behavior when
+`fileReferenceRoots` is omitted; when roots are configured, they constrain local and
+listener calls alike.
+
+Each tool call is limited to 32 file-backed references, 16 MB of file content in total,
+and four concurrent reads. Each file is opened and read only through `maxBytes + 1`, so
+a file that grows after validation cannot force an unbounded allocation.
+
 Use the reference that matches the downstream field shape:
 
 | Need | Use | Do not use |
@@ -553,7 +595,7 @@ config — there is no callmux setting for this.
     "github": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": { "GITHUB_TOKEN": "ghp_xxx" },
+      "envRefs": { "GITHUB_TOKEN": "env:GITHUB_TOKEN" },
       "tools": ["create_issue", "get_issue", "list_issues", "search_issues"],
       "maxConcurrency": 5,
       "cachePolicy": { "allowTools": ["get_*", "list_*"] }
@@ -584,6 +626,7 @@ config — there is no callmux setting for this.
   "maxConcurrency": 20,
   "connectTimeoutMs": 30000,
   "callTimeoutMs": 180000,
+  "reloadDrainTimeoutMs": 181000,
   "strictStartup": false,
   "metaOnly": false,
   "exposeMetaTools": true,

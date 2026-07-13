@@ -2,7 +2,7 @@
 
 import { watch, type FSWatcher } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallmuxBridge } from "../bridge.js";
 import { CallmuxProxy } from "../proxy.js";
@@ -76,6 +76,7 @@ import {
   type AgentInstructionsProfile,
 } from "../instructions.js";
 import { shutdownAfterFatalListenerError } from "../fatal.js";
+import { drainAndCloseProxy } from "../reload-drain.js";
 import {
   applyManagementOverlay,
   loadManagementOverlay,
@@ -2102,20 +2103,27 @@ async function main(): Promise<void> {
     // Sentinel keeps the event loop alive even if every other ref is dropped
     // (all child transports closed, no active HTTP connections, etc.)
     const keepalive = setInterval(() => {}, 30_000);
-    const staleProxyCloseDelayMs = 30_000;
+    const staleProxyClosures = new Map<Promise<void>, AbortController>();
     let configWatcher: FSWatcher | undefined;
     let reloadTimer: ReturnType<typeof setTimeout> | undefined;
     let reloadInProgress = false;
     let reloadQueued = false;
 
-    const closeStaleProxyLater = (staleProxy: CallmuxProxy): void => {
-      const timer = setTimeout(() => {
-        staleProxy.close().catch((error) => {
-          const message = error instanceof Error ? error.message : String(error);
-          process.stderr.write(`[callmux] Stale upstream close failed: ${message}\n`);
-        });
-      }, staleProxyCloseDelayMs);
-      timer.unref?.();
+    const closeStaleProxyWhenDrained = (
+      staleProxy: CallmuxProxy,
+      staleConfig: CallmuxConfig
+    ): void => {
+      const controller = new AbortController();
+      const closure = drainAndCloseProxy(
+        listener,
+        staleProxy,
+        staleConfig,
+        (message) => process.stderr.write(`[callmux] ${message}\n`),
+        controller.signal
+      ).finally(() => {
+        staleProxyClosures.delete(closure);
+      });
+      staleProxyClosures.set(closure, controller);
     };
 
     const applyRuntimeConfig = async (
@@ -2130,6 +2138,7 @@ async function main(): Promise<void> {
         await nextProxy.connectUpstreams();
 
         const previousProxy = proxy;
+        const previousConfig = config;
         listener.applyReloadedState({
           config: nextConfig,
           upstream: nextProxy.getUpstream(),
@@ -2145,7 +2154,7 @@ async function main(): Promise<void> {
         config = nextConfig;
         baseConfig = nextBaseConfig;
         managementOverlay = nextManagementOverlay;
-        closeStaleProxyLater(previousProxy);
+        closeStaleProxyWhenDrained(previousProxy, previousConfig);
         const source = activeConfigPath ?? "runtime";
         process.stderr.write(
           `[callmux] Reloaded config from ${source} (${trigger})\n`
@@ -2213,9 +2222,11 @@ async function main(): Promise<void> {
       clearInterval(keepalive);
       if (reloadTimer) clearTimeout(reloadTimer);
       configWatcher?.close();
+      for (const controller of staleProxyClosures.values()) controller.abort();
       await Promise.allSettled([
         listener.close(),
         proxy.close(),
+        ...staleProxyClosures.keys(),
       ]);
     };
 
@@ -2247,8 +2258,14 @@ async function main(): Promise<void> {
 
     if (activeConfigPath) {
       try {
-        configWatcher = watch(activeConfigPath, (eventType) => {
-          if (eventType === "change" || eventType === "rename") {
+        const watchedConfigName = basename(activeConfigPath);
+        // Watch the containing directory so atomic temp-file renames do not
+        // leave us attached to the replaced config inode.
+        configWatcher = watch(dirname(activeConfigPath), (eventType, filename) => {
+          if (
+            (filename === null || filename.toString() === watchedConfigName) &&
+            (eventType === "change" || eventType === "rename")
+          ) {
             scheduleReload(`file ${eventType}`);
           }
         });

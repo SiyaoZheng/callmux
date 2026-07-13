@@ -1,6 +1,11 @@
 import * as p from "@clack/prompts";
 import { UpstreamManager } from "./upstream.js";
-import { loadManagedConfig, saveManagedConfig, getDefaultConfigPath } from "./config.js";
+import {
+  getDefaultConfigPath,
+  loadManagedConfig,
+  saveManagedConfig,
+  saveManagedSecret,
+} from "./config.js";
 import { parseCommandLine } from "./cli.js";
 import {
   attachClaudeConfig,
@@ -16,7 +21,7 @@ import {
 } from "./daemon.js";
 import { detectExistingConfigs, type DetectedServer } from "./detect.js";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { SERVER_REGISTRY, type RegistryEntry } from "./registry.js";
 import { isHttpServerConfig } from "./types.js";
 import { META_TOOLS } from "./meta-tools.js";
@@ -27,11 +32,29 @@ interface DiscoveredServer {
   config: ServerConfig;
   tools: string[];
   selectedTools?: string[];
+  pendingSecrets?: Array<{ path: string; value: string }>;
 }
 
 type SetupClientMode =
   | { mode: "local" }
   | { mode: "shared"; listenerUrl: string };
+
+export function setupPromptDefaults(existing?: CallmuxConfig | null): {
+  cacheEnabled: boolean;
+  cacheTtlWhenEnabled: number;
+  metaOnly: boolean;
+  descriptionMaxLength?: number;
+} {
+  const existingCacheTtl = existing?.cacheTtlSeconds ?? 0;
+  return {
+    cacheEnabled: existing ? existingCacheTtl > 0 : true,
+    cacheTtlWhenEnabled: existingCacheTtl > 0 ? existingCacheTtl : 60,
+    metaOnly: existing?.metaOnly ?? false,
+    ...(existing?.descriptionMaxLength !== undefined
+      ? { descriptionMaxLength: existing.descriptionMaxLength }
+      : {}),
+  };
+}
 
 export function listenerClientUrl(baseUrl: string, client: ClientKind): string {
   const url = new URL(baseUrl);
@@ -90,11 +113,12 @@ export async function runSetup(configPath?: string): Promise<void> {
     process.exit(0);
   }
 
-  const discovered = await discoverTools(servers, imported);
+  const discovered = await discoverTools(servers, imported, resolvedConfigPath);
 
+  const promptDefaults = setupPromptDefaults(effectiveExisting);
   const cacheChoice = await p.confirm({
     message: "Enable caching for read-only tools? (recommended)",
-    initialValue: true,
+    initialValue: promptDefaults.cacheEnabled,
   });
 
   if (p.isCancel(cacheChoice)) {
@@ -102,7 +126,7 @@ export async function runSetup(configPath?: string): Promise<void> {
     process.exit(0);
   }
 
-  const cacheTtl = cacheChoice ? 60 : 0;
+  const cacheTtl = cacheChoice ? promptDefaults.cacheTtlWhenEnabled : 0;
 
   const totalToolCount = discovered.reduce(
     (sum, s) => sum + (s.selectedTools?.length ?? s.tools.length),
@@ -111,7 +135,7 @@ export async function runSetup(configPath?: string): Promise<void> {
 
   const metaOnlyChoice = await p.confirm({
     message: `Enable meta-only mode? Hides individual tools from your agent's listing and exposes them only through callmux meta-tools. Reduces tool listing from ${totalToolCount} tools to ${META_TOOLS.length}.`,
-    initialValue: false,
+    initialValue: promptDefaults.metaOnly,
   });
 
   if (p.isCancel(metaOnlyChoice)) {
@@ -124,6 +148,7 @@ export async function runSetup(configPath?: string): Promise<void> {
     const descMaxInput = await p.text({
       message: "Max description length for tool discovery (leave blank for no limit):",
       placeholder: "100",
+      initialValue: promptDefaults.descriptionMaxLength?.toString() ?? "",
       validate: (v = "") => {
         if (v && (!/^\d+$/.test(v) || Number(v) < 1))
           return "Must be a positive integer";
@@ -138,7 +163,7 @@ export async function runSetup(configPath?: string): Promise<void> {
     descriptionMaxLength = descMaxInput ? Number(descMaxInput) : undefined;
   }
 
-  const config = buildConfig(
+  const config = buildSetupConfig(
     discovered,
     cacheTtl,
     metaOnlyChoice,
@@ -148,6 +173,9 @@ export async function runSetup(configPath?: string): Promise<void> {
 
   const clientMode = await selectClientMode();
 
+  for (const pending of discovered.flatMap((server) => server.pendingSecrets ?? [])) {
+    await saveManagedSecret(pending.path, pending.value);
+  }
   await saveManagedConfig(resolvedConfigPath, config);
   p.log.success(`Config written to ${resolvedConfigPath}`);
 
@@ -427,34 +455,90 @@ async function selectServers(): Promise<Array<{ entry?: RegistryEntry; custom?: 
   return results;
 }
 
-async function promptEnvVars(entry: RegistryEntry): Promise<Record<string, string>> {
-  const env: Record<string, string> = {};
+interface SetupEnvSelection {
+  envRefs: Record<string, string>;
+  probeEnv: Record<string, string>;
+  pendingSecrets: Array<{ path: string; value: string }>;
+}
+
+function setupSecretPath(configPath: string, serverName: string, envName: string): string {
+  const safeServer = serverName.replace(/[^A-Za-z0-9_-]/g, "_");
+  const safeEnvName = envName.replace(/[^A-Za-z0-9_-]/g, "_");
+  return join(
+    dirname(resolve(configPath)),
+    "secrets",
+    `${safeServer}-${safeEnvName}`
+  );
+}
+
+async function promptEnvVars(
+  entry: RegistryEntry,
+  configPath: string
+): Promise<SetupEnvSelection> {
+  const envRefs: Record<string, string> = {};
+  const probeEnv: Record<string, string> = {};
+  const pendingSecrets: Array<{ path: string; value: string }> = [];
 
   for (const spec of entry.envVars) {
-    const value = await p.text({
-      message: `${spec.description}:`,
-      placeholder: spec.hint ?? "",
-      validate: (v = "") => {
-        if (spec.required && !v.trim()) return `${spec.name} is required`;
-      },
+    const detected = process.env[spec.name];
+    const source = await p.select({
+      message: `How should callmux load ${spec.name}?`,
+      options: [
+        {
+          value: "environment",
+          label: `Reference environment variable ${spec.name}`,
+          hint: detected
+            ? "Detected; recommended"
+            : "Set it before starting callmux",
+        },
+        {
+          value: "file",
+          label: "Enter and store in a private secret file",
+          hint: "Masked input; stored with mode 0600",
+        },
+        ...(!spec.required
+          ? [{ value: "skip", label: "Skip this optional value" }]
+          : []),
+      ],
     });
 
-    if (p.isCancel(value)) {
+    if (p.isCancel(source)) {
       p.cancel("Setup cancelled.");
       process.exit(0);
     }
 
-    if (value.trim()) {
-      env[spec.name] = value.trim();
+    if (source === "skip") continue;
+    if (source === "environment") {
+      envRefs[spec.name] = `env:${spec.name}`;
+      if (detected) probeEnv[spec.name] = detected;
+      continue;
     }
+
+    const value = await p.password({
+      message: `${spec.description}${spec.hint ? ` (${spec.hint})` : ""}:`,
+      validate: (v = "") => {
+        if (spec.required && !v.trim()) return `${spec.name} is required`;
+      },
+    });
+    if (p.isCancel(value)) {
+      p.cancel("Setup cancelled.");
+      process.exit(0);
+    }
+    if (!value.trim()) continue;
+
+    const path = setupSecretPath(configPath, entry.name, spec.name);
+    envRefs[spec.name] = `file:${path}`;
+    probeEnv[spec.name] = value.trim();
+    pendingSecrets.push({ path, value: value.trim() });
   }
 
-  return env;
+  return { envRefs, probeEnv, pendingSecrets };
 }
 
 async function discoverTools(
   servers: Array<{ entry?: RegistryEntry; custom?: { name: string; command: string; url?: string } }>,
-  preImported: DiscoveredServer[] = []
+  preImported: DiscoveredServer[] = [],
+  configPath = getDefaultConfigPath()
 ): Promise<DiscoveredServer[]> {
   const discovered: DiscoveredServer[] = [...preImported];
 
@@ -462,9 +546,13 @@ async function discoverTools(
     const name = server.entry?.name ?? server.custom!.name;
     const label = server.entry?.label ?? server.custom!.name;
 
-    let env: Record<string, string> = {};
+    let envSelection: SetupEnvSelection = {
+      envRefs: {},
+      probeEnv: {},
+      pendingSecrets: [],
+    };
     if (server.entry && server.entry.envVars.length > 0) {
-      env = await promptEnvVars(server.entry);
+      envSelection = await promptEnvVars(server.entry, configPath);
     }
 
     let config: ServerConfig;
@@ -475,14 +563,15 @@ async function discoverTools(
       config = {
         command: server.entry.command,
         args: [...server.entry.args],
-        ...(Object.keys(env).length > 0 ? { env } : {}),
+        ...(Object.keys(envSelection.envRefs).length > 0
+          ? { envRefs: envSelection.envRefs }
+          : {}),
       };
     } else {
       const parts = parseCommandLine(server.custom!.command);
       config = {
         command: parts[0],
         args: parts.slice(1),
-        ...(Object.keys(env).length > 0 ? { env } : {}),
       };
     }
 
@@ -493,7 +582,18 @@ async function discoverTools(
     let tools: string[] = [];
 
     try {
-      const [connection] = await upstream.connect({ [name]: config });
+      const probeConfig: ServerConfig = "command" in config
+        ? (() => {
+            const { envRefs: _envRefs, ...withoutRefs } = config;
+            return {
+              ...withoutRefs,
+              ...(Object.keys(envSelection.probeEnv).length > 0
+                ? { env: { ...(withoutRefs.env ?? {}), ...envSelection.probeEnv } }
+                : {}),
+            };
+          })()
+        : config;
+      const [connection] = await upstream.connect({ [name]: probeConfig });
       tools = connection?.tools.map((t) => t.name).sort() ?? [];
       s.stop(`${label}: found ${tools.length} tool${tools.length === 1 ? "" : "s"}`);
     } catch (error) {
@@ -547,20 +647,30 @@ async function discoverTools(
       }
     }
 
-    discovered.push({ name, config, tools, selectedTools });
+    discovered.push({
+      name,
+      config,
+      tools,
+      selectedTools,
+      ...(envSelection.pendingSecrets.length > 0
+        ? { pendingSecrets: envSelection.pendingSecrets }
+        : {}),
+    });
   }
 
   return discovered;
 }
 
-function buildConfig(
+export function buildSetupConfig(
   discovered: DiscoveredServer[],
   cacheTtl: number,
   metaOnly: boolean,
   descriptionMaxLength: number | undefined,
   existing?: CallmuxConfig | null
 ): CallmuxConfig {
-  const servers: Record<string, ServerConfig> = existing?.servers ?? {};
+  const servers: Record<string, ServerConfig> = {
+    ...(existing?.servers ?? {}),
+  };
 
   for (const { name, config, selectedTools } of discovered) {
     servers[name] = {
@@ -569,17 +679,30 @@ function buildConfig(
     };
   }
 
-  return {
+  const config: CallmuxConfig = {
+    ...(existing ?? {}),
     servers,
-    ...(cacheTtl > 0 ? { cacheTtlSeconds: cacheTtl } : {}),
-    maxConcurrency: existing?.maxConcurrency ?? 20,
-    ...(existing?.maxCacheEntries ? { maxCacheEntries: existing.maxCacheEntries } : {}),
-    ...(existing?.connectTimeoutMs ? { connectTimeoutMs: existing.connectTimeoutMs } : {}),
-    ...(existing?.callTimeoutMs ? { callTimeoutMs: existing.callTimeoutMs } : {}),
-    ...(existing?.strictStartup ? { strictStartup: existing.strictStartup } : {}),
-    ...(metaOnly ? { metaOnly } : {}),
-    ...(descriptionMaxLength ? { descriptionMaxLength } : {}),
+    cacheTtlSeconds: cacheTtl,
+    ...(!existing ? { maxConcurrency: 20 } : {}),
   };
+
+  // Cache and meta-only choices are always explicitly prompted. Preserve every
+  // other existing option, including options added in future releases.
+  if (metaOnly) {
+    config.metaOnly = true;
+    // Meta-only needs the callmux meta-tools to remain visible. Omitting this
+    // field restores its default (true) if the previous config hid meta-tools.
+    delete config.exposeMetaTools;
+    if (descriptionMaxLength !== undefined) {
+      config.descriptionMaxLength = descriptionMaxLength;
+    } else {
+      delete config.descriptionMaxLength;
+    }
+  } else {
+    delete config.metaOnly;
+  }
+
+  return config;
 }
 
 async function attachToClients(

@@ -42,8 +42,22 @@ function extractText(result: CallToolResult): string {
     .join("\n");
 }
 
+function hasRichMcpResultData(result: CallToolResult): boolean {
+  if (result.structuredContent !== undefined || result._meta !== undefined) {
+    return true;
+  }
+  if (result.content.length !== 1) return true;
+
+  const only = result.content[0];
+  if (only.type !== "text") return true;
+  // Content annotations and extension metadata are part of the MCP result and
+  // must survive fan-out normalization rather than being flattened to a string.
+  return only.annotations !== undefined || only._meta !== undefined;
+}
+
 function unwrapResult(result: CallToolResult): unknown {
   const text = extractText(result);
+  if (hasRichMcpResultData(result)) return result;
   if (result.isError) return { error: text, isError: true };
   try {
     return JSON.parse(text);
@@ -238,11 +252,12 @@ function contextWithSafeRetry(
   cache: CallCache,
   tool: string,
   server: string | undefined,
-  context: ToolCallContext | undefined
+  context: ToolCallContext | undefined,
+  annotations?: PreparedToolCall["annotations"]
 ): ToolCallContext {
   return {
     ...(context ?? {}),
-    retryOnReconnect: cache.isSafeToRetry(tool, server),
+    retryOnReconnect: cache.isSafeToRetry(tool, server, annotations),
   };
 }
 
@@ -259,6 +274,7 @@ async function prepareResolvedCacheKey(
   tool: string,
   args: Record<string, unknown> | undefined,
   server: string | undefined,
+  context?: ToolCallContext,
   opaqueArgumentKeys?: ReadonlySet<string>
 ): Promise<ResolvedCall | CallToolResult> {
   const maybePrepare = upstream as UpstreamManager & {
@@ -266,7 +282,10 @@ async function prepareResolvedCacheKey(
       toolName: string,
       args?: Record<string, unknown>,
       serverHint?: string,
-      options?: { opaqueArgumentKeys?: ReadonlySet<string> }
+      options?: {
+        context?: ToolCallContext;
+        opaqueArgumentKeys?: ReadonlySet<string>;
+      }
     ) => ReturnType<UpstreamManager["prepareToolCall"]>;
   };
   if (typeof maybePrepare.prepareToolCall !== "function") {
@@ -277,7 +296,14 @@ async function prepareResolvedCacheKey(
     tool,
     args,
     server,
-    opaqueArgumentKeys && opaqueArgumentKeys.size > 0 ? { opaqueArgumentKeys } : undefined
+    context || (opaqueArgumentKeys && opaqueArgumentKeys.size > 0)
+      ? {
+          ...(context ? { context } : {}),
+          ...(opaqueArgumentKeys && opaqueArgumentKeys.size > 0
+            ? { opaqueArgumentKeys }
+            : {}),
+        }
+      : undefined
   );
   if ("error" in prepared) return prepared.error;
   return {
@@ -1066,13 +1092,21 @@ export async function handleParallel(
         upstream,
         call.tool,
         call.arguments,
-        call.server
+        call.server,
+        callContext
       );
       if (isToolErrorResult(prepared)) {
         return { call, result: unwrapResult(prepared), durationMs: Date.now() - callStart };
       }
       const cacheScope = cacheScopeForCall(upstream, call.tool, prepared.server, callContext);
-      const cached = cache.get(call.tool, prepared.args, prepared.server, cacheScope);
+      const annotations = prepared.preparedCall?.annotations;
+      const cached = cache.get(
+        call.tool,
+        prepared.args,
+        prepared.server,
+        cacheScope,
+        annotations
+      );
       if (cached) {
         return { call, result: unwrapResult(cached), durationMs: Date.now() - callStart };
       }
@@ -1081,9 +1115,9 @@ export async function handleParallel(
         upstream,
         call.tool,
         prepared,
-        contextWithSafeRetry(cache, call.tool, prepared.server, callContext)
+        contextWithSafeRetry(cache, call.tool, prepared.server, callContext, annotations)
       );
-      cache.set(call.tool, prepared.args, result, prepared.server, cacheScope);
+      cache.set(call.tool, prepared.args, result, prepared.server, cacheScope, annotations);
       return { call, result: unwrapResult(result), durationMs: Date.now() - callStart };
     } catch (err) {
       return {
@@ -1171,14 +1205,22 @@ export async function handleBatch(
         upstream,
         tool,
         item.arguments,
-        server
+        server,
+        callContext
       );
       if (isToolErrorResult(prepared)) {
         failed++;
         return { index, result: unwrapResult(prepared), durationMs: Date.now() - callStart };
       }
       const cacheScope = cacheScopeForCall(upstream, tool, prepared.server, callContext);
-      const cached = cache.get(tool, prepared.args, prepared.server, cacheScope);
+      const annotations = prepared.preparedCall?.annotations;
+      const cached = cache.get(
+        tool,
+        prepared.args,
+        prepared.server,
+        cacheScope,
+        annotations
+      );
       if (cached) {
         if (cached.isError) failed++;
         else succeeded++;
@@ -1189,9 +1231,9 @@ export async function handleBatch(
         upstream,
         tool,
         prepared,
-        contextWithSafeRetry(cache, tool, prepared.server, callContext)
+        contextWithSafeRetry(cache, tool, prepared.server, callContext, annotations)
       );
-      cache.set(tool, prepared.args, result, prepared.server, cacheScope);
+      cache.set(tool, prepared.args, result, prepared.server, cacheScope, annotations);
       if (result.isError) failed++;
       else succeeded++;
       return { index, result: unwrapResult(result), durationMs: Date.now() - callStart };
@@ -1321,6 +1363,7 @@ export async function handlePipeline(
         step.tool,
         mergedArgs,
         step.server,
+        callContext,
         opaqueArgumentKeys
       );
       if (isToolErrorResult(prepared)) {
@@ -1341,16 +1384,23 @@ export async function handlePipeline(
         }, outputFormat);
       }
       const cacheScope = cacheScopeForCall(upstream, step.tool, prepared.server, callContext);
-      const cached = cache.get(step.tool, prepared.args, prepared.server, cacheScope);
+      const annotations = prepared.preparedCall?.annotations;
+      const cached = cache.get(
+        step.tool,
+        prepared.args,
+        prepared.server,
+        cacheScope,
+        annotations
+      );
       const result = cached ?? await invokeResolved(
         upstream,
         step.tool,
         prepared,
-        contextWithSafeRetry(cache, step.tool, prepared.server, callContext)
+        contextWithSafeRetry(cache, step.tool, prepared.server, callContext, annotations)
       );
 
       if (!cached) {
-        cache.set(step.tool, prepared.args, result, prepared.server, cacheScope);
+        cache.set(step.tool, prepared.args, result, prepared.server, cacheScope, annotations);
       }
 
       const durationMs = Date.now() - callStart;
@@ -1431,11 +1481,15 @@ export async function handleDryRun(
   let warningCount = 0;
 
   for (const call of parsed.calls) {
+    const callContext = contextWithCallOverrides(context, {
+      timeoutMs: call.timeoutMs,
+      cwd: call.cwd,
+    });
     const prepare = await upstream.prepareToolCall(
       call.tool,
       call.arguments,
       call.server,
-      { modelClientCoercion: true }
+      { modelClientCoercion: true, context: callContext }
     );
 
     if ("error" in prepare) {
@@ -1449,16 +1503,13 @@ export async function handleDryRun(
       continue;
     }
 
-    const callContext = contextWithCallOverrides(context, {
-      timeoutMs: call.timeoutMs,
-      cwd: call.cwd,
-    });
     const cacheScope = cacheScopeForCall(upstream, call.tool, prepare.server, callContext);
     const cacheHit = cache.get(
       call.tool,
       prepare.resolvedArguments,
       prepare.server,
-      cacheScope
+      cacheScope,
+      prepare.annotations
     ) !== null;
     if (cacheHit) cacheHitCandidates++;
 
@@ -1599,17 +1650,24 @@ export async function handleCall(
     ...(typeof timeoutMs === "number" ? { timeoutMs } : {}),
     ...(typeof cwd === "string" ? { cwd } : {}),
   });
-  const prepared = await prepareResolvedCacheKey(upstream, tool, parsedArgs, server);
+  const prepared = await prepareResolvedCacheKey(
+    upstream,
+    tool,
+    parsedArgs,
+    server,
+    callContext
+  );
   if (isToolErrorResult(prepared)) return prepared;
   const cacheScope = cacheScopeForCall(upstream, tool, prepared.server, callContext);
-  const cached = cache.get(tool, prepared.args, prepared.server, cacheScope);
+  const annotations = prepared.preparedCall?.annotations;
+  const cached = cache.get(tool, prepared.args, prepared.server, cacheScope, annotations);
   if (cached) return formatResultIfStructured(cached, outputFormat);
 
   const result = await invokeResolved(upstream, tool, prepared, {
-    ...contextWithSafeRetry(cache, tool, prepared.server, callContext),
+    ...contextWithSafeRetry(cache, tool, prepared.server, callContext, annotations),
     forceReconnect,
   });
-  cache.set(tool, prepared.args, result, prepared.server, cacheScope);
+  cache.set(tool, prepared.args, result, prepared.server, cacheScope, annotations);
   return formatResultIfStructured(result, outputFormat);
 }
 

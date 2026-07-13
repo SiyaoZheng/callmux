@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -19,6 +19,7 @@ import {
   loadConfig,
   loadManagedConfig,
   saveManagedConfig,
+  saveManagedSecret,
 } from "./config.js";
 import {
   applyServerMutation,
@@ -55,7 +56,7 @@ import { CallmuxProxy } from "./proxy.js";
 import { createListener } from "./library.js";
 import { mapBounded, UpstreamManager } from "./upstream.js";
 import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
-import type { ServerConfig, StdioServerConfig } from "./types.js";
+import type { CallmuxConfig, ServerConfig, StdioServerConfig } from "./types.js";
 import { META_TOOLS } from "./meta-tools.js";
 import { errorResult } from "./results.js";
 import { formatToolText } from "./output-format.js";
@@ -72,7 +73,12 @@ import {
   withBearerToken,
   writeManagedClientToken,
 } from "./cli-auth.js";
-import { listenerClientUrl, renderSharedListenerStartCommand } from "./setup.js";
+import {
+  buildSetupConfig,
+  listenerClientUrl,
+  renderSharedListenerStartCommand,
+  setupPromptDefaults,
+} from "./setup.js";
 import { createResponseStore, ResponseStore } from "./response-store.js";
 import {
   compressToolForExposure,
@@ -311,7 +317,7 @@ async function captureStderr<T>(
 }
 
 test("CallCache distinguishes nested arguments while preserving stable object order", () => {
-  const cache = new CallCache(60);
+  const cache = new CallCache(60, { allowTools: ["*"] });
   const result = textResult("cached");
 
   cache.set("get_issue", { filter: { state: "open", labels: ["bug"] } }, result);
@@ -327,7 +333,7 @@ test("CallCache distinguishes nested arguments while preserving stable object or
 });
 
 test("CallCache prunes expired entries", async () => {
-  const cache = new CallCache(0.01);
+  const cache = new CallCache(0.01, { allowTools: ["*"] });
 
   cache.set("get_issue", { id: 1 }, textResult("stale"));
   assert.equal(cache.size, 1);
@@ -338,7 +344,7 @@ test("CallCache prunes expired entries", async () => {
 });
 
 test("CallCache evicts least-recently-used entries beyond max size", () => {
-  const cache = new CallCache(60, undefined, undefined, 2);
+  const cache = new CallCache(60, { allowTools: ["*"] }, undefined, 2);
 
   cache.set("get_item", { id: 1 }, textResult("one"));
   cache.set("get_item", { id: 2 }, textResult("two"));
@@ -352,7 +358,7 @@ test("CallCache evicts least-recently-used entries beyond max size", () => {
 });
 
 test("CallCache tracks hit/miss counters and hit rate", () => {
-  const cache = new CallCache(60);
+  const cache = new CallCache(60, { allowTools: ["*"] });
   cache.set("get_item", { id: 1 }, textResult("one"));
 
   assert.deepEqual(cache.get("get_item", { id: 1 }), textResult("one")); // hit
@@ -387,8 +393,16 @@ test("CallCache respects explicit allow and deny policies", () => {
 test("CallCache safe retry classification does not require active caching", () => {
   const cache = new CallCache(0);
 
-  assert.equal(cache.canCache("get_issue"), false);
-  assert.equal(cache.isSafeToRetry("get_issue"), true);
+  assert.equal(cache.canCache("get_issue", undefined, { readOnlyHint: true }), false);
+  assert.equal(
+    cache.isSafeToRetry("get_issue", undefined, { readOnlyHint: true }),
+    true
+  );
+  assert.equal(
+    cache.isSafeToRetry("replace_issue", undefined, { idempotentHint: true }),
+    true
+  );
+  assert.equal(cache.isSafeToRetry("get_and_delete"), false);
   assert.equal(cache.isSafeToRetry("create_issue"), false);
 });
 
@@ -758,7 +772,7 @@ test("invalid concurrency fails fast instead of hanging", async () => {
 });
 
 test("pipeline reuses cached read-only step results", async () => {
-  const cache = new CallCache(60);
+  const cache = new CallCache(60, { allowTools: ["get_issue"] });
   let calls = 0;
   const upstream = {
     async callTool(tool: string, args?: Record<string, unknown>) {
@@ -782,7 +796,7 @@ test("pipeline reuses cached read-only step results", async () => {
 });
 
 test("cache clear can target a specific server", () => {
-  const cache = new CallCache(60);
+  const cache = new CallCache(60, { allowTools: ["get_issue"] });
 
   cache.set("get_issue", { id: 1 }, textResult("github"), "github");
   cache.set("get_issue", { id: 1 }, textResult("linear"), "linear");
@@ -917,6 +931,22 @@ test("configFromArgs parses timeout and strict startup flags", () => {
   assert.equal(config.connectTimeoutMs, 1000);
   assert.equal(config.callTimeoutMs, 2000);
   assert.equal(config.strictStartup, true);
+});
+
+test("loadConfig resolves fileReferenceRoots relative to the config file", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-file-roots-config-"));
+  const configPath = join(dir, "config.json");
+  await writeFile(configPath, JSON.stringify({
+    servers: { fake: { command: "fake" } },
+    fileReferenceRoots: ["./inputs"],
+  }));
+
+  try {
+    const config = await loadConfig(configPath);
+    assert.deepEqual(config.fileReferenceRoots, [join(dir, "inputs")]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("loadConfig parses reconnect policy configuration", async () => {
@@ -1093,6 +1123,101 @@ test("saveManagedConfig and loadManagedConfig round-trip native config", async (
   }
 });
 
+test("saveManagedConfig atomically replaces private config and keeps a private backup", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-managed-private-"));
+  const configPath = join(dir, "config.json");
+  const backupPath = `${configPath}.bak`;
+  const previous = {
+    servers: { old: { command: "old-server", env: { apiKey: "old-secret" } } },
+    cacheTtlSeconds: 10,
+  };
+
+  try {
+    await writeFile(configPath, `${JSON.stringify(previous)}\n`, {
+      encoding: "utf-8",
+      mode: 0o644,
+    });
+    const next: CallmuxConfig = {
+      servers: { next: { command: "next-server" } },
+      cacheTtlSeconds: 60,
+      maxConcurrency: 20,
+    };
+
+    await saveManagedConfig(configPath, next);
+
+    assert.deepEqual(await loadManagedConfig(configPath), next);
+    assert.deepEqual(JSON.parse(await readFile(backupPath, "utf-8")), previous);
+    assert.deepEqual(
+      (await readdir(dir)).filter((name) => name.includes(".tmp-")),
+      []
+    );
+    if (process.platform !== "win32") {
+      assert.equal((await stat(configPath)).mode & 0o777, 0o600);
+      assert.equal((await stat(backupPath)).mode & 0o777, 0o600);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("saveManagedSecret writes only a private sidecar value", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-managed-secret-"));
+  const secretPath = join(dir, "nested", "github-token");
+  try {
+    await saveManagedSecret(secretPath, "secret-value");
+    assert.equal(await readFile(secretPath, "utf-8"), "secret-value\n");
+    if (process.platform !== "win32") {
+      assert.equal((await stat(secretPath)).mode & 0o777, 0o600);
+    }
+    await assert.rejects(saveManagedSecret(secretPath, "   "), /empty managed secret/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig validates envRefs and resolves relative secret files from config", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-env-refs-"));
+  const configPath = join(dir, "config.json");
+  try {
+    await writeFile(configPath, JSON.stringify({
+      servers: {
+        github: {
+          command: "github-server",
+          env: { LOG_LEVEL: "debug" },
+          envRefs: {
+            GITHUB_TOKEN: "env:CALLMUX_TEST_GITHUB_TOKEN",
+            SECONDARY_TOKEN: "file:./secrets/secondary-token",
+          },
+        },
+      },
+    }));
+
+    const config = await loadConfig(configPath);
+    const github = config.servers.github as StdioServerConfig;
+    assert.deepEqual(github.env, { LOG_LEVEL: "debug" });
+    assert.deepEqual(github.envRefs, {
+      GITHUB_TOKEN: "env:CALLMUX_TEST_GITHUB_TOKEN",
+      SECONDARY_TOKEN: `file:${join(dir, "secrets", "secondary-token")}`,
+    });
+
+    await writeFile(configPath, JSON.stringify({
+      servers: {
+        bad: { command: "bad-server", envRefs: { TOKEN: "env:NOT-VALID" } },
+      },
+    }));
+    await assert.rejects(loadConfig(configPath), /valid environment variable/);
+
+    await writeFile(configPath, JSON.stringify({
+      servers: {
+        bad: { command: "bad-server", envRefs: { TOKEN: "literal-secret" } },
+      },
+    }));
+    await assert.rejects(loadConfig(configPath), /must use env:<NAME> or file:<PATH>/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("loadManagedConfig rejects mcpServers format for managed commands", async () => {
   const dir = await mkdtemp(join(tmpdir(), "callmux-managed-"));
   const configPath = join(dir, "config.json");
@@ -1205,6 +1330,11 @@ test("applyServerMutation updates tools env cwd and cache policy without leaking
       command: "npx",
       args: ["server.js"],
       env: { OLD_TOKEN: "x", KEEP: "y" },
+      envRefs: {
+        OLD_REF: "env:OLD_REF",
+        GITHUB_TOKEN: "env:GITHUB_TOKEN",
+        KEEP_REF: "file:/tmp/keep-ref",
+      },
       cwd: "/tmp/old",
       tools: ["get_issue", "create_issue"],
       cachePolicy: { allowTools: ["get_*"], denyTools: ["create_*"] },
@@ -1217,7 +1347,7 @@ test("applyServerMutation updates tools env cwd and cache policy without leaking
       addTools: ["search"],
       removeTools: ["create_issue"],
       setEnv: { GITHUB_TOKEN: "secret" },
-      removeEnv: ["OLD_TOKEN"],
+      removeEnv: ["OLD_TOKEN", "OLD_REF"],
       cwd: "/tmp/new",
       cacheAllowTools: [],
       cacheDenyTools: ["create_*", "delete_*"],
@@ -1233,6 +1363,7 @@ test("applyServerMutation updates tools env cwd and cache policy without leaking
       KEEP: "y",
       GITHUB_TOKEN: "secret",
     },
+    envRefs: { KEEP_REF: "file:/tmp/keep-ref" },
     cwd: "/tmp/new",
     tools: ["get_issue", "search"],
     cachePolicy: {
@@ -1249,6 +1380,7 @@ test("serializeServers redacts env values and preserves cache policy", () => {
     command: "npx",
     args: ["server.js"],
     env: { B_TOKEN: "b", A_TOKEN: "a" },
+    envRefs: { C_TOKEN: "env:C_TOKEN", A_TOKEN: "file:/tmp/a-token" },
     cachePolicy: { allowTools: ["get_*"] },
     callTimeoutMs: 90000,
     requestBodyMaxBytes: 2048,
@@ -1259,7 +1391,7 @@ test("serializeServers redacts env values and preserves cache policy", () => {
       name: "github",
       command: "npx",
       args: ["server.js"],
-      envKeys: ["A_TOKEN", "B_TOKEN"],
+      envKeys: ["A_TOKEN", "B_TOKEN", "C_TOKEN"],
       cachePolicy: { allowTools: ["get_*"] },
       callTimeoutMs: 90000,
       requestBodyMaxBytes: 2048,
@@ -1296,10 +1428,13 @@ test("display helpers redact command arguments and URL secrets", () => {
       "--token",
       "secret-token",
       "--api-key=secret-key",
+      "--clientSecret=secret-client",
+      "--accessToken",
+      "secret-access",
       "--safe",
       "visible",
     ]),
-    "server --token [redacted] --api-key=[redacted] --safe visible"
+    "server --token [redacted] --api-key=[redacted] --clientSecret=[redacted] --accessToken [redacted] --safe visible"
   );
 
   assert.equal(
@@ -1308,8 +1443,8 @@ test("display helpers redact command arguments and URL secrets", () => {
   );
 
   assert.equal(
-    redactUrl("https://user:pass@example.com/mcp?token=secret&query=visible"),
-    "https://%5Bredacted%5D:%5Bredacted%5D@example.com/mcp?token=%5Bredacted%5D&query=visible"
+    redactUrl("https://user:pass@example.com/mcp?token=secret&clientSecret=also-secret&query=visible"),
+    "https://%5Bredacted%5D:%5Bredacted%5D@example.com/mcp?token=%5Bredacted%5D&clientSecret=%5Bredacted%5D&query=visible"
   );
 });
 
@@ -1607,6 +1742,124 @@ test("shared listener setup helpers derive client URLs and start command", () =>
     renderSharedListenerStartCommand("http://0.0.0.0:4860", "/tmp/callmux.json"),
     "callmux --listen 4860 --host 0.0.0.0 --config /tmp/callmux.json"
   );
+});
+
+test("setup extension preserves the complete existing config except prompted choices", () => {
+  const existing: CallmuxConfig = {
+    servers: {
+      existing: { command: "existing-server", env: { EXISTING_SECRET: "keep-me" } },
+    },
+    recipes: {
+      inspect: { mode: "call", server: "existing", tool: "inspect" },
+    },
+    cacheTtlSeconds: 300,
+    cachePolicy: { denyTools: ["write_*"] },
+    maxConcurrency: 7,
+    connectTimeoutMs: 12_000,
+    callTimeoutMs: 45_000,
+    reloadDrainTimeoutMs: 46_000,
+    reconnectPolicy: { initialDelayMs: 500, maxDelayMs: 5_000 },
+    sessionCwdIdleTtlSeconds: 120,
+    fileReferenceRoots: ["/srv/callmux/agent-inputs"],
+    strictStartup: true,
+    maxCacheEntries: 321,
+    metaOnly: true,
+    descriptionMaxLength: 88,
+    outputFormat: "toon",
+    responseShield: { enabled: true, maxStoredResults: 17 },
+    schemaCompression: { enabled: true, mode: "aggressive" },
+    requestBodyMaxBytes: 2048,
+    allowRequestBodyMaxOverride: true,
+    auth: { mode: "bearer", tokens: [{ id: "ops", token: "secret" }] },
+    authorization: {
+      defaultEffect: "deny",
+      rules: [{ id: "ops", effect: "allow", principals: ["bearer:ops"], tools: ["*"] }],
+    },
+    abuseControls: { globalRequestsPerMinute: 100 },
+    auditLog: { enabled: true, includeRequestBody: false },
+    metrics: { enabled: true, path: "/metrics" },
+    dashboard: { enabled: true, path: "/dashboard" },
+    eventStore: { enabled: true, path: "/tmp/callmux-events.sqlite" },
+    management: { enabled: true, path: "/management/v1" },
+    allowInsecureRemoteListener: true,
+  };
+
+  const result = buildSetupConfig(
+    [{
+      name: "new-server",
+      config: {
+        command: "new-server",
+        envRefs: { API_TOKEN: "file:/tmp/callmux-secrets/new-server-token" },
+      },
+      tools: ["read"],
+      selectedTools: ["read"],
+    }],
+    60,
+    false,
+    undefined,
+    existing
+  );
+  const expected: CallmuxConfig = {
+    ...existing,
+    servers: {
+      ...existing.servers,
+      "new-server": {
+        command: "new-server",
+        envRefs: { API_TOKEN: "file:/tmp/callmux-secrets/new-server-token" },
+        tools: ["read"],
+      },
+    },
+    cacheTtlSeconds: 60,
+  };
+  delete expected.metaOnly;
+
+  assert.deepEqual(result, expected);
+  assert.deepEqual(Object.keys(existing.servers), ["existing"]);
+  assert.notEqual(result.servers, existing.servers);
+});
+
+test("setup meta-only choices clear conflicting and blank prompted values", () => {
+  const result = buildSetupConfig(
+    [],
+    0,
+    true,
+    undefined,
+    {
+      servers: { existing: { command: "existing-server" } },
+      exposeMetaTools: false,
+      descriptionMaxLength: 120,
+      recipes: { inspect: { mode: "call", tool: "inspect" } },
+    }
+  );
+
+  assert.equal(result.cacheTtlSeconds, 0);
+  assert.equal(result.metaOnly, true);
+  assert.equal(result.exposeMetaTools, undefined);
+  assert.equal(result.descriptionMaxLength, undefined);
+  assert.equal(result.maxConcurrency, undefined);
+  assert.deepEqual(result.recipes, { inspect: { mode: "call", tool: "inspect" } });
+});
+
+test("setup seeds prompted cache and meta-only values from existing config", () => {
+  assert.deepEqual(
+    setupPromptDefaults({
+      servers: {},
+      cacheTtlSeconds: 900,
+      metaOnly: true,
+      descriptionMaxLength: 144,
+    }),
+    {
+      cacheEnabled: true,
+      cacheTtlWhenEnabled: 900,
+      metaOnly: true,
+      descriptionMaxLength: 144,
+    }
+  );
+  assert.deepEqual(setupPromptDefaults(null), {
+    cacheEnabled: true,
+    cacheTtlWhenEnabled: 60,
+    metaOnly: false,
+  });
 });
 
 test("renderAgentInstructions includes compact safety guidance without local paths", () => {
@@ -3009,7 +3262,7 @@ test("parallel fan-out returns partial promptly when one downstream hangs", asyn
       succeeded: number;
       failed: number;
       failedIndexes: number[];
-      results: Array<{ result?: { error?: string; isError?: boolean } }>;
+      results: Array<{ result?: CallToolResult }>;
     };
 
     assert.equal(content.status, "partial");
@@ -3017,7 +3270,14 @@ test("parallel fan-out returns partial promptly when one downstream hangs", asyn
     assert.equal(content.failed, 1);
     assert.deepEqual(content.failedIndexes, [0]);
     assert.equal(content.results[0].result?.isError, true);
-    assert.match(content.results[0].result?.error ?? "", /timed out after 20ms/i);
+    assert.match(
+      (
+        content.results[0].result?.structuredContent as {
+          error: { message: string };
+        }
+      ).error.message,
+      /timed out after 20ms/i
+    );
     assert.equal(content.results[1].result, "good:ok");
     assert.ok(durationMs < 500, `fan-out should not hang behind slow downstream; took ${durationMs}ms`);
     assert.equal(slowClosed, true);
@@ -3087,8 +3347,11 @@ test("UpstreamManager retires and reconnects a client after hard call timeout", 
   await upstream.close();
 });
 
-test("handleCall retries safe tools once after reconnect but not mutating tools", async () => {
-  async function run(toolName: string): Promise<{ result: CallToolResult; connectCount: number }> {
+test("handleCall uses MCP safety annotations instead of tool-name prefixes for reconnect retry", async () => {
+  async function run(
+    toolName: string,
+    annotations?: Tool["annotations"]
+  ): Promise<{ result: CallToolResult; connectCount: number }> {
     const upstream = new UpstreamManager();
     const cache = new CallCache(0);
     let connectCount = 0;
@@ -3098,7 +3361,7 @@ test("handleCall retries safe tools once after reconnect but not mutating tools"
     harness.connectOne = async (name: string, config: ServerConfig) => {
       connectCount++;
       const currentConnect = connectCount;
-      const tool = mockTool(toolName);
+      const tool = mockTool(toolName, undefined, [], annotations);
       return {
         name,
         config,
@@ -3132,7 +3395,7 @@ test("handleCall retries safe tools once after reconnect but not mutating tools"
     }
   }
 
-  const safe = await run("get_issue");
+  const safe = await run("get_issue", { readOnlyHint: true });
   assert.equal(safe.connectCount, 2);
   assert.equal(safe.result.isError, undefined);
   assert.deepEqual(safe.result.content, [{ type: "text", text: "client-2" }]);
@@ -3144,6 +3407,67 @@ test("handleCall retries safe tools once after reconnect but not mutating tools"
     (mutating.result.structuredContent as { error: { code: string } }).error.code,
     "tool_call_failed"
   );
+
+  const misleadingName = await run("get_and_delete");
+  assert.equal(misleadingName.connectCount, 1);
+  assert.equal(misleadingName.result.isError, true);
+  const misleadingDetails = (misleadingName.result.structuredContent as {
+    error: { details: Record<string, unknown> };
+  }).error.details;
+  assert.equal(misleadingDetails.retryable, true);
+  assert.equal(misleadingDetails.safeToRetry, false);
+  assert.equal(misleadingDetails.executionState, "unknown");
+});
+
+test("UpstreamManager preserves ambiguous execution state across a failed safe replay", async () => {
+  const upstream = new UpstreamManager();
+  let connectCount = 0;
+  const harness = upstream as unknown as {
+    connectOne: (name: string, config: ServerConfig) => Promise<unknown>;
+  };
+  harness.connectOne = async (name: string, config: ServerConfig) => {
+    connectCount++;
+    const currentConnect = connectCount;
+    const tool = mockTool("get_issue", undefined, [], { readOnlyHint: true });
+    return {
+      name,
+      config,
+      client: {
+        async callTool() {
+          if (currentConnect === 1) {
+            throw new Error("socket hang up");
+          }
+          throw new Error("unknown session id");
+        },
+        async close() {},
+      },
+      transport: { async close() {} },
+      resolvedTransport: "streamable-http",
+      allTools: [tool],
+      tools: [tool],
+      connectDurationMs: 1,
+    };
+  };
+
+  await upstream.connect({ github: { command: "github-mcp" } });
+  try {
+    const result = await upstream.callTool("get_issue", {}, "github");
+    const details = (result.structuredContent as {
+      error: { details: Record<string, unknown> };
+    }).error.details;
+
+    assert.equal(connectCount, 2);
+    assert.equal(result.isError, true);
+    assert.equal(details.retryAttempted, true);
+    assert.equal(details.safeToRetry, true);
+    assert.equal(
+      details.executionState,
+      "unknown",
+      "a pre-execution replay failure cannot erase the first attempt's ambiguity"
+    );
+  } finally {
+    await upstream.close();
+  }
 });
 
 test("UpstreamManager reconnects and retries a mutating call once after an invalid-session error (#55)", async () => {
@@ -3221,9 +3545,10 @@ test("UpstreamManager surfaces an actionable hint when a session error cannot be
   // the literal string matches none of the older session patterns.
   assert.equal(structured.error.details?.category, "session");
   assert.equal(structured.error.details?.retryable, true);
-  // A mutating tool is now retry-eligible for session errors despite failing the
-  // read-only safety gate, and the terminal error carries a re-auth hint.
-  assert.equal(structured.error.details?.retryAttempted, true);
+  // A mutating tool is retry-eligible for session errors despite failing the
+  // read-only safety gate, but this synthetic manager cannot reconnect, so it
+  // must not claim that a replay was actually attempted.
+  assert.equal(structured.error.details?.retryAttempted, undefined);
   assert.match(
     String(structured.error.details?.hint),
     /re-authentication|reconnected/i
@@ -3243,7 +3568,7 @@ test("fan-out meta-tools retry safe child calls once after reconnect", async () 
     harness.connectOne = async (name: string, config: ServerConfig) => {
       connectCount++;
       const currentConnect = connectCount;
-      const tool = mockTool("get_issue");
+      const tool = mockTool("get_issue", undefined, [], { readOnlyHint: true });
       return {
         name,
         config,
@@ -3342,7 +3667,7 @@ test("cached file-reference calls key on resolved file content", async () => {
       connectOne: (name: string, config: ServerConfig) => Promise<unknown>;
     };
     harness.connectOne = async (name: string, config: ServerConfig) => {
-      const tool = mockTool("get_issue");
+      const tool = mockTool("get_issue", undefined, [], { readOnlyHint: true });
       return {
         name,
         config,
@@ -3688,6 +4013,118 @@ test("UpstreamManager resolves $file references before forwarding tool arguments
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("listener-origin file references are disabled until roots are configured", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-listener-file-ref-off-"));
+  const filePath = join(dir, "body.md");
+  await writeFile(filePath, "private listener host content", "utf8");
+  const upstream = new UpstreamManager();
+
+  try {
+    await assert.rejects(
+      upstream.resolveToolArguments(
+        { body: { $file: filePath } },
+        undefined,
+        { transport: "mcp" }
+      ),
+      /disabled for listener calls.*fileReferenceRoots/i
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("file reference roots use real paths and reject symlink escapes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-listener-file-roots-"));
+  const allowedDir = join(dir, "allowed");
+  const outsideDir = join(dir, "outside");
+  await mkdir(allowedDir);
+  await mkdir(outsideDir);
+  const allowedPath = join(allowedDir, "inside.md");
+  const outsidePath = join(outsideDir, "outside.md");
+  const symlinkPath = join(allowedDir, "escape.md");
+  await writeFile(allowedPath, "inside", "utf8");
+  await writeFile(outsidePath, "outside", "utf8");
+  await symlink(outsidePath, symlinkPath);
+
+  const upstream = new UpstreamManager() as unknown as {
+    fileReferenceRoots: string[];
+    resolveToolArguments: UpstreamManager["resolveToolArguments"];
+  };
+  upstream.fileReferenceRoots = [await realpath(allowedDir)];
+
+  try {
+    const resolved = await upstream.resolveToolArguments(
+      { body: { $file: allowedPath } },
+      undefined,
+      { transport: "mcp" }
+    );
+    assert.deepEqual(resolved, { body: "inside" });
+
+    await assert.rejects(
+      upstream.resolveToolArguments(
+        { body: { $file: symlinkPath } },
+        undefined,
+        { transport: "mcp" }
+      ),
+      /outside configured fileReferenceRoots/i
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("file reference resolution caps files per call and rejects non-regular files", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-file-ref-budget-"));
+  const filePath = join(dir, "body.md");
+  await writeFile(filePath, "content", "utf8");
+  const upstream = new UpstreamManager();
+
+  try {
+    await assert.rejects(
+      upstream.resolveToolArguments({
+        files: Array.from({ length: 33 }, () => ({ $file: filePath })),
+      }),
+      /file reference count exceeds per-call limit \(32\)/i
+    );
+    await assert.rejects(
+      upstream.resolveToolArguments({ body: { $file: dir } }),
+      /must resolve to a regular file/i
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("file reference resolution bounds read concurrency and aggregate bytes", async () => {
+  const upstream = new UpstreamManager() as any;
+  let active = 0;
+  let maxActive = 0;
+  upstream.readFileReferenceBounded = async () => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    active -= 1;
+    return Buffer.from("x");
+  };
+
+  const resolved = await upstream.resolveToolArguments({
+    files: Array.from({ length: 12 }, (_, index) => ({ $file: `/virtual/${index}` })),
+  });
+  assert.equal((resolved.files as string[]).length, 12);
+  assert.equal(maxActive, 4);
+
+  upstream.readFileReferenceBounded = async () => Buffer.alloc(8_000_001);
+  await assert.rejects(
+    upstream.resolveToolArguments({
+      files: [
+        { $file: "/virtual/a", maxBytes: 9_000_000 },
+        { $file: "/virtual/b", maxBytes: 9_000_000 },
+      ],
+    }),
+    /file reference bytes exceed per-call limit \(16000000\)/i
+  );
 });
 
 test("UpstreamManager returns structured error when $file path is missing", async () => {
@@ -4206,6 +4643,31 @@ test("UpstreamManager reports argument resolution errors for invalid $jsonFile",
   }
 });
 
+test("stdio envRefs resolve at spawn time and override literal env values", async () => {
+  const envName = "CALLMUX_TEST_DOWNSTREAM_NAME";
+  const previous = process.env[envName];
+  process.env[envName] = "resolved-from-env-ref";
+  const upstream = new UpstreamManager();
+
+  try {
+    await upstream.connect({
+      fake: {
+        ...fakeMcpServer("literal-name"),
+        envRefs: { FAKE_MCP_NAME: `env:${envName}` },
+      },
+    });
+    const result = await upstream.callTool("get_item", { id: 1 });
+    const payload = JSON.parse((result.content[0] as { text: string }).text) as {
+      server: string;
+    };
+    assert.equal(payload.server, "resolved-from-env-ref");
+  } finally {
+    await upstream.close();
+    if (previous === undefined) delete process.env[envName];
+    else process.env[envName] = previous;
+  }
+});
+
 test("fake MCP fixture supports real stdio listTools and callTool", async () => {
   const upstream = new UpstreamManager();
 
@@ -4234,6 +4696,68 @@ test("fake MCP fixture supports real stdio listTools and callTool", async () => 
     assert.deepEqual(payload.arguments, { id: 42 });
     assert.equal(typeof payload.cwd, "string");
   } finally {
+    await upstream.close();
+  }
+});
+
+test("UpstreamManager resolves file envRefs at stdio spawn time", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-env-refs-"));
+  const secretPath = join(dir, "server-name");
+  await writeFile(secretPath, "from-file\n", "utf8");
+
+  const callServerName = async (config: StdioServerConfig): Promise<string> => {
+    const upstream = new UpstreamManager();
+    try {
+      await upstream.connect({ fake: config }, { strictStartup: true });
+      const result = await upstream.callTool("get_item", { id: 1 });
+      assert.equal(result.isError, undefined);
+      const payload = JSON.parse((result.content[0] as { text: string }).text) as {
+        server: string;
+      };
+      return payload.server;
+    } finally {
+      await upstream.close();
+    }
+  };
+
+  try {
+    assert.equal(
+      await callServerName({
+        ...fakeMcpServer("literal-name"),
+        envRefs: { FAKE_MCP_NAME: `file:${secretPath}` },
+      }),
+      "from-file"
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("UpstreamManager fails strict startup when an envRef is missing", async () => {
+  const envName = "CALLMUX_TEST_MISSING_ENV_REF";
+  const previousEnvValue = process.env[envName];
+  delete process.env[envName];
+  const upstream = new UpstreamManager();
+
+  try {
+    await assert.rejects(
+      upstream.connect(
+        {
+          fake: {
+            ...fakeMcpServer("literal-name"),
+            envRefs: { FAKE_MCP_NAME: `env:${envName}` },
+          },
+        },
+        { strictStartup: true }
+      ),
+      new RegExp(`missing or empty environment variable "${envName}"`)
+    );
+  } finally {
+    if (previousEnvValue === undefined) {
+      delete process.env[envName];
+    } else {
+      process.env[envName] = previousEnvValue;
+    }
     await upstream.close();
   }
 });
@@ -4401,6 +4925,68 @@ test("UpstreamManager retires session-scoped stdio clients when idle TTL is zero
       { cwd, sessionId: "session-1" }
     );
     assert.equal(result.isError, undefined);
+    assert.equal((upstream as any).sessionClients.size, 0);
+  } finally {
+    await upstream.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("scoped-client release never decrements or closes a replacement generation", () => {
+  const upstream = new UpstreamManager() as unknown as {
+    sessionClients: Map<string, unknown>;
+    sessionCwdIdleTtlMs: number;
+    releaseScopedClientLease: (lease: { key: string; scoped: any }) => void;
+  };
+  const key = "fake\0cwd:/workspace";
+  const oldScoped = {
+    client: {},
+    transport: {},
+    tools: new Set<string>(),
+    activeCalls: 1,
+    kind: "stdio-cwd",
+    server: "fake",
+    label: "/workspace",
+  };
+  const replacement = { ...oldScoped, activeCalls: 1 };
+  upstream.sessionCwdIdleTtlMs = 0;
+  upstream.sessionClients = new Map([[key, replacement]]);
+
+  upstream.releaseScopedClientLease({ key, scoped: oldScoped });
+
+  assert.equal(oldScoped.activeCalls, 0);
+  assert.equal(replacement.activeCalls, 1);
+  assert.equal(upstream.sessionClients.get(key), replacement);
+});
+
+test("close aborts and drains a pending session-scoped connection", async () => {
+  const upstream = new UpstreamManager();
+  const cwd = await mkdtemp(join(tmpdir(), "callmux-session-pending-close-"));
+
+  try {
+    await upstream.connect({
+      fake: fakeMcpServer("fake", {
+        FAKE_MCP_TOOLS: JSON.stringify([{ name: "get_item" }]),
+      }),
+    });
+    (upstream as any).serverConfigs.set("fake", fakeMcpServer("fake", {
+      FAKE_MCP_TOOLS: JSON.stringify([{ name: "get_item" }]),
+      FAKE_MCP_START_DELAY_MS: "500",
+    }));
+
+    const pendingCall = upstream.callTool(
+      "get_item",
+      { id: 1 },
+      undefined,
+      { cwd, sessionId: "pending-session", transport: "mcp" }
+    );
+    while ((upstream as any).sessionClientConnects.size === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    await upstream.close();
+    await pendingCall;
+    assert.equal((upstream as any).sessionClientConnects.size, 0);
     assert.equal((upstream as any).sessionClients.size, 0);
   } finally {
     await upstream.close();
@@ -4728,10 +5314,16 @@ function createMockUpstream(tools: Array<{ server: string; tool: Tool }>) {
   return upstream;
 }
 
-function mockTool(name: string, description?: string, inputFields: string[] = []): Tool {
+function mockTool(
+  name: string,
+  description?: string,
+  inputFields: string[] = [],
+  annotations?: Tool["annotations"]
+): Tool {
   return {
     name,
     ...(description ? { description } : {}),
+    ...(annotations ? { annotations } : {}),
     inputSchema: {
       type: "object" as const,
       ...(inputFields.length > 0
@@ -4821,7 +5413,7 @@ test("schema compression supports aggressive and disabled modes", () => {
 });
 
 test("handleDryRun previews resolved calls and cache-hit candidates", async () => {
-  const cache = new CallCache(60);
+  const cache = new CallCache(60, { allowTools: ["*"] });
   cache.set("github__get_issue", { id: 1 }, textResult("cached"), "github");
 
   const upstream = {
@@ -5300,10 +5892,13 @@ test("handleRecipeDryRun previews expanded recipe calls", async () => {
 
 test("handleCall passes through to upstream and caches result", async () => {
   const upstream = createMockUpstream([
-    { server: "github", tool: mockTool("get_issue") },
+    {
+      server: "github",
+      tool: mockTool("get_issue", undefined, [], { readOnlyHint: true }),
+    },
   ]);
 
-  const cache = new CallCache(60);
+  const cache = new CallCache(60, { allowTools: ["*"] });
   const result = await handleCall(upstream as never, cache, {
     tool: "get_issue",
     arguments: { id: 1 },
@@ -6480,6 +7075,7 @@ test("loadConfig parses startup timeout settings from file", async () => {
         servers: { github: { command: "node", args: ["server.js"], callTimeoutMs: 3000 } },
         connectTimeoutMs: 1000,
         callTimeoutMs: 2000,
+        reloadDrainTimeoutMs: 4000,
         sessionCwdIdleTtlSeconds: 300,
         strictStartup: true,
       })
@@ -6488,6 +7084,7 @@ test("loadConfig parses startup timeout settings from file", async () => {
     const config = await loadConfig(configPath);
     assert.equal(config.connectTimeoutMs, 1000);
     assert.equal(config.callTimeoutMs, 2000);
+    assert.equal(config.reloadDrainTimeoutMs, 4000);
     assert.equal((config.servers.github as StdioServerConfig).callTimeoutMs, 3000);
     assert.equal(config.sessionCwdIdleTtlSeconds, 300);
     assert.equal(config.strictStartup, true);
@@ -9194,14 +9791,21 @@ test("cache allowTools wildcard matches tool prefixes", () => {
   assert.equal(cache.get("create_issue", { title: "x" }), null);
 });
 
-test("cache denyTools wildcard blocks matching tools", () => {
+test("cache denyTools blocks annotated read-only tools while preserving other annotated reads", () => {
   const cache = new CallCache(60, { denyTools: ["get_secret*"] });
+  const readOnly = { readOnlyHint: true };
 
-  cache.set("get_issue", { id: 1 }, textResult("issue"));
-  cache.set("get_secret_key", { id: 1 }, textResult("secret"));
+  cache.set("get_issue", { id: 1 }, textResult("issue"), undefined, undefined, readOnly);
+  cache.set("get_secret_key", { id: 1 }, textResult("secret"), undefined, undefined, readOnly);
 
-  assert.deepEqual(cache.get("get_issue", { id: 1 }), textResult("issue"));
-  assert.equal(cache.get("get_secret_key", { id: 1 }), null);
+  assert.deepEqual(
+    cache.get("get_issue", { id: 1 }, undefined, undefined, readOnly),
+    textResult("issue")
+  );
+  assert.equal(
+    cache.get("get_secret_key", { id: 1 }, undefined, undefined, readOnly),
+    null
+  );
 });
 
 test("cache denyTools takes precedence over allowTools", () => {
@@ -9253,20 +9857,26 @@ test("per-server cache policy applies to qualified passthrough tools", () => {
   assert.equal(cache.size, 1);
 });
 
-test("cache skips mutating tools by default without policy", () => {
+test("cache treats unknown tools as unsafe and honors read-only annotations", () => {
   const cache = new CallCache(60);
+  const readOnly = { readOnlyHint: true };
 
   cache.set("create_issue", { title: "x" }, textResult("created"));
   cache.set("delete_issue", { id: 1 }, textResult("deleted"));
-  cache.set("get_issue", { id: 1 }, textResult("issue"));
+  cache.set("get_and_delete", { id: 1 }, textResult("deleted"));
+  cache.set("get_issue", { id: 1 }, textResult("issue"), undefined, undefined, readOnly);
 
   assert.equal(cache.get("create_issue", { title: "x" }), null);
   assert.equal(cache.get("delete_issue", { id: 1 }), null);
-  assert.deepEqual(cache.get("get_issue", { id: 1 }), textResult("issue"));
+  assert.equal(cache.get("get_and_delete", { id: 1 }), null);
+  assert.deepEqual(
+    cache.get("get_issue", { id: 1 }, undefined, undefined, readOnly),
+    textResult("issue")
+  );
 });
 
 test("cache does not store error results", () => {
-  const cache = new CallCache(60);
+  const cache = new CallCache(60, { allowTools: ["get_issue"] });
 
   cache.set("get_issue", { id: 1 }, {
     content: [{ type: "text", text: "not found" }],
@@ -9289,6 +9899,64 @@ test("cache wildcard matches qualified tool names across servers", () => {
 });
 
 // ── Result unwrapping ─────────────────────────────────────────────
+
+test("fan-out modes preserve image blocks, content annotations, and structured errors", async () => {
+  const imageResult: CallToolResult = {
+    content: [{
+      type: "image",
+      data: "aW1hZ2U=",
+      mimeType: "image/png",
+      annotations: { audience: ["assistant"], priority: 0.9 },
+    }],
+    _meta: { traceId: "trace-image" },
+  };
+  const structuredError: CallToolResult = {
+    content: [{ type: "text", text: "validation failed" }],
+    structuredContent: {
+      error: { code: "invalid_widget", details: { field: "name" } },
+    },
+    isError: true,
+  };
+  const upstream = {
+    async callTool(tool: string, args?: Record<string, unknown>) {
+      return tool === "image" || args?.kind === "image"
+        ? imageResult
+        : structuredError;
+    },
+    getServerConcurrency() { return undefined; },
+  };
+
+  const parallel = await handleParallel(upstream as never, new CallCache(0), {
+    calls: [{ tool: "image" }, { tool: "error" }],
+  }, 2);
+  const parallelResults = (parallel.structuredContent as {
+    results: Array<{ result: CallToolResult }>;
+  }).results;
+  assert.deepEqual(parallelResults[0].result, imageResult);
+  assert.deepEqual(parallelResults[1].result, structuredError);
+
+  const batch = await handleBatch(upstream as never, new CallCache(0), {
+    tool: "render",
+    items: [
+      { arguments: { kind: "image" } },
+      { arguments: { kind: "error" } },
+    ],
+  }, 2);
+  const batchResults = (batch.structuredContent as {
+    results: Array<{ result: CallToolResult }>;
+  }).results;
+  assert.deepEqual(batchResults[0].result, imageResult);
+  assert.deepEqual(batchResults[1].result, structuredError);
+
+  const pipeline = await handlePipeline(upstream as never, new CallCache(0), {
+    steps: [{ tool: "image" }, { tool: "error" }],
+  });
+  const pipelineSteps = (pipeline.structuredContent as {
+    steps: Array<{ result: CallToolResult }>;
+  }).steps;
+  assert.deepEqual(pipelineSteps[0].result, imageResult);
+  assert.deepEqual(pipelineSteps[1].result, structuredError);
+});
 
 test("batch unwraps JSON content from upstream results", async () => {
   const upstream = {
@@ -12287,6 +12955,8 @@ test("stdio bridge does not replay a tool call after a mid-flight transport drop
     assert.equal(result.isError, true);
     assert.equal(result.structuredContent.error.code, "bridge_upstream_unavailable");
     assert.equal(result.structuredContent.error.details.retryable, true);
+    assert.equal(result.structuredContent.error.details.safeToRetry, false);
+    assert.equal(result.structuredContent.error.details.executionState, "unknown");
   } finally {
     await bridgeClient.close().catch(() => undefined);
     await bridge.close();
@@ -12322,6 +12992,47 @@ test("stdio bridge replays a tool call after a pre-execution session error (N1)"
     assert.equal(callCount, 2);
     assert.equal(result.isError, undefined);
     assert.deepEqual(result.content, [{ type: "text", text: "ok" }]);
+  } finally {
+    await bridgeClient.close().catch(() => undefined);
+    await bridge.close();
+  }
+});
+
+test("stdio bridge preserves ambiguous execution state across an annotated replay", async () => {
+  const bridge = new CallmuxBridge({ url: "http://127.0.0.1:1/mcp", cwd: process.cwd() });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const bridgeClient = new Client(
+    { name: "bridge-ambiguous-replay", version: "1.0" },
+    { capabilities: {} }
+  );
+
+  const tool = mockTool("do_read", undefined, [], { readOnlyHint: true });
+  let callCount = 0;
+  const fakeClient = {
+    async listTools() { return { tools: [tool] }; },
+    async callTool() {
+      callCount++;
+      if (callCount === 1) throw new Error("socket hang up");
+      throw new Error("unknown session id");
+    },
+    async close() {},
+  };
+  (bridge as any).client = fakeClient;
+  (bridge as any).cachedTools = [tool];
+  (bridge as any).connectUpstream = async () => { (bridge as any).client = fakeClient; };
+
+  try {
+    await (bridge as any).server.connect(serverTransport);
+    await bridgeClient.connect(clientTransport);
+
+    const result = await bridgeClient.callTool({ name: "do_read", arguments: {} }) as any;
+    const details = result.structuredContent.error.details;
+
+    assert.equal(callCount, 2);
+    assert.equal(result.isError, true);
+    assert.equal(details.retryAttempted, true);
+    assert.equal(details.safeToRetry, true);
+    assert.equal(details.executionState, "unknown");
   } finally {
     await bridgeClient.close().catch(() => undefined);
     await bridge.close();
@@ -12960,7 +13671,11 @@ test("listener audit log redacts sensitive payload fields", async () => {
               tool: "github__get_issue",
               arguments: {
                 token: "super-secret-token",
-                nested: { api_key: "secret-value" },
+                accessToken: "camel-access-secret",
+                nested: {
+                  api_key: "secret-value",
+                  clientSecret: "camel-client-secret",
+                },
               },
             },
           },
@@ -12982,6 +13697,8 @@ test("listener audit log redacts sensitive payload fields", async () => {
   assert.ok(serialized.includes("[redacted]"));
   assert.ok(!serialized.includes("super-secret-token"));
   assert.ok(!serialized.includes("secret-value"));
+  assert.ok(!serialized.includes("camel-access-secret"));
+  assert.ok(!serialized.includes("camel-client-secret"));
 });
 
 test("listener enforces global abuse rate limit", async () => {

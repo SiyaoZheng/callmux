@@ -135,6 +135,7 @@ export class CallmuxProxy {
         connectTimeoutMs: this.connectTimeoutMs,
         reconnectPolicy: this.config.reconnectPolicy,
         sessionCwdIdleTtlSeconds: this.config.sessionCwdIdleTtlSeconds,
+        fileReferenceRoots: this.config.fileReferenceRoots,
         strictStartup: this.config.strictStartup ?? false,
       }
     );
@@ -379,7 +380,13 @@ export class CallmuxProxy {
     const cacheScope = typeof maybeScoped.cacheScopeForCall === "function"
       ? maybeScoped.cacheScopeForCall(name, cacheServer)
       : undefined;
-    const cached = this.cache.get(name, cacheArgs, cacheServer, cacheScope);
+    const cached = this.cache.get(
+      name,
+      cacheArgs,
+      cacheServer,
+      cacheScope,
+      prepared?.annotations
+    );
     if (cached) return this.shieldResult(target, cached);
 
     // When we have a prepared resolution, reuse it via callPrepared so we don't
@@ -388,12 +395,16 @@ export class CallmuxProxy {
     // upstream lacks prepareToolCall.
     const result = prepared
       ? await this.upstream.callPrepared(prepared, {
-          retryOnReconnect: this.cache.isSafeToRetry(name, cacheServer),
+          retryOnReconnect: this.cache.isSafeToRetry(
+            name,
+            cacheServer,
+            prepared.annotations
+          ),
         })
       : await this.upstream.callTool(name, cacheArgs, cacheServer, {
           retryOnReconnect: this.cache.isSafeToRetry(name, cacheServer),
         });
-    this.cache.set(name, cacheArgs, result, cacheServer, cacheScope);
+    this.cache.set(name, cacheArgs, result, cacheServer, cacheScope, prepared?.annotations);
     return this.shieldResult(target, result);
   }
 

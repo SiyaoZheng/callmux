@@ -1,9 +1,8 @@
 import type { AuditLogConfig } from "./types.js";
 import type { AuthorizationPrincipal } from "./authorization.js";
+import { isSecretKey } from "./redact.js";
 
 const DEFAULT_MAX_PAYLOAD_CHARS = 4096;
-const SECRET_KEY_PATTERN =
-  /(?:^|[-_])(token|secret|password|passwd|api[-_]?key|authorization|credential|auth|cookie)(?:$|[-_])/i;
 
 interface HttpAuditEvent {
   event: "http_request";
@@ -37,7 +36,7 @@ function normalizeConfig(config: AuditLogConfig | undefined): Required<AuditLogC
 }
 
 function shouldRedactKey(key: string, extraPatterns: RegExp[]): boolean {
-  if (SECRET_KEY_PATTERN.test(key)) return true;
+  if (isSecretKey(key)) return true;
   return extraPatterns.some((pattern) => pattern.test(key));
 }
 

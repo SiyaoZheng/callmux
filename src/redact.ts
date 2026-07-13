@@ -1,8 +1,14 @@
 const SECRET_KEY_PATTERN =
   /(?:^|[-_])(token|secret|password|passwd|api[-_]?key|authorization|credential|auth|cookie)(?:$|[-_])/i;
 
-function isSecretKey(value: string): boolean {
-  return SECRET_KEY_PATTERN.test(value);
+function normalizeKeyBoundaries(value: string): string {
+  return value
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2");
+}
+
+export function isSecretKey(value: string): boolean {
+  return SECRET_KEY_PATTERN.test(normalizeKeyBoundaries(value));
 }
 
 function redactInlineAssignment(value: string): string {

@@ -1,4 +1,5 @@
-import { readFile, access, mkdir, writeFile } from "node:fs/promises";
+import { readFile, access, chmod, mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { resolve, join, dirname, isAbsolute } from "node:path";
 import { homedir } from "node:os";
 import type {
@@ -128,6 +129,43 @@ function parseStringRecord(
   }
 
   return Object.fromEntries(entries) as Record<string, string>;
+}
+
+function parseEnvRefRecord(
+  value: unknown,
+  optionName: string,
+  configBaseDir?: string
+): Record<string, string> | undefined {
+  const refs = parseStringRecord(value, optionName);
+  if (!refs) return undefined;
+
+  return Object.fromEntries(
+    Object.entries(refs).map(([key, rawRef]) => {
+      const ref = rawRef.trim();
+      if (ref.startsWith("env:")) {
+        const envName = ref.slice(4).trim();
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(envName)) {
+          throw new Error(
+            `${optionName}.${key} env reference must name a valid environment variable`
+          );
+        }
+        return [key, `env:${envName}`];
+      }
+      if (ref.startsWith("file:")) {
+        const filePath = ref.slice(5).trim();
+        if (filePath.length === 0) {
+          throw new Error(`${optionName}.${key} file reference must include a path`);
+        }
+        return [
+          key,
+          `file:${resolve(configBaseDir ?? process.cwd(), filePath)}`,
+        ];
+      }
+      throw new Error(
+        `${optionName}.${key} must use env:<NAME> or file:<PATH>`
+      );
+    })
+  );
 }
 
 function parseHeaderNames(
@@ -1191,7 +1229,11 @@ async function parseAuthConfig(
   throw new Error(`${optionName}.mode must be "bearer" or "oidc_jwt"`);
 }
 
-function parseServerConfig(value: unknown, serverName: string): ServerConfig {
+function parseServerConfig(
+  value: unknown,
+  serverName: string,
+  configBaseDir?: string
+): ServerConfig {
   if (!isRecord(value)) {
     throw new Error(`servers.${serverName} must be an object`);
   }
@@ -1277,6 +1319,11 @@ function parseServerConfig(value: unknown, serverName: string): ServerConfig {
 
   const args = parseStringArray(value.args, `servers.${serverName}.args`);
   const env = parseStringRecord(value.env, `servers.${serverName}.env`);
+  const envRefs = parseEnvRefRecord(
+    value.envRefs,
+    `servers.${serverName}.envRefs`,
+    configBaseDir
+  );
   const cwd =
     value.cwd === undefined
       ? undefined
@@ -1305,6 +1352,7 @@ function parseServerConfig(value: unknown, serverName: string): ServerConfig {
     command: value.command as string,
     ...(args ? { args } : {}),
     ...(env ? { env } : {}),
+    ...(envRefs ? { envRefs } : {}),
     ...(cwd ? { cwd } : {}),
     ...(cwdMode ? { cwdMode } : {}),
     ...(requireSessionCwd ? { requireSessionCwd } : {}),
@@ -1314,14 +1362,18 @@ function parseServerConfig(value: unknown, serverName: string): ServerConfig {
 
 function parseServers(
   value: unknown,
-  optionName: string
+  optionName: string,
+  configBaseDir?: string
 ): Record<string, ServerConfig> {
   if (!isRecord(value)) {
     throw new Error(`${optionName} must be an object`);
   }
 
   return Object.fromEntries(
-    Object.entries(value).map(([name, config]) => [name, parseServerConfig(config, name)])
+    Object.entries(value).map(([name, config]) => [
+      name,
+      parseServerConfig(config, name, configBaseDir),
+    ])
   );
 }
 
@@ -1377,6 +1429,16 @@ async function parseConfigDocument(
       "reconnectPolicy"
     );
     const recipes = parseRecipesConfig(parsed.recipes, "recipes");
+    const fileReferenceRoots = parseStringArray(
+      parsed.fileReferenceRoots,
+      "fileReferenceRoots"
+    )?.map((root, index) => {
+      const trimmed = root.trim();
+      if (trimmed.length === 0) {
+        throw new Error(`fileReferenceRoots[${index}] must be a non-empty path`);
+      }
+      return resolve(configBaseDir ?? process.cwd(), trimmed);
+    });
     return {
       cacheTtlSeconds:
         parsed.cacheTtlSeconds === undefined
@@ -1405,6 +1467,14 @@ async function parseConfigDocument(
             ),
           }
         : {}),
+      ...(parsed.reloadDrainTimeoutMs !== undefined
+        ? {
+            reloadDrainTimeoutMs: parsePositiveInteger(
+              parsed.reloadDrainTimeoutMs,
+              "reloadDrainTimeoutMs"
+            ),
+          }
+        : {}),
       ...(reconnectPolicy ? { reconnectPolicy } : {}),
       ...(parsed.sessionCwdIdleTtlSeconds !== undefined
         ? {
@@ -1413,6 +1483,9 @@ async function parseConfigDocument(
               "sessionCwdIdleTtlSeconds"
             ),
           }
+        : {}),
+      ...(fileReferenceRoots
+        ? { fileReferenceRoots: Array.from(new Set(fileReferenceRoots)) }
         : {}),
       ...(parsed.strictStartup !== undefined
         ? {
@@ -1506,7 +1579,7 @@ async function parseConfigDocument(
     const sharedFields = await parseSharedFields();
     return {
       config: {
-        servers: parseServers(parsed.servers, "servers"),
+        servers: parseServers(parsed.servers, "servers", configBaseDir),
         ...sharedFields,
       },
       format: "native",
@@ -1517,7 +1590,7 @@ async function parseConfigDocument(
     const sharedFields = await parseSharedFields();
     return {
       config: {
-        servers: parseServers(parsed.mcpServers, "mcpServers"),
+        servers: parseServers(parsed.mcpServers, "mcpServers", configBaseDir),
         ...sharedFields,
       },
       format: "mcpCompatible",
@@ -1615,18 +1688,65 @@ export async function loadManagedConfig(
 export const CONFIG_SCHEMA_URL =
   "https://raw.githubusercontent.com/edimuj/callmux/main/schema.json";
 
+const PRIVATE_FILE_MODE = 0o600;
+
+async function atomicWritePrivateFile(
+  filePath: string,
+  content: string | Buffer
+): Promise<void> {
+  const tempPath = `${filePath}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    await writeFile(tempPath, content, {
+      ...(typeof content === "string" ? { encoding: "utf-8" as const } : {}),
+      flag: "wx",
+      mode: PRIVATE_FILE_MODE,
+    });
+    // A pre-existing temp path is impossible with wx, but chmod also protects
+    // against platforms or umasks that do not honor the requested creation mode.
+    await chmod(tempPath, PRIVATE_FILE_MODE);
+    await rename(tempPath, filePath);
+    await chmod(filePath, PRIVATE_FILE_MODE);
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function saveManagedSecret(
+  secretPath: string,
+  value: string
+): Promise<void> {
+  const secret = value.trim();
+  if (secret.length === 0) {
+    throw new Error("Refusing to write an empty managed secret");
+  }
+  const resolvedPath = resolve(secretPath);
+  await mkdir(dirname(resolvedPath), { recursive: true, mode: 0o700 });
+  await atomicWritePrivateFile(resolvedPath, `${secret}\n`);
+}
+
 export async function saveManagedConfig(
   configPath: string,
   config: CallmuxConfig
 ): Promise<void> {
   const resolvedPath = resolve(configPath);
-  await mkdir(dirname(resolvedPath), { recursive: true });
+  await mkdir(dirname(resolvedPath), { recursive: true, mode: 0o700 });
   const withSchema = { $schema: CONFIG_SCHEMA_URL, ...config };
-  await writeFile(
-    resolvedPath,
-    `${JSON.stringify(withSchema, null, 2)}\n`,
-    "utf-8"
-  );
+  const content = `${JSON.stringify(withSchema, null, 2)}\n`;
+
+  let previous: Buffer | undefined;
+  try {
+    previous = await readFile(resolvedPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+
+  // Keep one stable, private last-known-good copy. Write it atomically before
+  // replacing the live config so a failed save never destroys the only copy.
+  if (previous !== undefined) {
+    await atomicWritePrivateFile(`${resolvedPath}.bak`, previous);
+  }
+  await atomicWritePrivateFile(resolvedPath, content);
 }
 
 /**

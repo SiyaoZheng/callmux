@@ -3,8 +3,7 @@ import { CallmuxListener } from "./listener.js";
 import { CallmuxProxy } from "./proxy.js";
 import type { CallmuxConfig, ListenerRuntimeDiagnostics, ServerInfo } from "./types.js";
 import type { ManagementOverlay } from "./management.js";
-
-const STALE_PROXY_CLOSE_DELAY_MS = 30_000;
+import { drainAndCloseProxy } from "./reload-drain.js";
 
 export type ListenerLifecycleState =
   | "starting"
@@ -57,16 +56,6 @@ export interface ProgrammaticListener {
   stop(): Promise<void>;
 }
 
-function closeStaleProxyLater(proxy: CallmuxProxy): void {
-  const timer = setTimeout(() => {
-    proxy.close().catch((error) => {
-      const message = error instanceof Error ? error.message : String(error);
-      process.stderr.write(`[callmux] Stale upstream close failed: ${message}\n`);
-    });
-  }, STALE_PROXY_CLOSE_DELAY_MS);
-  timer.unref?.();
-}
-
 function listenerPort(listener: CallmuxListener, configuredPort: number): number {
   const address = listener.address();
   if (address && typeof address === "object") return address.port;
@@ -107,6 +96,7 @@ class ProgrammaticCallmuxListener extends EventEmitter implements ProgrammaticLi
   private startedAt: string | undefined;
   private stoppedAt: string | undefined;
   private currentReason: string | undefined;
+  private staleProxyClosures = new Map<Promise<void>, AbortController>();
 
   readonly listener: CallmuxListener;
 
@@ -184,10 +174,11 @@ class ProgrammaticCallmuxListener extends EventEmitter implements ProgrammaticLi
         managementOverlay: options?.managementOverlay,
       });
       this.listener.recordConfigReload({ ok: true });
+      const previousConfig = this.config;
       this.proxy = nextProxy;
       this.config = config;
       nextProxy = undefined;
-      closeStaleProxyLater(previousProxy);
+      this.retireProxy(previousProxy, previousConfig);
       this.setState(
         this.proxy.getUpstream().getFailedServers().length > 0 ? "degraded" : "running",
         options?.reason
@@ -204,9 +195,11 @@ class ProgrammaticCallmuxListener extends EventEmitter implements ProgrammaticLi
   }
 
   async stop(): Promise<void> {
+    for (const controller of this.staleProxyClosures.values()) controller.abort();
     await Promise.allSettled([
       this.listener.close(),
       this.proxy.close(),
+      ...this.staleProxyClosures.keys(),
     ]);
     this.stoppedAt = new Date().toISOString();
     this.setState("stopped");
@@ -216,6 +209,20 @@ class ProgrammaticCallmuxListener extends EventEmitter implements ProgrammaticLi
     this.state = state;
     this.currentReason = reason;
     this.emit("status", this.health());
+  }
+
+  private retireProxy(proxy: CallmuxProxy, config: CallmuxConfig): void {
+    const controller = new AbortController();
+    const closure = drainAndCloseProxy(
+      this.listener,
+      proxy,
+      config,
+      (message) => process.stderr.write(`[callmux] ${message}\n`),
+      controller.signal
+    ).finally(() => {
+      this.staleProxyClosures.delete(closure);
+    });
+    this.staleProxyClosures.set(closure, controller);
   }
 }
 

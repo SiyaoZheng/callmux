@@ -246,6 +246,8 @@ export class CallmuxListener {
   private metricsFlushTimer: ReturnType<typeof setInterval> | undefined;
   private metricsLoaded = false;
   private activeToolCalls = new Map<string, ActiveToolCallEntry>();
+  private activeCallsByUpstream = new Map<UpstreamManager, number>();
+  private upstreamDrainWaiters = new Map<UpstreamManager, Set<() => void>>();
   private unsubscribeToolSuiteChanges: (() => void) | undefined;
   private lastReloadAt: string | undefined;
   private lastReloadError: string | undefined;
@@ -420,6 +422,45 @@ export class CallmuxListener {
         return counts ? { unresolvedSessionCwd: counts } : {};
       })(),
     };
+  }
+
+  /**
+   * Wait until requests that captured a specific upstream generation have
+   * finished. New calls after applyReloadedState() capture the replacement,
+   * so the old generation can drain without blocking fresh traffic.
+   */
+  async waitForUpstreamDrain(
+    upstream: UpstreamManager,
+    timeoutMs: number,
+    signal?: AbortSignal
+  ): Promise<boolean> {
+    if ((this.activeCallsByUpstream.get(upstream) ?? 0) === 0) return true;
+    if (signal?.aborted) return false;
+
+    return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (drained: boolean) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        signal?.removeEventListener("abort", onAborted);
+        const waiters = this.upstreamDrainWaiters.get(upstream);
+        waiters?.delete(onDrained);
+        if (waiters?.size === 0) this.upstreamDrainWaiters.delete(upstream);
+        resolve(drained);
+      };
+      const onDrained = () => finish(true);
+      const onAborted = () => finish(false);
+      const waiters = this.upstreamDrainWaiters.get(upstream) ?? new Set<() => void>();
+      waiters.add(onDrained);
+      this.upstreamDrainWaiters.set(upstream, waiters);
+      signal?.addEventListener("abort", onAborted, { once: true });
+      timer = setTimeout(() => finish(false), timeoutMs);
+
+      // Avoid missing a completion between the initial check and registration.
+      if ((this.activeCallsByUpstream.get(upstream) ?? 0) === 0) onDrained();
+    });
   }
 
   async start(): Promise<void> {
@@ -1735,6 +1776,7 @@ export class CallmuxListener {
         extra.sessionId,
         this.toolCallTimeoutBudgetMs(name, args)
       );
+      const releaseUpstream = this.retainUpstream(upstream);
       try {
         const authz = this.authorizeToolCall(name, args, principal);
         if (!authz.allowed) {
@@ -1913,13 +1955,21 @@ export class CallmuxListener {
           break;
         default: {
           target = this.responseShieldTarget(upstream, name, args);
-          const prepared = await upstream.prepareToolCall(name, args);
+          const prepared = await upstream.prepareToolCall(name, args, undefined, {
+            context: toolContext,
+          });
           if ("error" in prepared) {
             result = prepared.error;
             break;
           }
           const cacheScope = upstream.cacheScopeForCall(name, prepared.server, toolContext);
-          const cached = cache.get(name, prepared.resolvedArguments, prepared.server, cacheScope);
+          const cached = cache.get(
+            name,
+            prepared.resolvedArguments,
+            prepared.server,
+            cacheScope,
+            prepared.annotations
+          );
           if (cached) {
             cacheHit = true;
             result = this.shieldResult(target, cached, undefined, responseOwner);
@@ -1933,9 +1983,20 @@ export class CallmuxListener {
             // the executed arguments (pass 2).
             const upstreamResult = await upstream.callPrepared(prepared, {
               ...toolContext,
-              retryOnReconnect: cache.isSafeToRetry(name, prepared.server),
+              retryOnReconnect: cache.isSafeToRetry(
+                name,
+                prepared.server,
+                prepared.annotations
+              ),
             });
-            cache.set(name, prepared.resolvedArguments, upstreamResult, prepared.server, cacheScope);
+            cache.set(
+              name,
+              prepared.resolvedArguments,
+              upstreamResult,
+              prepared.server,
+              cacheScope,
+              prepared.annotations
+            );
             result = this.shieldResult(target, upstreamResult, undefined, responseOwner);
           }
           break;
@@ -1949,6 +2010,7 @@ export class CallmuxListener {
       return result;
       } finally {
         this.completeActiveToolCall(active.id);
+        releaseUpstream();
       }
     });
 
@@ -2214,6 +2276,27 @@ export class CallmuxListener {
     const entry = this.activeToolCalls.get(id);
     if (entry?.timeoutOverrunTimer) clearTimeout(entry.timeoutOverrunTimer);
     this.activeToolCalls.delete(id);
+  }
+
+  private retainUpstream(upstream: UpstreamManager): () => void {
+    this.activeCallsByUpstream.set(
+      upstream,
+      (this.activeCallsByUpstream.get(upstream) ?? 0) + 1
+    );
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (this.activeCallsByUpstream.get(upstream) ?? 1) - 1;
+      if (remaining > 0) {
+        this.activeCallsByUpstream.set(upstream, remaining);
+        return;
+      }
+      this.activeCallsByUpstream.delete(upstream);
+      const waiters = this.upstreamDrainWaiters.get(upstream);
+      this.upstreamDrainWaiters.delete(upstream);
+      for (const waiter of waiters ?? []) waiter();
+    };
   }
 
   private scheduleActiveToolCallTimeoutOverrun(id: string): void {

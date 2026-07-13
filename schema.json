@@ -70,12 +70,22 @@
       "default": 180000,
       "description": "Timeout in milliseconds for downstream tool calls"
     },
+    "reloadDrainTimeoutMs": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Maximum time to drain calls from an old upstream generation after hot reload (default: longest configured call timeout plus 1000ms)"
+    },
     "reconnectPolicy": { "$ref": "#/$defs/reconnectPolicy" },
     "sessionCwdIdleTtlSeconds": {
       "type": "integer",
       "minimum": 0,
       "default": 600,
       "description": "Idle TTL in seconds for listener-mode session cwd stdio clients (0 = close after each call)"
+    },
+    "fileReferenceRoots": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Local filesystem roots that listener-origin $file/$jsonFile/$yamlFile references may read. Relative paths resolve beside the config file; omit to disable file-backed references for listener callers."
     },
     "strictStartup": {
       "type": "boolean",
@@ -163,7 +173,15 @@
         "env": {
           "type": "object",
           "additionalProperties": { "type": "string" },
-          "description": "Environment variables for the server process"
+          "description": "Literal environment variables for the server process. Prefer envRefs for secrets."
+        },
+        "envRefs": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^(env:[A-Za-z_][A-Za-z0-9_]*|file:.+)$"
+          },
+          "description": "Secret environment values resolved at process start from env:NAME or file:PATH. Values override env entries with the same key."
         },
         "cwd": {
           "type": "string",

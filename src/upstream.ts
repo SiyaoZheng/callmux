@@ -4,8 +4,9 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import type { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
-import { isAbsolute } from "node:path";
+import { constants as fsConstants } from "node:fs";
+import { open, realpath } from "node:fs/promises";
+import { isAbsolute, relative, resolve as resolvePath } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { Tool, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -30,6 +31,10 @@ const DEFAULT_CLOSE_TIMEOUT_MS = 1_000;
 const DEFAULT_SESSION_CWD_IDLE_TTL_SECONDS = 600;
 const DEFAULT_FILE_REF_MAX_BYTES = 1_000_000; // 1 MB
 const HARD_FILE_REF_MAX_BYTES = 10_000_000; // 10 MB
+const MAX_FILE_REFS_PER_CALL = 32;
+const MAX_FILE_REF_TOTAL_BYTES_PER_CALL = 16_000_000; // 16 MB
+const MAX_FILE_REF_READ_CONCURRENCY = 4;
+const MAX_ENV_REF_FILE_BYTES = 64 * 1024;
 // Reference keys and their permitted companion keys. Used both to resolve refs
 // and to detect a ref accidentally passed as a JSON-encoded string.
 const FILE_REF_ALLOWED_KEYS: Record<string, ReadonlySet<string>> = {
@@ -92,6 +97,7 @@ interface UpstreamConnectOptions {
   connectTimeoutMs?: number;
   reconnectPolicy?: ReconnectPolicyConfig;
   sessionCwdIdleTtlSeconds?: number;
+  fileReferenceRoots?: string[];
   strictStartup?: boolean;
 }
 
@@ -100,6 +106,8 @@ export interface PreparedToolCall {
   server: string;
   actualName: string;
   resolvedArguments?: Record<string, unknown>;
+  /** MCP-declared safety hints used for cache and reconnect decisions. */
+  annotations?: Tool["annotations"];
   /**
    * Argument paths the MCP client would JSON-stringify on the wire because the
    * target field is string-typed but received a structured value. Only set when
@@ -121,6 +129,8 @@ interface PrepareToolCallOptions {
    * /$text references during resolution. See resolveToolArguments.
    */
   opaqueArgumentKeys?: ReadonlySet<string>;
+  /** Origin and session information used to enforce listener file-reference policy. */
+  context?: ToolCallContext;
 }
 
 interface ScopedClient {
@@ -133,6 +143,29 @@ interface ScopedClient {
   label: string;
   cwd?: string;
   idleTimer?: ReturnType<typeof setTimeout>;
+}
+
+interface ScopedClientLease {
+  key: string;
+  scoped: ScopedClient;
+}
+
+interface PendingScopedClient {
+  promise: Promise<ScopedClient>;
+  close: () => Promise<void>;
+}
+
+interface ClientSelection {
+  client: Client;
+  scopedLease?: ScopedClientLease;
+}
+
+interface FileReferenceResolutionState {
+  listenerOrigin: boolean;
+  opaqueArgumentKeys?: ReadonlySet<string>;
+  fileTasks: Array<() => Promise<void>>;
+  referenceCount: number;
+  totalBytes: number;
 }
 
 function errorMessage(error: unknown): string {
@@ -303,6 +336,27 @@ function isRetryableToolCallFailure(category: ToolCallFailureCategory): boolean 
  */
 function isPreExecutionFailure(category: ToolCallFailureCategory): boolean {
   return category === "session";
+}
+
+function annotationsAllowReplay(annotations?: Tool["annotations"]): boolean {
+  return (
+    annotations?.readOnlyHint === true ||
+    annotations?.idempotentHint === true
+  );
+}
+
+function executionStateForFailure(
+  category: ToolCallFailureCategory
+): "not_started" | "unknown" {
+  return isPreExecutionFailure(category) ? "not_started" : "unknown";
+}
+
+function combineExecutionStates(
+  ...states: Array<"not_started" | "unknown">
+): "not_started" | "unknown" {
+  return states.every((state) => state === "not_started")
+    ? "not_started"
+    : "unknown";
 }
 
 const SESSION_REAUTH_HINT =
@@ -651,7 +705,7 @@ export class UpstreamManager {
   private clients = new Map<string, Client>();
   private transports = new Map<string, Transport>();
   private sessionClients = new Map<string, ScopedClient>();
-  private sessionClientConnects = new Map<string, Promise<ScopedClient>>();
+  private sessionClientConnects = new Map<string, PendingScopedClient>();
   private reconnects = new Map<string, Promise<boolean>>();
   private reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private reconnectAttempts = new Map<string, number>();
@@ -685,6 +739,7 @@ export class UpstreamManager {
     fastFailDuringBackoff: true,
   };
   private sessionCwdIdleTtlMs = DEFAULT_SESSION_CWD_IDLE_TTL_SECONDS * 1000;
+  private fileReferenceRoots: string[] = [];
   private unresolvedSessionCwdCounts = new Map<string, number>();
   private unresolvedSessionCwdWarned = new Set<string>();
   private closing = false;
@@ -753,6 +808,7 @@ export class UpstreamManager {
     for (const scoped of this.sessionClients.values()) {
       if (scoped.idleTimer) clearTimeout(scoped.idleTimer);
     }
+    const closePending = this.closePendingSessionClientConnects();
     await Promise.all(
       [
         ...Array.from(this.clients.entries()).map(([name, client]) =>
@@ -761,6 +817,7 @@ export class UpstreamManager {
         ...Array.from(this.sessionClients.values()).map(({ client, transport }) =>
           this.closeQuietly(client, transport)
         ),
+        closePending,
       ]
     );
     this.clients.clear();
@@ -779,6 +836,7 @@ export class UpstreamManager {
     this.removedTools.clear();
     this.serverInfoMap.clear();
     this.serverConcurrency.clear();
+    this.fileReferenceRoots = [];
     this.closing = false;
   }
 
@@ -810,6 +868,21 @@ export class UpstreamManager {
       }
     }
     await this.forceCloseStdioChild(stdioChild);
+  }
+
+  private async closePendingSessionClientConnects(): Promise<void> {
+    const pending = Array.from(new Set(this.sessionClientConnects.values()));
+    this.sessionClientConnects.clear();
+    await Promise.all(
+      pending.map(async (entry) => {
+        await entry.close().catch(() => undefined);
+        await withTimeout(
+          entry.promise.then(() => undefined, () => undefined),
+          DEFAULT_CLOSE_TIMEOUT_MS,
+          "pending session client close"
+        ).catch(() => undefined);
+      })
+    );
   }
 
   private stdioChildProcess(transport?: Transport): ChildProcess | undefined {
@@ -855,11 +928,53 @@ export class UpstreamManager {
     if (timer) clearTimeout(timer);
   }
 
-  private createStdioTransport(config: StdioServerConfig, cwd?: string): Transport {
+  private async resolveStdioEnvironment(
+    config: StdioServerConfig
+  ): Promise<Record<string, string>> {
+    const env = { ...process.env, ...config.env } as Record<string, string>;
+    for (const [key, ref] of Object.entries(config.envRefs ?? {})) {
+      if (ref.startsWith("env:")) {
+        const name = ref.slice("env:".length);
+        const value = process.env[name];
+        if (value === undefined || value.length === 0) {
+          throw new Error(
+            `stdio envRefs.${key} references missing or empty environment variable "${name}"`
+          );
+        }
+        env[key] = value;
+        continue;
+      }
+      if (ref.startsWith("file:")) {
+        const filePath = ref.slice("file:".length);
+        const canonical = await realpath(resolvePath(filePath));
+        const bytes = await this.readOpenedRegularFileBounded(
+          canonical,
+          MAX_ENV_REF_FILE_BYTES,
+          `stdio envRefs.${key}`,
+          filePath
+        );
+        const value = bytes.toString("utf8").replace(/\r?\n$/, "");
+        if (value.length === 0) {
+          throw new Error(`stdio envRefs.${key} resolved to an empty file`);
+        }
+        env[key] = value;
+        continue;
+      }
+      // Config loading validates refs, but programmatic callers can construct a
+      // StdioServerConfig directly. Keep the runtime boundary fail-closed too.
+      throw new Error(`stdio envRefs.${key} must use env:<NAME> or file:<PATH>`);
+    }
+    return env;
+  }
+
+  private async createStdioTransport(
+    config: StdioServerConfig,
+    cwd?: string
+  ): Promise<Transport> {
     return new StdioClientTransport({
       command: config.command,
       args: config.args,
-      env: { ...process.env, ...config.env } as Record<string, string>,
+      env: await this.resolveStdioEnvironment(config),
       cwd: cwd ?? config.cwd,
       stderr: "inherit",
     });
@@ -907,11 +1022,13 @@ export class UpstreamManager {
     name: string,
     config: HttpServerConfig,
     connectTimeoutMs: number,
-    forwardedHeaders?: Record<string, string>
+    forwardedHeaders?: Record<string, string>,
+    onAttempt?: (client: Client, transport: Transport) => void
   ): Promise<{ transport: Transport; client: Client; resolvedTransport: "streamable-http" | "sse" }> {
     if (config.transport) {
       const transport = this.createHttpTransport(config, forwardedHeaders);
       const client = new Client({ name: "callmux", version: "0.2.0" }, { capabilities: {} });
+      onAttempt?.(client, transport);
       await withTimeout(
         client.connect(transport),
         connectTimeoutMs,
@@ -930,6 +1047,7 @@ export class UpstreamManager {
         headers ? { requestInit: { headers } } : undefined
       );
       client = new Client({ name: "callmux", version: "0.2.0" }, { capabilities: {} });
+      onAttempt?.(client, transport);
       await withTimeout(
         client.connect(transport),
         connectTimeoutMs,
@@ -944,6 +1062,7 @@ export class UpstreamManager {
         headers ? { requestInit: { headers } } : undefined
       );
       const sseClient = new Client({ name: "callmux", version: "0.2.0" }, { capabilities: {} });
+      onAttempt?.(sseClient, sseTransport);
       await withTimeout(
         sseClient.connect(sseTransport),
         connectTimeoutMs,
@@ -969,7 +1088,7 @@ export class UpstreamManager {
         client = result.client;
         resolvedTransport = result.resolvedTransport;
       } else {
-        transport = this.createStdioTransport(config);
+        transport = await this.createStdioTransport(config);
         client = new Client({ name: "callmux", version: "0.2.0" }, { capabilities: {} });
         await withTimeout(
           client.connect(transport),
@@ -1438,6 +1557,8 @@ export class UpstreamManager {
         server,
         tool: toolName,
         retryable: true,
+        safeToRetry: true,
+        executionState: "not_started",
         ...(info?.state ? { state: info.state } : {}),
         ...(info?.lastError ?? info?.error ? { lastError: info.lastError ?? info.error } : {}),
         ...(info?.lastFailureAt ? { lastFailureAt: info.lastFailureAt } : {}),
@@ -1455,6 +1576,12 @@ export class UpstreamManager {
 
   private sessionClientKey(server: string, scope: string): string {
     return `${server}\0${scope}`;
+  }
+
+  private deleteSessionClientIfCurrent(key: string, scoped: ScopedClient): boolean {
+    if (this.sessionClients.get(key) !== scoped) return false;
+    this.sessionClients.delete(key);
+    return true;
   }
 
   private forwardedHeaderFingerprint(headers: Record<string, string>): string {
@@ -1625,7 +1752,7 @@ export class UpstreamManager {
     scoped.idleTimer = setTimeout(() => {
       if (this.sessionClients.get(key) !== scoped) return;
       if (scoped.activeCalls > 0) return;
-      this.sessionClients.delete(key);
+      this.deleteSessionClientIfCurrent(key, scoped);
       void this.closeQuietly(scoped.client, scoped.transport);
       process.stderr.write(`[callmux] Session-scoped server "${server}" idle timeout (${label})\n`);
     }, this.sessionCwdIdleTtlMs);
@@ -1638,7 +1765,7 @@ export class UpstreamManager {
   ): void {
     if (this.sessionCwdIdleTtlMs !== 0) return;
     if (scoped.activeCalls > 0) return;
-    this.sessionClients.delete(key);
+    if (!this.deleteSessionClientIfCurrent(key, scoped)) return;
     void this.closeQuietly(scoped.client, scoped.transport);
   }
 
@@ -1652,6 +1779,19 @@ export class UpstreamManager {
 
   private releaseSessionClient(scoped: ScopedClient): void {
     scoped.activeCalls = Math.max(0, scoped.activeCalls - 1);
+  }
+
+  private releaseScopedClientLease(lease: ScopedClientLease): void {
+    const { key, scoped } = lease;
+    this.releaseSessionClient(scoped);
+    // The key may now belong to a replacement generation. Never decrement,
+    // schedule, or close that replacement on behalf of an older call.
+    if (this.sessionClients.get(key) !== scoped) return;
+    if (this.sessionCwdIdleTtlMs === 0) {
+      this.closeSessionClientAfterCall(key, scoped);
+    } else {
+      this.refreshSessionClientIdleTimer(key, scoped.server, scoped.label, scoped);
+    }
   }
 
   private validateSessionToolSurface(
@@ -1689,14 +1829,20 @@ export class UpstreamManager {
 
     const connecting = this.sessionClientConnects.get(key);
     if (connecting) {
-      const scoped = await connecting;
+      const scoped = await connecting.promise;
       this.acquireSessionClient(scoped);
       return scoped;
     }
 
+    const lifecycleGeneration = this.lifecycleGeneration;
+    let transport: Transport | undefined;
+    let client: Client | undefined;
     const promise = (async () => {
-      const transport = this.createStdioTransport(config, cwd);
-      const client = new Client({ name: "callmux", version: "0.2.0" }, { capabilities: {} });
+      transport = await this.createStdioTransport(config, cwd);
+      if (this.closing || this.lifecycleGeneration !== lifecycleGeneration) {
+        throw new Error(`session-scoped server "${server}" connect became stale`);
+      }
+      client = new Client({ name: "callmux", version: "0.2.0" }, { capabilities: {} });
       try {
         await withTimeout(
           client.connect(transport),
@@ -1719,11 +1865,14 @@ export class UpstreamManager {
           label: cwd,
           cwd,
         };
+        if (this.closing || this.lifecycleGeneration !== lifecycleGeneration) {
+          throw new Error(`session-scoped server "${server}" connect became stale`);
+        }
         this.sessionClients.set(key, scoped);
 
         client.onclose = () => {
           if (scoped.idleTimer) clearTimeout(scoped.idleTimer);
-          this.sessionClients.delete(key);
+          this.deleteSessionClientIfCurrent(key, scoped);
           process.stderr.write(`[callmux] Session-scoped server "${server}" disconnected (${cwd})\n`);
         };
         client.onerror = (err) => {
@@ -1734,15 +1883,23 @@ export class UpstreamManager {
       } catch (error) {
         await this.closeQuietly(client, transport);
         throw error;
-      } finally {
-        this.sessionClientConnects.delete(key);
       }
     })();
 
-    this.sessionClientConnects.set(key, promise);
-    const scoped = await promise;
-    this.acquireSessionClient(scoped);
-    return scoped;
+    const pending: PendingScopedClient = {
+      promise,
+      close: () => this.closeQuietly(client, transport),
+    };
+    this.sessionClientConnects.set(key, pending);
+    try {
+      const scoped = await promise;
+      this.acquireSessionClient(scoped);
+      return scoped;
+    } finally {
+      if (this.sessionClientConnects.get(key) === pending) {
+        this.sessionClientConnects.delete(key);
+      }
+    }
   }
 
   private async getForwardedHeaderClient(
@@ -1762,21 +1919,26 @@ export class UpstreamManager {
 
     const connecting = this.sessionClientConnects.get(key);
     if (connecting) {
-      const scoped = await connecting;
+      const scoped = await connecting.promise;
       this.acquireSessionClient(scoped);
       return scoped;
     }
 
     const label = `forwarded headers: ${Object.keys(forwardedHeaders).sort().join(", ")}`;
+    const lifecycleGeneration = this.lifecycleGeneration;
+    let transport: Transport | undefined;
+    let client: Client | undefined;
     const promise = (async () => {
-      let transport: Transport | undefined;
-      let client: Client | undefined;
       try {
         const connected = await this.connectWithFallback(
           server,
           config,
           this.connectTimeoutMs,
-          forwardedHeaders
+          forwardedHeaders,
+          (attemptClient, attemptTransport) => {
+            client = attemptClient;
+            transport = attemptTransport;
+          }
         );
         transport = connected.transport;
         client = connected.client;
@@ -1795,11 +1957,14 @@ export class UpstreamManager {
           server,
           label,
         };
+        if (this.closing || this.lifecycleGeneration !== lifecycleGeneration) {
+          throw new Error(`session-scoped server "${server}" connect became stale`);
+        }
         this.sessionClients.set(key, scoped);
 
         client.onclose = () => {
           if (scoped.idleTimer) clearTimeout(scoped.idleTimer);
-          this.sessionClients.delete(key);
+          this.deleteSessionClientIfCurrent(key, scoped);
           process.stderr.write(`[callmux] Session-scoped server "${server}" disconnected (${label})\n`);
         };
         client.onerror = (err) => {
@@ -1810,31 +1975,55 @@ export class UpstreamManager {
       } catch (error) {
         await this.closeQuietly(client, transport);
         throw error;
-      } finally {
-        this.sessionClientConnects.delete(key);
       }
     })();
 
-    this.sessionClientConnects.set(key, promise);
-    const scoped = await promise;
-    this.acquireSessionClient(scoped);
-    return scoped;
+    const pending: PendingScopedClient = {
+      promise,
+      close: () => this.closeQuietly(client, transport),
+    };
+    this.sessionClientConnects.set(key, pending);
+    try {
+      const scoped = await promise;
+      this.acquireSessionClient(scoped);
+      return scoped;
+    } finally {
+      if (this.sessionClientConnects.get(key) === pending) {
+        this.sessionClientConnects.delete(key);
+      }
+    }
   }
 
   private async clientForCall(
     server: string,
     toolName: string,
     context?: ToolCallContext
-  ): Promise<Client | { error: CallToolResult } | undefined> {
+  ): Promise<ClientSelection | { error: CallToolResult } | undefined> {
     const forwardedHeaders = this.forwardedHeadersForServer(server, context);
     if (forwardedHeaders) {
       const scoped = await this.getForwardedHeaderClient(server, forwardedHeaders);
-      if (scoped) return scoped.client;
+      if (scoped) {
+        return {
+          client: scoped.client,
+          scopedLease: {
+            key: this.sessionClientKey(server, `headers:${this.forwardedHeaderFingerprint(forwardedHeaders)}`),
+            scoped,
+          },
+        };
+      }
     }
 
     if (this.shouldUseSessionCwd(server, context)) {
       const scoped = await this.getSessionClient(server, context.cwd);
-      if (scoped) return scoped.client;
+      if (scoped) {
+        return {
+          client: scoped.client,
+          scopedLease: {
+            key: this.sessionClientKey(server, `cwd:${context.cwd}`),
+            scoped,
+          },
+        };
+      }
     }
 
     const info = this.serverInfoMap.get(server);
@@ -1856,7 +2045,8 @@ export class UpstreamManager {
       }
     }
 
-    return this.clients.get(server);
+    const client = this.clients.get(server);
+    return client ? { client } : undefined;
   }
 
   async connect(
@@ -1874,6 +2064,11 @@ export class UpstreamManager {
     this.reconnectPolicy = this.normalizeReconnectPolicy(options.reconnectPolicy);
     this.sessionCwdIdleTtlMs =
       (options.sessionCwdIdleTtlSeconds ?? DEFAULT_SESSION_CWD_IDLE_TTL_SECONDS) * 1000;
+    this.fileReferenceRoots = await Promise.all(
+      (options.fileReferenceRoots ?? []).map(async (root) =>
+        realpath(resolvePath(root))
+      )
+    );
     const strictStartup = options.strictStartup ?? false;
     this.failedConnections = [];
 
@@ -2100,198 +2295,325 @@ export class UpstreamManager {
     return keys.every((key) => FILE_REF_ALLOWED_KEYS[refKey].has(key)) ? parsed : undefined;
   }
 
+  private fileReferenceMaxBytes(
+    value: Record<string, unknown>,
+    refKey: "$file" | "$jsonFile" | "$yamlFile",
+    path: string
+  ): number {
+    const allowedKeys = new Set([refKey, "maxBytes"]);
+    const unexpectedKeys = Object.keys(value).filter((key) => !allowedKeys.has(key));
+    if (unexpectedKeys.length > 0) {
+      throw new Error(
+        `invalid ${refKey} reference at ${path}: unexpected keys [${unexpectedKeys.join(", ")}]`
+      );
+    }
+    if (typeof value[refKey] !== "string" || value[refKey].trim().length === 0) {
+      throw new Error(
+        `invalid ${refKey} reference at ${path}: "${refKey}" must be a non-empty string`
+      );
+    }
+    const requested = value.maxBytes;
+    if (
+      requested !== undefined &&
+      (
+        typeof requested !== "number" ||
+        !Number.isInteger(requested) ||
+        requested <= 0 ||
+        requested > HARD_FILE_REF_MAX_BYTES
+      )
+    ) {
+      throw new Error(
+        `invalid ${refKey} reference at ${path}: "maxBytes" must be a positive integer <= ${HARD_FILE_REF_MAX_BYTES}`
+      );
+    }
+    return requested ?? DEFAULT_FILE_REF_MAX_BYTES;
+  }
+
+  private resolveInlineTextReference(value: Record<string, unknown>, path: string): string {
+    const unexpectedKeys = Object.keys(value).filter((key) => key !== "$text");
+    if (unexpectedKeys.length > 0) {
+      throw new Error(
+        `invalid $text reference at ${path}: unexpected keys [${unexpectedKeys.join(", ")}]`
+      );
+    }
+    const textSpec = value.$text;
+    if (typeof textSpec === "string") return textSpec;
+    if (!isPlainObject(textSpec)) {
+      throw new Error(
+        `invalid $text reference at ${path}: "$text" must be a string or { lines, join? } object`
+      );
+    }
+    const unexpectedTextSpecKeys = Object.keys(textSpec).filter(
+      (key) => key !== "lines" && key !== "join"
+    );
+    if (unexpectedTextSpecKeys.length > 0) {
+      throw new Error(
+        `invalid $text reference at ${path}: unexpected $text keys [${unexpectedTextSpecKeys.join(", ")}]`
+      );
+    }
+    if (!Array.isArray(textSpec.lines)) {
+      throw new Error(
+        `invalid $text reference at ${path}: "$text.lines" must be an array of strings`
+      );
+    }
+    if (!textSpec.lines.every((line) => typeof line === "string")) {
+      throw new Error(
+        `invalid $text reference at ${path}: "$text.lines" must contain only strings`
+      );
+    }
+    const join = textSpec.join ?? "\n";
+    if (typeof join !== "string") {
+      throw new Error(
+        `invalid $text reference at ${path}: "$text.join" must be a string`
+      );
+    }
+    return textSpec.lines.join(join);
+  }
+
+  private pathIsWithinRoot(candidate: string, root: string): boolean {
+    const rel = relative(root, candidate);
+    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  }
+
+  private async canonicalFileReferencePath(
+    filePath: string,
+    path: string,
+    listenerOrigin: boolean
+  ): Promise<string> {
+    if (listenerOrigin && this.fileReferenceRoots.length === 0) {
+      throw new Error(
+        `file reference at ${path} is disabled for listener calls; configure fileReferenceRoots`
+      );
+    }
+    const canonical = await realpath(resolvePath(filePath));
+    if (
+      this.fileReferenceRoots.length > 0 &&
+      !this.fileReferenceRoots.some((root) => this.pathIsWithinRoot(canonical, root))
+    ) {
+      throw new Error(
+        `file reference at ${path} resolves outside configured fileReferenceRoots: ${filePath}`
+      );
+    }
+    return canonical;
+  }
+
+  private async readFileReferenceBounded(
+    filePath: string,
+    maxBytes: number,
+    path: string,
+    listenerOrigin: boolean
+  ): Promise<Buffer> {
+    const canonical = await this.canonicalFileReferencePath(filePath, path, listenerOrigin);
+    return this.readOpenedRegularFileBounded(
+      canonical,
+      maxBytes,
+      `file reference at ${path}`,
+      filePath
+    );
+  }
+
+  private async readOpenedRegularFileBounded(
+    canonicalPath: string,
+    maxBytes: number,
+    label: string,
+    displayPath: string
+  ): Promise<Buffer> {
+    // O_NONBLOCK keeps opening a FIFO/device from stalling before fstat can
+    // reject it. It has no effect on ordinary regular-file reads.
+    const handle = await open(
+      canonicalPath,
+      fsConstants.O_RDONLY | fsConstants.O_NONBLOCK
+    );
+    try {
+      const stats = await handle.stat();
+      if (!stats.isFile()) {
+        throw new Error(`${label} must resolve to a regular file: ${displayPath}`);
+      }
+      if (stats.size > maxBytes) {
+        throw new Error(
+          `${label} exceeds maxBytes (${stats.size} > ${maxBytes}): ${displayPath}`
+        );
+      }
+      const buffer = Buffer.allocUnsafe(maxBytes + 1);
+      let total = 0;
+      while (total < buffer.length) {
+        const { bytesRead } = await handle.read(
+          buffer,
+          total,
+          buffer.length - total,
+          null
+        );
+        if (bytesRead === 0) break;
+        total += bytesRead;
+      }
+      if (total > maxBytes) {
+        throw new Error(`${label} exceeds maxBytes after read: ${displayPath}`);
+      }
+      return Buffer.from(buffer.subarray(0, total));
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async runFileReferenceTasks(
+    state: FileReferenceResolutionState
+  ): Promise<void> {
+    let nextIndex = 0;
+    let firstError: unknown;
+    const workers = Array.from(
+      {
+        length: Math.min(MAX_FILE_REF_READ_CONCURRENCY, state.fileTasks.length),
+      },
+      async () => {
+        while (firstError === undefined && nextIndex < state.fileTasks.length) {
+          const task = state.fileTasks[nextIndex++];
+          try {
+            await task();
+          } catch (error) {
+            firstError ??= error;
+          }
+        }
+      }
+    );
+    await Promise.all(workers);
+    if (firstError !== undefined) throw firstError;
+  }
+
   private async resolveFileReferences(
     value: unknown,
-    path: string
+    path: string,
+    state: FileReferenceResolutionState
   ): Promise<unknown> {
-    if (Array.isArray(value)) {
-      return Promise.all(
-        value.map((item, index) => this.resolveFileReferences(item, `${path}[${index}]`))
-      );
-    }
+    const root: { value?: unknown } = {};
+    type WorkItem = {
+      value: unknown;
+      path: string;
+      assign: (resolved: unknown) => void;
+      opaque?: boolean;
+    };
+    const work: WorkItem[] = [{
+      value,
+      path,
+      assign: (resolved) => { root.value = resolved; },
+    }];
 
-    if (typeof value === "string") {
-      // A ref ({ "$file": "..." }) coerced to a JSON *string* by the client (the
-      // usual fate on string-typed fields like an issue body). Resolve it as if
-      // it had arrived as an object, so $file works on string fields too.
-      const stringifiedRef = this.parseStringifiedFileRef(value);
-      if (stringifiedRef) return this.resolveFileReferences(stringifiedRef, path);
-      return value;
-    }
-
-    if (!isPlainObject(value)) {
-      return value;
-    }
-
-    if ("$file" in value) {
-      const allowedKeys = new Set(["$file", "maxBytes"]);
-      const unexpectedKeys = Object.keys(value).filter((key) => !allowedKeys.has(key));
-      if (unexpectedKeys.length > 0) {
-        throw new Error(
-          `invalid $file reference at ${path}: unexpected keys [${unexpectedKeys.join(", ")}]`
-        );
+    while (work.length > 0) {
+      const item = work.pop()!;
+      if (item.opaque) {
+        item.assign(item.value);
+        continue;
       }
 
-      const filePath = value.$file;
-      if (typeof filePath !== "string" || filePath.trim().length === 0) {
-        throw new Error(`invalid $file reference at ${path}: "$file" must be a non-empty string`);
+      let current = item.value;
+      if (typeof current === "string") {
+        current = this.parseStringifiedFileRef(current) ?? current;
+      }
+      if (typeof current === "string" || !current || typeof current !== "object") {
+        item.assign(current);
+        continue;
       }
 
-      const requestedMaxBytesRaw = value.maxBytes;
-      let requestedMaxBytes: number | undefined;
-      if (requestedMaxBytesRaw !== undefined) {
-        if (
-          typeof requestedMaxBytesRaw !== "number" ||
-          !Number.isInteger(requestedMaxBytesRaw) ||
-          requestedMaxBytesRaw <= 0 ||
-          requestedMaxBytesRaw > HARD_FILE_REF_MAX_BYTES
-        ) {
+      if (Array.isArray(current)) {
+        const output = new Array<unknown>(current.length);
+        item.assign(output);
+        for (let index = current.length - 1; index >= 0; index--) {
+          work.push({
+            value: current[index],
+            path: `${item.path}[${index}]`,
+            assign: (resolved) => { output[index] = resolved; },
+          });
+        }
+        continue;
+      }
+
+      if (!isPlainObject(current)) {
+        item.assign(current);
+        continue;
+      }
+
+      const refKey = ("$file" in current
+        ? "$file"
+        : "$jsonFile" in current
+          ? "$jsonFile"
+          : "$yamlFile" in current
+            ? "$yamlFile"
+            : undefined) as "$file" | "$jsonFile" | "$yamlFile" | undefined;
+      if (refKey) {
+        const maxBytes = this.fileReferenceMaxBytes(current, refKey, item.path);
+        state.referenceCount += 1;
+        if (state.referenceCount > MAX_FILE_REFS_PER_CALL) {
           throw new Error(
-            `invalid $file reference at ${path}: "maxBytes" must be a positive integer <= ${HARD_FILE_REF_MAX_BYTES}`
+            `file reference count exceeds per-call limit (${MAX_FILE_REFS_PER_CALL})`
           );
         }
-        requestedMaxBytes = requestedMaxBytesRaw;
-      }
-      const maxBytes = requestedMaxBytes ?? DEFAULT_FILE_REF_MAX_BYTES;
-
-      const fileStats = await stat(filePath);
-      if (fileStats.size > maxBytes) {
-        throw new Error(
-          `file reference at ${path} exceeds maxBytes (${fileStats.size} > ${maxBytes}): ${filePath}`
-        );
-      }
-
-      const content = await readFile(filePath, "utf8");
-      if (Buffer.byteLength(content, "utf8") > maxBytes) {
-        throw new Error(
-          `file reference at ${path} exceeds maxBytes after read: ${filePath}`
-        );
-      }
-      return content;
-    }
-
-    if ("$jsonFile" in value || "$yamlFile" in value) {
-      const refKey = "$jsonFile" in value ? "$jsonFile" : "$yamlFile";
-      const allowedKeys = new Set([refKey, "maxBytes"]);
-      const unexpectedKeys = Object.keys(value).filter((key) => !allowedKeys.has(key));
-      if (unexpectedKeys.length > 0) {
-        throw new Error(
-          `invalid ${refKey} reference at ${path}: unexpected keys [${unexpectedKeys.join(", ")}]`
-        );
-      }
-
-      const filePath = value[refKey];
-      if (typeof filePath !== "string" || filePath.trim().length === 0) {
-        throw new Error(`invalid ${refKey} reference at ${path}: "${refKey}" must be a non-empty string`);
-      }
-
-      const requestedMaxBytesRaw = value.maxBytes;
-      let requestedMaxBytes: number | undefined;
-      if (requestedMaxBytesRaw !== undefined) {
-        if (
-          typeof requestedMaxBytesRaw !== "number" ||
-          !Number.isInteger(requestedMaxBytesRaw) ||
-          requestedMaxBytesRaw <= 0 ||
-          requestedMaxBytesRaw > HARD_FILE_REF_MAX_BYTES
-        ) {
-          throw new Error(
-            `invalid ${refKey} reference at ${path}: "maxBytes" must be a positive integer <= ${HARD_FILE_REF_MAX_BYTES}`
+        const filePath = current[refKey] as string;
+        state.fileTasks.push(async () => {
+          const bytes = await this.readFileReferenceBounded(
+            filePath,
+            maxBytes,
+            item.path,
+            state.listenerOrigin
           );
-        }
-        requestedMaxBytes = requestedMaxBytesRaw;
+          state.totalBytes += bytes.length;
+          if (state.totalBytes > MAX_FILE_REF_TOTAL_BYTES_PER_CALL) {
+            throw new Error(
+              `file reference bytes exceed per-call limit (${MAX_FILE_REF_TOTAL_BYTES_PER_CALL})`
+            );
+          }
+          const content = bytes.toString("utf8");
+          if (refKey === "$file") {
+            item.assign(content);
+            return;
+          }
+          try {
+            item.assign(
+              refKey === "$jsonFile"
+                ? JSON.parse(content) as unknown
+                : parseYaml(content) as unknown
+            );
+          } catch (error) {
+            throw new Error(
+              `failed to parse ${refKey} at ${item.path} (${filePath}): ${errorMessage(error)}`
+            );
+          }
+        });
+        continue;
       }
-      const maxBytes = requestedMaxBytes ?? DEFAULT_FILE_REF_MAX_BYTES;
 
-      const fileStats = await stat(filePath);
-      if (fileStats.size > maxBytes) {
-        throw new Error(
-          `${refKey} reference at ${path} exceeds maxBytes (${fileStats.size} > ${maxBytes}): ${filePath}`
-        );
+      if ("$text" in current) {
+        item.assign(this.resolveInlineTextReference(current, item.path));
+        continue;
       }
 
-      const content = await readFile(filePath, "utf8");
-      if (Buffer.byteLength(content, "utf8") > maxBytes) {
-        throw new Error(
-          `${refKey} reference at ${path} exceeds maxBytes after read: ${filePath}`
-        );
-      }
-
-      try {
-        if (refKey === "$jsonFile") {
-          return JSON.parse(content) as unknown;
-        }
-        return parseYaml(content) as unknown;
-      } catch (error) {
-        throw new Error(
-          `failed to parse ${refKey} at ${path} (${filePath}): ${errorMessage(error)}`
-        );
+      const output: Record<string, unknown> = {};
+      item.assign(output);
+      const entries = Object.entries(current);
+      for (let index = entries.length - 1; index >= 0; index--) {
+        const [key, nested] = entries[index];
+        work.push({
+          value: nested,
+          path: `${item.path}.${key}`,
+          opaque: item.path === "arguments" && state.opaqueArgumentKeys?.has(key),
+          assign: (resolved) => {
+            Object.defineProperty(output, key, {
+              value: resolved,
+              enumerable: true,
+              configurable: true,
+              writable: true,
+            });
+          },
+        });
       }
     }
 
-    if ("$text" in value) {
-      const allowedKeys = new Set(["$text"]);
-      const unexpectedKeys = Object.keys(value).filter((key) => !allowedKeys.has(key));
-      if (unexpectedKeys.length > 0) {
-        throw new Error(
-          `invalid $text reference at ${path}: unexpected keys [${unexpectedKeys.join(", ")}]`
-        );
-      }
-
-      const textSpec = value.$text;
-      if (typeof textSpec === "string") {
-        return textSpec;
-      }
-
-      if (!isPlainObject(textSpec)) {
-        throw new Error(
-          `invalid $text reference at ${path}: "$text" must be a string or { lines, join? } object`
-        );
-      }
-
-      const allowedTextSpecKeys = new Set(["lines", "join"]);
-      const unexpectedTextSpecKeys = Object.keys(textSpec).filter(
-        (key) => !allowedTextSpecKeys.has(key)
-      );
-      if (unexpectedTextSpecKeys.length > 0) {
-        throw new Error(
-          `invalid $text reference at ${path}: unexpected $text keys [${unexpectedTextSpecKeys.join(", ")}]`
-        );
-      }
-
-      if (!("lines" in textSpec) || !Array.isArray(textSpec.lines)) {
-        throw new Error(
-          `invalid $text reference at ${path}: "$text.lines" must be an array of strings`
-        );
-      }
-
-      if (!textSpec.lines.every((line) => typeof line === "string")) {
-        throw new Error(
-          `invalid $text reference at ${path}: "$text.lines" must contain only strings`
-        );
-      }
-
-      const join = textSpec.join ?? "\n";
-      if (typeof join !== "string") {
-        throw new Error(
-          `invalid $text reference at ${path}: "$text.join" must be a string`
-        );
-      }
-
-      return textSpec.lines.join(join);
-    }
-
-    const resolvedEntries = await Promise.all(
-      Object.entries(value).map(async ([key, nested]) => [
-        key,
-        await this.resolveFileReferences(nested, `${path}.${key}`),
-      ] as const)
-    );
-    return Object.fromEntries(resolvedEntries);
+    await this.runFileReferenceTasks(state);
+    return root.value;
   }
 
   async resolveToolArguments(
     args?: Record<string, unknown>,
-    opaqueArgumentKeys?: ReadonlySet<string>
+    opaqueArgumentKeys?: ReadonlySet<string>,
+    context?: ToolCallContext
   ): Promise<Record<string, unknown> | undefined> {
     if (!args) return args;
     // Top-level argument keys listed in opaqueArgumentKeys carry values from an
@@ -2302,17 +2624,14 @@ export class UpstreamManager {
     // it downstream. File references are a convenience for caller-authored
     // argument literals only. Everything else resolves as usual; opaque values
     // still go on to schema coercion like any other literal.
-    if (!opaqueArgumentKeys || opaqueArgumentKeys.size === 0) {
-      const resolved = await this.resolveFileReferences(args, "arguments");
-      return resolved as Record<string, unknown>;
-    }
-    const entries = await Promise.all(
-      Object.entries(args).map(async ([key, value]) => {
-        if (opaqueArgumentKeys.has(key)) return [key, value] as const;
-        return [key, await this.resolveFileReferences(value, `arguments.${key}`)] as const;
-      })
-    );
-    return Object.fromEntries(entries) as Record<string, unknown>;
+    const state: FileReferenceResolutionState = {
+      listenerOrigin: context?.transport === "cli" || context?.transport === "mcp",
+      ...(opaqueArgumentKeys && opaqueArgumentKeys.size > 0 ? { opaqueArgumentKeys } : {}),
+      fileTasks: [],
+      referenceCount: 0,
+      totalBytes: 0,
+    };
+    return await this.resolveFileReferences(args, "arguments", state) as Record<string, unknown>;
   }
 
   private resolvedTool(server: string, actualName: string): Tool | undefined {
@@ -2353,7 +2672,8 @@ export class UpstreamManager {
       }
       const resolvedArguments = await this.resolveToolArguments(
         inputArguments,
-        options?.opaqueArgumentKeys
+        options?.opaqueArgumentKeys,
+        options?.context
       );
       const normalizedArguments = tool?.inputSchema
         ? normalizeToolArgumentsForSchema(resolvedArguments, tool.inputSchema)
@@ -2366,6 +2686,7 @@ export class UpstreamManager {
         server: resolved.server,
         actualName: resolved.actualName,
         ...(coercedArguments ? { resolvedArguments: coercedArguments } : {}),
+        ...(tool?.annotations ? { annotations: tool.annotations } : {}),
         ...(clientCoercions.length > 0 ? { clientCoercions } : {}),
       };
     } catch (error) {
@@ -2507,7 +2828,12 @@ export class UpstreamManager {
     serverHint?: string,
     context?: ToolCallContext
   ): Promise<CallToolResult> {
-    const prepared = await this.prepareToolCall(toolName, args, serverHint);
+    const prepared = await this.prepareToolCall(
+      toolName,
+      args,
+      serverHint,
+      context ? { context } : undefined
+    );
     if ("error" in prepared) return prepared.error;
     return this.callPrepared(prepared, context, serverHint);
   }
@@ -2558,22 +2884,24 @@ export class UpstreamManager {
         ? this.sessionClientKey(prepared.server, `cwd:${context.cwd}`)
         : undefined;
     let callClient: Client | undefined;
+    const acquiredScopedLeases: ScopedClientLease[] = [];
 
     try {
       const invoke = async (forceReconnect = false): Promise<CallToolResult> => {
-        const client = await this.clientForCall(
+        const selection = await this.clientForCall(
           prepared.server,
           prepared.actualName,
           forceReconnect ? { ...context, forceReconnect: true } : context
         );
-        if (client && "error" in client) return client.error;
-        if (!client) {
+        if (selection && "error" in selection) return selection.error;
+        if (!selection) {
           return this.toolNotFound(toolName);
         }
-        callClient = client;
+        callClient = selection.client;
+        if (selection.scopedLease) acquiredScopedLeases.push(selection.scopedLease);
         const timeoutMs = this.effectiveCallTimeoutMs(prepared.server, context);
         const result = await withTimeout(
-          client.callTool(
+          selection.client.callTool(
             {
               name: prepared.actualName,
               arguments: prepared.resolvedArguments,
@@ -2591,11 +2919,16 @@ export class UpstreamManager {
       return result;
     } catch (error) {
       const normalized = normalizeToolCallFailure(error);
+      const initialExecutionState = executionStateForFailure(normalized.category);
+      let retryAttempted = false;
       // A session rejection happens before the tool runs downstream, so retrying
       // it once is safe even for a mutating call that the read-only gate
       // (retryOnReconnect) would otherwise refuse to retry. See #55.
-      const retrySafe =
-        context?.retryOnReconnect || isPreExecutionFailure(normalized.category);
+      const retrySafe = Boolean(
+        context?.retryOnReconnect ||
+        annotationsAllowReplay(prepared.annotations) ||
+        isPreExecutionFailure(normalized.category)
+      );
       if (normalized.retryable) {
         this.retireFailedCallClient(
           prepared.server,
@@ -2609,19 +2942,21 @@ export class UpstreamManager {
             ? true
             : await this.reconnectServer(prepared.server, "call");
           if (reconnected) {
+            retryAttempted = true;
             try {
               return await (async () => {
-                const client = await this.clientForCall(
+                const selection = await this.clientForCall(
                   prepared.server,
                   prepared.actualName,
                   { ...context, forceReconnect: true }
                 );
-                if (client && "error" in client) return client.error;
-                if (!client) return this.toolNotFound(toolName);
-                callClient = client;
+                if (selection && "error" in selection) return selection.error;
+                if (!selection) return this.toolNotFound(toolName);
+                callClient = selection.client;
+                if (selection.scopedLease) acquiredScopedLeases.push(selection.scopedLease);
                 const timeoutMs = this.effectiveCallTimeoutMs(prepared.server, context);
                 const result = await withTimeout(
-                  client.callTool(
+                  selection.client.callTool(
                     {
                       name: prepared.actualName,
                       arguments: prepared.resolvedArguments,
@@ -2636,6 +2971,11 @@ export class UpstreamManager {
               })();
             } catch (retryError) {
               const retryNormalized = normalizeToolCallFailure(retryError);
+              const retrySafeForCaller = Boolean(
+                context?.retryOnReconnect ||
+                annotationsAllowReplay(prepared.annotations) ||
+                isPreExecutionFailure(retryNormalized.category)
+              );
               if (retryNormalized.retryable) {
                 this.retireFailedCallClient(
                   prepared.server,
@@ -2651,6 +2991,11 @@ export class UpstreamManager {
                 category: retryNormalized.category,
                 rootCause: retryNormalized.rootCause,
                 retryable: retryNormalized.retryable,
+                safeToRetry: retrySafeForCaller,
+                executionState: combineExecutionStates(
+                  initialExecutionState,
+                  executionStateForFailure(retryNormalized.category)
+                ),
                 retryAttempted: true,
                 ...(retryNormalized.category === "session"
                   ? { hint: SESSION_REAUTH_HINT }
@@ -2666,25 +3011,14 @@ export class UpstreamManager {
         category: normalized.category,
         rootCause: normalized.rootCause,
         retryable: normalized.retryable,
-        ...(retrySafe ? { retryAttempted: true } : {}),
+        safeToRetry: retrySafe,
+        executionState: initialExecutionState,
+        ...(retryAttempted ? { retryAttempted: true } : {}),
         ...(normalized.category === "session" ? { hint: SESSION_REAUTH_HINT } : {}),
       });
     } finally {
-      if (scopedKey) {
-        const scoped = this.sessionClients.get(scopedKey);
-        if (scoped) {
-          this.releaseSessionClient(scoped);
-          if (this.sessionCwdIdleTtlMs === 0) {
-            this.closeSessionClientAfterCall(scopedKey, scoped);
-          } else {
-            this.refreshSessionClientIdleTimer(
-              scopedKey,
-              prepared.server,
-              scoped.label,
-              scoped
-            );
-          }
-        }
+      for (const lease of acquiredScopedLeases.reverse()) {
+        this.releaseScopedClientLease(lease);
       }
     }
   }
@@ -2745,6 +3079,7 @@ export class UpstreamManager {
     for (const scoped of this.sessionClients.values()) {
       if (scoped.idleTimer) clearTimeout(scoped.idleTimer);
     }
+    const closePending = this.closePendingSessionClientConnects();
     await Promise.all([
       ...Array.from(this.clients.entries()).map(([name, client]) =>
         this.closeQuietly(client, this.transports.get(name))
@@ -2752,6 +3087,7 @@ export class UpstreamManager {
       ...Array.from(this.sessionClients.values()).map(({ client, transport }) =>
         this.closeQuietly(client, transport)
       ),
+      closePending,
     ]);
     this.clients.clear();
     this.transports.clear();
@@ -2769,6 +3105,7 @@ export class UpstreamManager {
     this.removedTools.clear();
     this.serverInfoMap.clear();
     this.serverConcurrency.clear();
+    this.fileReferenceRoots = [];
     this.failedConnections = [];
     this.closing = false;
   }

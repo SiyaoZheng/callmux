@@ -1,79 +1,10 @@
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { CacheEntry, CachePolicyConfig } from "./types.js";
 
-const READ_ONLY_TOOL_PREFIXES = [
-  "check",
-  "compare",
-  "count",
-  "describe",
-  "diff",
-  "fetch",
-  "find",
-  "get",
-  "info",
-  "inspect",
-  "list",
-  "lookup",
-  "query",
-  "read",
-  "search",
-  "show",
-  "stat",
-  "status",
-  "validate",
-  "view",
-  "whoami",
-];
-
-const MUTATING_TOOL_PREFIXES = [
-  "add",
-  "approve",
-  "assign",
-  "batch",
-  "clear",
-  "close",
-  "comment",
-  "convert",
-  "create",
-  "delete",
-  "deploy",
-  "disable",
-  "dismiss",
-  "enable",
-  "install",
-  "invalidate",
-  "label",
-  "lock",
-  "mark",
-  "merge",
-  "move",
-  "open",
-  "patch",
-  "pipeline",
-  "post",
-  "publish",
-  "put",
-  "remove",
-  "reply",
-  "request",
-  "reset",
-  "resolve",
-  "restart",
-  "run",
-  "save",
-  "send",
-  "set",
-  "start",
-  "stop",
-  "submit",
-  "trigger",
-  "unlock",
-  "unresolve",
-  "uninstall",
-  "update",
-  "upsert",
-  "write",
-];
+export type ToolSafetyAnnotations = Pick<
+  NonNullable<Tool["annotations"]>,
+  "readOnlyHint" | "idempotentHint"
+>;
 
 function normalizeToolName(tool: string): string {
   const separator = tool.lastIndexOf("__");
@@ -116,15 +47,6 @@ function matchesPolicy(patterns: string[], candidates: string[]): boolean {
     const matcher = patternToRegExp(pattern);
     return candidates.some((candidate) => matcher.test(candidate));
   });
-}
-
-function isToolCacheable(tool: string): boolean {
-  const normalized = normalizeToolName(tool).toLowerCase();
-  const prefix = normalized.split(/[^a-z0-9]+/, 1)[0];
-
-  if (!prefix) return false;
-  if (MUTATING_TOOL_PREFIXES.includes(prefix)) return false;
-  return READ_ONLY_TOOL_PREFIXES.includes(prefix);
 }
 
 export class CallCache {
@@ -174,7 +96,10 @@ export class CallCache {
     return this.serverPolicies.has(inferred) ? inferred : undefined;
   }
 
-  private shouldCache(tool: string, server?: string): boolean {
+  private policyDecision(
+    tool: string,
+    server?: string
+  ): { explicitlyAllowed: boolean; denied: boolean; hasAllowList: boolean } {
     const effectiveServer = this.effectiveServer(tool, server);
     const candidates = this.cacheCandidates(tool, effectiveServer);
     const policies = [
@@ -183,25 +108,54 @@ export class CallCache {
     ].filter((policy): policy is CachePolicyConfig => policy !== undefined);
 
     const denyPatterns = policies.flatMap((policy) => policy.denyTools ?? []);
-    if (denyPatterns.length > 0 && matchesPolicy(denyPatterns, candidates)) {
-      return false;
-    }
-
     const allowPatterns = policies.flatMap((policy) => policy.allowTools ?? []);
-    if (allowPatterns.length > 0) {
-      return matchesPolicy(allowPatterns, candidates);
-    }
-
-    return isToolCacheable(tool);
+    return {
+      denied:
+        denyPatterns.length > 0 && matchesPolicy(denyPatterns, candidates),
+      explicitlyAllowed:
+        allowPatterns.length > 0 && matchesPolicy(allowPatterns, candidates),
+      hasAllowList: allowPatterns.length > 0,
+    };
   }
 
-  isSafeToRetry(tool: string, server?: string): boolean {
-    return this.shouldCache(tool, server);
+  private shouldCache(
+    tool: string,
+    server?: string,
+    annotations?: ToolSafetyAnnotations
+  ): boolean {
+    const policy = this.policyDecision(tool, server);
+    if (policy.denied) return false;
+    if (policy.explicitlyAllowed) return true;
+    if (policy.hasAllowList) return false;
+
+    // MCP annotations default to false. Unknown tools are deliberately unsafe:
+    // names such as `get_and_delete` are not a trustworthy side-effect signal.
+    return annotations?.readOnlyHint === true;
   }
 
-  canCache(tool: string, server?: string): boolean {
+  isSafeToRetry(
+    tool: string,
+    server?: string,
+    annotations?: ToolSafetyAnnotations
+  ): boolean {
+    const policy = this.policyDecision(tool, server);
+    // An explicit cache allow-list is also an operator assertion that identical
+    // calls are replay-safe. Cache deny-lists do not imply the opposite: callers
+    // may disable caching for freshness while an annotation still permits retry.
+    return (
+      policy.explicitlyAllowed ||
+      annotations?.readOnlyHint === true ||
+      annotations?.idempotentHint === true
+    );
+  }
+
+  canCache(
+    tool: string,
+    server?: string,
+    annotations?: ToolSafetyAnnotations
+  ): boolean {
     if (this.ttlMs <= 0) return false;
-    return this.shouldCache(tool, server);
+    return this.shouldCache(tool, server, annotations);
   }
 
   private key(
@@ -244,11 +198,12 @@ export class CallCache {
     tool: string,
     args?: Record<string, unknown>,
     server?: string,
-    scope?: string
+    scope?: string,
+    annotations?: ToolSafetyAnnotations
   ): CallToolResult | null {
     if (this.ttlMs <= 0) return null;
     const effectiveServer = this.effectiveServer(tool, server);
-    if (!this.shouldCache(tool, effectiveServer)) return null;
+    if (!this.shouldCache(tool, effectiveServer, annotations)) return null;
     const now = Date.now();
     this.maybePruneExpired(now);
 
@@ -275,11 +230,12 @@ export class CallCache {
     args: Record<string, unknown> | undefined,
     result: CallToolResult,
     server?: string,
-    scope?: string
+    scope?: string,
+    annotations?: ToolSafetyAnnotations
   ): void {
     if (this.ttlMs <= 0) return;
     const effectiveServer = this.effectiveServer(tool, server);
-    if (!this.shouldCache(tool, effectiveServer)) return;
+    if (!this.shouldCache(tool, effectiveServer, annotations)) return;
     if (result.isError) return;
     const now = Date.now();
     this.maybePruneExpired(now);

@@ -6,7 +6,10 @@ import type { OutputFormat } from "./output-format.js";
 export interface StdioServerConfig {
   command: string;
   args?: string[];
+  /** Literal environment variables for the server process. Prefer envRefs for secrets. */
   env?: Record<string, string>;
+  /** Secret environment values resolved at process start from env:NAME or file:PATH. */
+  envRefs?: Record<string, string>;
   cwd?: string;
   /** Working directory behavior. Listener mode defaults to "session"; stdio mode defaults to "global". */
   cwdMode?: "global" | "session";
@@ -307,10 +310,18 @@ export interface CallmuxConfig {
   connectTimeoutMs?: number;
   /** Timeout in milliseconds for downstream tool calls */
   callTimeoutMs?: number;
+  /** Maximum time to drain calls from an old upstream generation after hot reload */
+  reloadDrainTimeoutMs?: number;
   /** Downstream reconnect retry/backoff policy */
   reconnectPolicy?: ReconnectPolicyConfig;
   /** Idle TTL in seconds for listener-mode session cwd stdio clients (0 = close after each call) */
   sessionCwdIdleTtlSeconds?: number;
+  /**
+   * Local filesystem roots that listener-origin tool calls may read through
+   * $file/$jsonFile/$yamlFile references. Omit to disable file-backed
+   * references for listener callers; local stdio callers retain legacy access.
+   */
+  fileReferenceRoots?: string[];
   /** When true, any downstream startup failure prevents callmux from starting */
   strictStartup?: boolean;
   /** Maximum cached entries before oldest entries are evicted */

@@ -374,14 +374,27 @@ export function applyServerMutation(
     : server.env
       ? { ...server.env }
       : undefined;
+  let envRefs = mutation.clearEnv
+    ? undefined
+    : server.envRefs
+      ? { ...server.envRefs }
+      : undefined;
   if (mutation.setEnv) {
     env = { ...(env ?? {}), ...mutation.setEnv };
-  }
-  if (mutation.removeEnv?.length && env) {
-    for (const key of mutation.removeEnv) {
-      delete env[key];
+    if (envRefs) {
+      for (const key of Object.keys(mutation.setEnv)) delete envRefs[key];
+      if (Object.keys(envRefs).length === 0) envRefs = undefined;
     }
-    if (Object.keys(env).length === 0) env = undefined;
+  }
+  if (mutation.removeEnv?.length) {
+    if (env) {
+      for (const key of mutation.removeEnv) delete env[key];
+      if (Object.keys(env).length === 0) env = undefined;
+    }
+    if (envRefs) {
+      for (const key of mutation.removeEnv) delete envRefs[key];
+      if (Object.keys(envRefs).length === 0) envRefs = undefined;
+    }
   }
 
   return {
@@ -394,6 +407,7 @@ export function applyServerMutation(
         ? { args: server.args }
         : {}),
     ...(env ? { env } : {}),
+    ...(envRefs ? { envRefs } : {}),
     ...((mutation.clearCwd ? undefined : mutation.cwd) ?? (!mutation.clearCwd ? server.cwd : undefined)
       ? { cwd: (mutation.clearCwd ? undefined : mutation.cwd) ?? server.cwd }
       : {}),
@@ -458,7 +472,12 @@ export function serializeServers(config: CallmuxConfig): Array<{
       ...(server.cwd ? { cwd: server.cwd } : {}),
       ...(server.cwdMode ? { cwdMode: server.cwdMode } : {}),
       ...(server.tools ? { tools: server.tools } : {}),
-      ...(server.env ? { envKeys: Object.keys(server.env).sort() } : {}),
+      ...((server.env || server.envRefs)
+        ? { envKeys: [...new Set([
+            ...Object.keys(server.env ?? {}),
+            ...Object.keys(server.envRefs ?? {}),
+          ])].sort() }
+        : {}),
       ...(server.cachePolicy ? { cachePolicy: server.cachePolicy } : {}),
       ...(server.callTimeoutMs !== undefined
         ? { callTimeoutMs: server.callTimeoutMs }
@@ -489,7 +508,14 @@ export function formatServerList(config: CallmuxConfig): string {
         lines.push(`  command: ${formatCommand(server)}`);
         if (server.cwd) lines.push(`  cwd: ${server.cwd}`);
         if (server.cwdMode) lines.push(`  cwd mode: ${server.cwdMode}`);
-        const envKeys = formatValueList(server.env ? Object.keys(server.env).sort() : undefined);
+        const envKeys = formatValueList(
+          server.env || server.envRefs
+            ? [...new Set([
+                ...Object.keys(server.env ?? {}),
+                ...Object.keys(server.envRefs ?? {}),
+              ])].sort()
+            : undefined
+        );
         if (envKeys) lines.push(`  env keys: ${envKeys}`);
       }
 
