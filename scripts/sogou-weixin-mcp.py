@@ -25,7 +25,7 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 mcp = FastMCP(
     "sogou-weixin",
-    version="0.2.0",
+    version="0.3.0",
     instructions=(
         "Search and fetch public WeChat articles. Results expose normalized fields "
         "for agents and raw_cli for exact-result caching and audit."
@@ -163,7 +163,7 @@ def _fetched_article(data: dict[str, Any], preview_chars: int) -> dict[str, Any]
 
 
 @mcp.tool(annotations=READ_ONLY)
-def sogou_weixin_search(
+def web_search_sogou(
     query: Annotated[str, Field(min_length=1, description="Search query")],
     page: Annotated[int, Field(ge=1, description="Results page")] = 1,
     limit: Annotated[int, Field(ge=1, le=10, description="Maximum results")] = 10,
@@ -196,7 +196,7 @@ def sogou_weixin_search(
 
 
 @mcp.tool(annotations=READ_ONLY)
-def sogou_weixin_fetch(
+def web_fetch_sogou(
     result: Annotated[
         str,
         Field(
@@ -240,7 +240,7 @@ def sogou_weixin_fetch(
 
 
 @mcp.tool(annotations=READ_ONLY)
-def sogou_weixin_batch_research(
+def batch_research_sogou(
     queries: Annotated[
         list[str],
         Field(
