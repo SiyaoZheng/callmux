@@ -669,7 +669,10 @@ class EventStoreEngine {
       WHERE e.ts_ms >= ? AND e.ts_ms <= ?
         AND (? = '' OR e.agent_signature = ?)
         AND (? = '' OR e.project_name = ? OR e.project_path = ?)
-        AND (? = '' OR e.server = ?)
+        AND (? = '' OR EXISTS (
+          SELECT 1 FROM call_event_targets t
+          WHERE t.event_id = e.id AND t.server = ?
+        ))
         AND (? = '' OR q.provider = ?)
       GROUP BY q.provider, q.query
     `).all(
@@ -719,7 +722,10 @@ class EventStoreEngine {
       WHERE e.ts_ms >= ? AND e.ts_ms <= ?
         AND (? = '' OR e.agent_signature = ?)
         AND (? = '' OR e.project_name = ? OR e.project_path = ?)
-        AND (? = '' OR e.server = ?)
+        AND (? = '' OR EXISTS (
+          SELECT 1 FROM call_event_targets t
+          WHERE t.event_id = e.id AND t.server = ?
+        ))
         AND (? = '' OR p.provider = ?)
       ORDER BY e.ts ASC, p.id ASC
     `).all(

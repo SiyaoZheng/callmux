@@ -5,8 +5,10 @@ import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { DetailItem } from '@/components/shared/bits'
 import { formatDateTime, formatNum } from '@/lib/format'
+import { normalizeServers } from '@/lib/events'
 import type { ResearchProvider, UrlTreeNode } from '@/types'
 
 function ProviderBadge({ provider }: { provider: ResearchProvider }) {
@@ -56,6 +58,8 @@ export function ResearchIndexView() {
   const load = useStore((s) => s.loadResearchIndex)
   const filters = useStore((s) => s.researchFilters)
   const setFilters = useStore((s) => s.setResearchFilters)
+  const snapshot = useStore((s) => s.snapshot)
+  const servers = normalizeServers(snapshot?.status.servers)
 
   useEffect(() => {
     void load()
@@ -75,7 +79,18 @@ export function ResearchIndexView() {
             Domains are roots; URL path segments form the branches. Discovery and fetch counts remain distinct.
           </p>
         </div>
-        <div className="grid gap-2 sm:grid-cols-[minmax(160px,0.7fr)_minmax(220px,1fr)_auto_auto]">
+        <div className="grid gap-2 lg:grid-cols-[minmax(150px,0.6fr)_minmax(160px,0.7fr)_minmax(220px,1fr)_auto_auto]">
+          <Select value={filters.mcp || '__all'} onValueChange={(value) => setFilters({ mcp: value === '__all' ? '' : value })}>
+            <SelectTrigger>
+              <SelectValue placeholder="All MCPs" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__all">All MCPs</SelectItem>
+              {servers.map((server) => (
+                <SelectItem key={server.name} value={server.name}>{server.name}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
           <Input
             value={filters.project}
             onChange={(event) => setFilters({ project: event.target.value })}
@@ -93,7 +108,7 @@ export function ResearchIndexView() {
             type="button"
             variant="outline"
             onClick={() => {
-              setFilters({ project: '', signature: '' })
+              setFilters({ project: '', signature: '', mcp: '' })
               queueMicrotask(() => void load())
             }}
           >

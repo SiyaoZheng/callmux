@@ -126,5 +126,18 @@ test("URL tree groups pages by domain and path segments", () => {
     ["a", "b"]
   );
   assert.equal(index.topQueries[0].calls, 2);
-  assert.equal(index.topTerms.some((row) => row.term === "政商"), true);
+  assert.equal(index.topTerms.some((row) => row.term === "政商关系"), true);
+});
+
+test("Chinese term ranking preserves contiguous phrases", () => {
+  const index = buildResearchIndex([{
+    provider: "sogou",
+    query: "人工智能",
+    calls: 7,
+    firstSeenAt: "2026-08-23T00:00:00.000Z",
+    lastSeenAt: "2026-08-24T00:00:00.000Z",
+    signatures: [],
+    projects: [],
+  }], []);
+  assert.deepEqual(index.topTerms, [{ provider: "sogou", term: "人工智能", uses: 7 }]);
 });

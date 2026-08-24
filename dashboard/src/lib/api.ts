@@ -35,10 +35,11 @@ export async function fetchDrilldown(range: MetricsRange): Promise<DrilldownResp
   return res.json()
 }
 
-export async function fetchResearchIndex(filters: { project?: string; signature?: string } = {}): Promise<ResearchIndexResponse | null> {
+export async function fetchResearchIndex(filters: { project?: string; signature?: string; mcp?: string } = {}): Promise<ResearchIndexResponse | null> {
   const params = new URLSearchParams()
   if (filters.project) params.set('project', filters.project)
   if (filters.signature) params.set('signature', filters.signature)
+  if (filters.mcp) params.set('mcp', filters.mcp)
   const query = params.size > 0 ? '?' + params.toString() : ''
   const res = await fetch(dashboardEndpoint('research-index') + query, {
     headers: { Accept: 'application/json' },

@@ -393,11 +393,12 @@ export function extractResearchObservations(
 }
 
 function queryTerms(query: string): string[] {
-  const segmenter = new Intl.Segmenter("zh", { granularity: "word" });
-  return [...segmenter.segment(query)]
-    .filter((item) => item.isWordLike)
-    .map((item) => item.segment.trim().toLocaleLowerCase())
-    .filter((item) => item.length > 0 && !/^\d+$/.test(item));
+  const tokens = query
+    .normalize("NFKC")
+    .match(/[\p{Script=Han}]+|[\p{L}\p{N}]+(?:[:._/-][\p{L}\p{N}]+)*/gu) ?? [];
+  return tokens
+    .map((token) => token.toLocaleLowerCase())
+    .filter((token) => !/^[\d._:/-]+$/.test(token));
 }
 
 interface MutableTreeNode extends Omit<

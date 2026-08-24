@@ -35,7 +35,7 @@ With the default path, callmux serves:
 
 The dashboard's history charts use the aggregate RRD JSON metrics store. The Drill-down tab is additive and requires the optional [SQLite event store](observability.md); it shows per-server, per-tool, per-session, and forwarded-header audit breakdowns for the selected range.
 
-The Research Index tab is also backed by the SQLite event store. It extracts Exa, Sogou, and Qichacha query terms; records Exa/Sogou search-result URLs as discovered and explicit page reads as fetched; and groups canonical URLs into a `domain -> path segment` hierarchy. Qichacha contributes query terms and attribution but does not treat returned company data as web pages. Set `eventStore.includeArguments` to `true` so the index can be rebuilt from stored tool arguments. New Codex bridge calls attach their `Codex/<thread-id>` signature and current project name/path; the endpoint returns those attributions.
+The Research Index tab is also backed by the SQLite event store. It ranks complete queries and terms by recorded use count; contiguous Chinese phrases remain intact instead of being split character by character. It records Exa/Sogou search-result URLs as discovered and explicit page reads as fetched, and groups canonical URLs into a `domain -> path segment` hierarchy. Qichacha contributes query terms and attribution but does not treat returned company data as web pages. Set `eventStore.includeArguments` to `true` so the index can be rebuilt from stored tool arguments. New Codex bridge calls attach their `Codex/<thread-id>` signature and current project name/path; the endpoint returns those attributions.
 
 `GET /dashboard/research-index` accepts these optional query parameters:
 

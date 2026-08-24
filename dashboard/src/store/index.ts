@@ -70,7 +70,7 @@ interface DashboardState {
   series: SeriesResponse | null
   drilldown: DrilldownResponse | null
   researchIndex: ResearchIndexResponse | null
-  researchFilters: { project: string; signature: string }
+  researchFilters: { project: string; signature: string; mcp: string }
   connected: boolean
   lastUpdated: number | null
 
@@ -92,7 +92,7 @@ interface DashboardState {
   setTheme: (theme: ThemeName) => void
   setRange: (range: MetricsRange) => void
   setFilter: (patch: Partial<EventFilters>) => void
-  setResearchFilters: (patch: Partial<{ project: string; signature: string }>) => void
+  setResearchFilters: (patch: Partial<{ project: string; signature: string; mcp: string }>) => void
   setHideAgentStatus: (value: boolean) => void
   setHideTransportHttp: (value: boolean) => void
   setHideSessionReinit: (value: boolean) => void
@@ -112,7 +112,7 @@ export const useStore = create<DashboardState>((set, get) => ({
   series: null,
   drilldown: null,
   researchIndex: null,
-  researchFilters: { project: '', signature: '' },
+  researchFilters: { project: '', signature: '', mcp: '' },
   connected: false,
   lastUpdated: null,
 
@@ -188,6 +188,7 @@ export const useStore = create<DashboardState>((set, get) => ({
     const researchIndex = await fetchResearchIndex({
       ...(filters.project.trim() ? { project: filters.project.trim() } : {}),
       ...(filters.signature.trim() ? { signature: filters.signature.trim() } : {}),
+      ...(filters.mcp.trim() ? { mcp: filters.mcp.trim() } : {}),
     })
     set({ researchIndex })
   },
