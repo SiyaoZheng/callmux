@@ -218,7 +218,7 @@ export interface DrilldownResponse {
   forwardedHeaders?: ForwardedHeaderRow[]
 }
 
-export type ResearchProvider = 'exa' | 'sogou'
+export type ResearchProvider = 'exa' | 'sogou' | 'qichacha'
 
 export interface ResearchQueryRow {
   provider: ResearchProvider

@@ -11,6 +11,7 @@ import {
   extractResearchObservations,
   type ResearchIndex,
   type ResearchObservations,
+  type ResearchProvider,
 } from "./research-index.js";
 
 export const DEFAULT_EVENT_STORE_MAX_ROWS = 100_000;
@@ -561,7 +562,7 @@ class EventStoreEngine {
   /** Populate the index from pre-index call arguments without inventing search-result visits. */
   private backfillResearchObservations(): void {
     const rows = this.db.prepare(`
-      SELECT e.id, e.tool, e.arguments_json
+      SELECT e.id, e.server, e.tool, e.arguments_json
       FROM call_events e
       WHERE e.ok = 1
         AND e.arguments_json IS NOT NULL
@@ -571,6 +572,8 @@ class EventStoreEngine {
           OR e.tool LIKE '%web_search_sogou'
           OR e.tool LIKE '%web_fetch_sogou'
           OR e.tool LIKE '%batch_research_sogou'
+          OR e.server LIKE 'qcc_%'
+          OR e.tool LIKE 'qcc_%__%'
           OR e.tool IN ('callmux_call', 'callmux_parallel', 'callmux_batch', 'callmux_pipeline')
         )
     `).all();
@@ -585,7 +588,7 @@ class EventStoreEngine {
         }
         this.insertResearchObservations(
           numberOr(row.id),
-          extractResearchObservations(textOr(row.tool), args)
+          extractResearchObservations(textOr(row.tool), args, undefined, textOr(row.server))
         );
       }
       this.db.exec("COMMIT");
@@ -664,7 +667,7 @@ class EventStoreEngine {
         AND (? = '' OR e.project_name = ? OR e.project_path = ?)
       GROUP BY q.provider, q.query
     `).all(fromMs, toMs, signature, signature, project, project, project).map((row) => ({
-      provider: textOr(row.provider) as "exa" | "sogou",
+      provider: textOr(row.provider) as ResearchProvider,
       query: textOr(row.query),
       calls: numberOr(row.calls),
       firstSeenAt: textOr(row.firstSeenAt),
@@ -674,7 +677,7 @@ class EventStoreEngine {
     }));
 
     const aggregates = new Map<string, {
-      provider: "exa" | "sogou";
+      provider: ResearchProvider;
       url: string;
       canonicalUrl: string;
       domain: string;
@@ -701,7 +704,7 @@ class EventStoreEngine {
       ORDER BY e.ts ASC, p.id ASC
     `).all(fromMs, toMs, signature, signature, project, project, project);
     for (const row of pageRows) {
-      const provider = textOr(row.provider) as "exa" | "sogou";
+      const provider = textOr(row.provider) as ResearchProvider;
       const canonicalUrl = textOr(row.canonical_url);
       const key = `${provider}\0${canonicalUrl}`;
       let aggregate = aggregates.get(key);

@@ -2860,7 +2860,7 @@ export class CallmuxListener {
         downstreamCalls: summary.totalDownstreamToolCalls,
         targets: summary.downstreamTargets,
         forwardedHeaders: this.forwardedHeaderNamesForEvent(summary, toolContext),
-        research: extractResearchObservations(tool, args, result),
+        research: extractResearchObservations(tool, args, result, target?.server),
       };
       try {
         this.eventStore.recordCall(event);

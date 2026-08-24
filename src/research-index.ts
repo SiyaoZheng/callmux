@@ -1,6 +1,6 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
-export type ResearchProvider = "exa" | "sogou";
+export type ResearchProvider = "exa" | "sogou" | "qichacha";
 export type WebPageRelation = "discovered" | "fetched";
 
 export interface ResearchQueryObservation {
@@ -119,11 +119,44 @@ function normalizedTool(tool: string): string {
   return tool.toLowerCase().replace(/^.*__/, "");
 }
 
-function providerForTool(tool: string): ResearchProvider | undefined {
+function providerForTool(
+  tool: string,
+  server?: string
+): ResearchProvider | undefined {
+  const qualified = tool.toLowerCase();
+  if (server?.toLowerCase().startsWith("qcc_") || /^qcc_[a-z0-9_-]+__/.test(qualified)) {
+    return "qichacha";
+  }
   const name = normalizedTool(tool);
   if (name.endsWith("_exa")) return "exa";
   if (name.endsWith("_sogou")) return "sogou";
   return undefined;
+}
+
+const QICHACHA_QUERY_FIELDS = [
+  "searchKey",
+  "query",
+  "keyword",
+  "keywords",
+  "personName",
+  "name",
+  "party",
+  "regulationName",
+  "caseNo",
+] as const;
+
+function qichachaQuery(args: Record<string, unknown>): string | undefined {
+  const values: string[] = [];
+  for (const field of QICHACHA_QUERY_FIELDS) {
+    const raw = args[field];
+    const candidates = Array.isArray(raw) ? raw : [raw];
+    for (const candidate of candidates) {
+      const value = text(candidate);
+      if (value && !values.includes(value)) values.push(value);
+    }
+  }
+  const query = values.join(" · ");
+  return query ? query.slice(0, 500) : undefined;
 }
 
 function flattenInvocations(
@@ -246,7 +279,8 @@ function resultUrlCandidates(result: CallToolResult | undefined): Array<{
 export function extractResearchObservations(
   tool: string,
   args: unknown,
-  result?: CallToolResult
+  result?: CallToolResult,
+  server?: string
 ): ResearchObservations {
   const invocations = flattenInvocations(tool, args);
   const queries: ResearchQueryObservation[] = [];
@@ -273,8 +307,13 @@ export function extractResearchObservations(
   };
 
   for (const invocation of invocations) {
-    const provider = providerForTool(invocation.tool);
+    const provider = providerForTool(invocation.tool, server);
     if (!provider) continue;
+    if (provider === "qichacha") {
+      const query = qichachaQuery(invocation.arguments);
+      if (query) queries.push({ provider, query });
+      continue;
+    }
     const name = normalizedTool(invocation.tool);
     if (name === "web_search_exa" || name === "web_search_sogou") {
       const query = text(invocation.arguments.query);
@@ -308,7 +347,10 @@ export function extractResearchObservations(
   }
 
   if (searchInvocations.length === 0 && fetchInvocations.length === 0) {
-    return { queries: [], pages: [] };
+    return {
+      queries: [...new Map(queries.map((item) => [`${item.provider}\0${item.query}`, item])).values()],
+      pages: [],
+    };
   }
 
   const resultCandidates = resultUrlCandidates(result);

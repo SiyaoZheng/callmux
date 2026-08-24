@@ -10,7 +10,8 @@ import { formatDateTime, formatNum } from '@/lib/format'
 import type { ResearchProvider, UrlTreeNode } from '@/types'
 
 function ProviderBadge({ provider }: { provider: ResearchProvider }) {
-  return <Badge variant="outline">{provider === 'exa' ? 'Exa' : '搜狗'}</Badge>
+  const label = provider === 'exa' ? 'Exa' : provider === 'sogou' ? '搜狗' : '企查查'
+  return <Badge variant="outline">{label}</Badge>
 }
 
 function TreeRow({ node }: { node: UrlTreeNode }) {

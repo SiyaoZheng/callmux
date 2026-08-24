@@ -136,6 +136,17 @@ test("event store backfills URL tree and query index from existing call argument
       durationMs: 30,
       ok: true,
     });
+    first.recordCall({
+      timestampMs: T0,
+      server: "qcc_company",
+      tool: "qcc_company__get_company_registration_info",
+      agentSignature: "Codex/thread-a",
+      projectName: "CPED-OpenAleph",
+      projectPath: "/work/CPED-OpenAleph",
+      arguments: { searchKey: "企查查科技股份有限公司" },
+      durationMs: 30,
+      ok: true,
+    });
   } finally {
     await first.close();
   }
@@ -143,7 +154,7 @@ test("event store backfills URL tree and query index from existing call argument
   const reopened = await openEventStore({ path, now: () => T0 + 1_000 });
   try {
     const index = await reopened.queryResearchIndex();
-    assert.equal(index.totals.queries, 1);
+    assert.equal(index.totals.queries, 2);
     assert.equal(index.totals.pages, 2);
     assert.equal(index.totals.fetches, 2);
     assert.equal(index.urlTree[0].segment, "example.com");
@@ -153,6 +164,9 @@ test("event store backfills URL tree and query index from existing call argument
       path: "/work/CPED-OpenAleph",
     }]);
     assert.deepEqual(index.topQueries[0].signatures, ["Codex/thread-a"]);
+    assert.equal(index.topQueries.some((row) => (
+      row.provider === "qichacha" && row.query === "企查查科技股份有限公司"
+    )), true);
     assert.equal((await reopened.queryResearchIndex({ signature: "Codex/other" })).totals.pages, 0);
     assert.equal((await reopened.queryResearchIndex({ project: "CPED-OpenAleph" })).totals.pages, 2);
     assert.equal(index.urlTree[0].children[0].segment, "research");

@@ -4,6 +4,8 @@ dist/
 dist-test/
 dashboard/dist/
 assets/dashboard.html
+__pycache__/
+*.py[cod]
 *.tgz
 .DS_Store
 test-config.json

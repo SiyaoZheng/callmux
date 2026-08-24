@@ -58,6 +58,22 @@ test("Sogou batch research records returned articles as fetched pages", () => {
   assert.equal(observations.pages[0].query, "干部 任命");
 });
 
+test("Qichacha calls contribute query terms without indexing returned data as pages", () => {
+  const observations = extractResearchObservations(
+    "get_executive_positions",
+    { searchKey: "企查查科技股份有限公司", personName: "陈德强" },
+    {
+      content: [{ type: "text", text: "https://www.qcc.com/firm/example.html" }],
+    },
+    "qcc_executive"
+  );
+  assert.deepEqual(observations.queries, [{
+    provider: "qichacha",
+    query: "企查查科技股份有限公司 · 陈德强",
+  }]);
+  assert.deepEqual(observations.pages, []);
+});
+
 test("URL tree groups pages by domain and path segments", () => {
   const index = buildResearchIndex(
     [{
