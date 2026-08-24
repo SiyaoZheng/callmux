@@ -4,7 +4,7 @@
 // window.location at runtime — there is no build-time base — exactly like the
 // vanilla dashboard's dashboardEndpoint().
 
-import type { DashboardSnapshot, DrilldownResponse, MetricsRange, SeriesResponse } from '@/types'
+import type { DashboardSnapshot, DrilldownResponse, MetricsRange, ResearchIndexResponse, SeriesResponse } from '@/types'
 
 export function dashboardEndpoint(name: string): string {
   const path = window.location.pathname || '/'
@@ -29,6 +29,18 @@ export async function fetchSeries(range: MetricsRange): Promise<SeriesResponse |
 
 export async function fetchDrilldown(range: MetricsRange): Promise<DrilldownResponse | null> {
   const res = await fetch(dashboardEndpoint('drilldown') + '?range=' + encodeURIComponent(range), {
+    headers: { Accept: 'application/json' },
+  })
+  if (!res.ok) return null
+  return res.json()
+}
+
+export async function fetchResearchIndex(filters: { project?: string; signature?: string } = {}): Promise<ResearchIndexResponse | null> {
+  const params = new URLSearchParams()
+  if (filters.project) params.set('project', filters.project)
+  if (filters.signature) params.set('signature', filters.signature)
+  const query = params.size > 0 ? '?' + params.toString() : ''
+  const res = await fetch(dashboardEndpoint('research-index') + query, {
     headers: { Accept: 'application/json' },
   })
   if (!res.ok) return null

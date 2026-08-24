@@ -6,6 +6,12 @@ import {
   parentPort,
   workerData,
 } from "node:worker_threads";
+import {
+  buildResearchIndex,
+  extractResearchObservations,
+  type ResearchIndex,
+  type ResearchObservations,
+} from "./research-index.js";
 
 export const DEFAULT_EVENT_STORE_MAX_ROWS = 100_000;
 export const DEFAULT_EVENT_STORE_RETENTION_DAYS = 14;
@@ -50,6 +56,9 @@ export interface EventStoreCallSample {
   arguments?: unknown;
   targetTool?: string;
   sessionId?: string;
+  agentSignature?: string;
+  projectName?: string;
+  projectPath?: string;
   principal?: string;
   /** How the calling client reached the listener: the `callmux` CLI verbs vs any MCP client */
   transport?: "cli" | "mcp";
@@ -65,7 +74,10 @@ export interface EventStoreCallSample {
   downstreamCalls?: number;
   targets?: EventTargetSample[];
   forwardedHeaders?: string[];
+  research?: ResearchObservations;
 }
+
+export type EventStoreResearchIndex = ResearchIndex;
 
 interface EventStoreBreakdownRow {
   name: string;
@@ -116,6 +128,9 @@ CREATE TABLE IF NOT EXISTS call_events (
   arguments_json TEXT,
   target_tool TEXT,
   session_id TEXT,
+  agent_signature TEXT,
+  project_name TEXT,
+  project_path TEXT,
   principal TEXT,
   transport TEXT,
   duration_ms INTEGER NOT NULL,
@@ -150,6 +165,28 @@ CREATE TABLE IF NOT EXISTS forwarded_header_usage (
   header_name TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS research_queries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL REFERENCES call_events(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL,
+  query TEXT NOT NULL,
+  UNIQUE(event_id, provider, query)
+);
+
+CREATE TABLE IF NOT EXISTS web_page_observations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER NOT NULL REFERENCES call_events(id) ON DELETE CASCADE,
+  provider TEXT NOT NULL,
+  url TEXT NOT NULL,
+  canonical_url TEXT NOT NULL,
+  domain TEXT NOT NULL,
+  path TEXT NOT NULL,
+  relation TEXT NOT NULL,
+  title TEXT,
+  source_query TEXT NOT NULL DEFAULT '',
+  UNIQUE(event_id, provider, canonical_url, relation, source_query)
+);
+
 CREATE INDEX IF NOT EXISTS idx_call_events_ts ON call_events(ts_ms);
 CREATE INDEX IF NOT EXISTS idx_call_events_server_ts ON call_events(server, ts_ms);
 CREATE INDEX IF NOT EXISTS idx_call_events_tool_ts ON call_events(tool, ts_ms);
@@ -157,6 +194,9 @@ CREATE INDEX IF NOT EXISTS idx_call_events_session_ts ON call_events(session_id,
 CREATE INDEX IF NOT EXISTS idx_call_event_targets_server_tool ON call_event_targets(server, tool);
 CREATE INDEX IF NOT EXISTS idx_forwarded_header_usage_ts ON forwarded_header_usage(ts_ms);
 CREATE INDEX IF NOT EXISTS idx_forwarded_header_usage_server ON forwarded_header_usage(server, header_name, ts_ms);
+CREATE INDEX IF NOT EXISTS idx_research_queries_provider_query ON research_queries(provider, query);
+CREATE INDEX IF NOT EXISTS idx_web_page_observations_domain ON web_page_observations(domain, path);
+CREATE INDEX IF NOT EXISTS idx_web_page_observations_url ON web_page_observations(canonical_url);
 
 CREATE VIEW IF NOT EXISTS audit_forwarded_headers AS
 SELECT
@@ -180,6 +220,26 @@ function integerOr(value: number | undefined, fallback = 0): number {
 
 function textOr(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
+}
+
+function jsonArray(value: unknown): unknown[] {
+  if (typeof value !== "string") return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function projectArray(value: unknown): Array<{ name: string; path: string }> {
+  return jsonArray(value).flatMap((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const record = item as Record<string, unknown>;
+    const name = textOr(record.name);
+    const path = textOr(record.path);
+    return name && path ? [{ name, path }] : [];
+  });
 }
 
 function serializeArguments(value: unknown): string | null {
@@ -214,6 +274,8 @@ class EventStoreEngine {
   private readonly insertEvent: StatementSync;
   private readonly insertTarget: StatementSync;
   private readonly insertForwardedHeader: StatementSync;
+  private readonly insertResearchQuery: StatementSync;
+  private readonly insertWebPageObservation: StatementSync;
   private readonly pruneAgeStmt: StatementSync;
   private readonly pruneRowsStmt: StatementSync;
   private readonly totalsStmt: StatementSync;
@@ -234,10 +296,11 @@ class EventStoreEngine {
     this.migrateCallEventColumns();
     this.insertEvent = this.db.prepare(`
       INSERT INTO call_events (
-        ts_ms, ts, server, tool, arguments_json, target_tool, session_id, principal, transport, duration_ms,
+        ts_ms, ts, server, tool, arguments_json, target_tool, session_id,
+        agent_signature, project_name, project_path, principal, transport, duration_ms,
         ok, status, error_class, bytes_in, bytes_out, cache_hit, tool_kind,
         operation, downstream_calls
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     this.insertTarget = this.db.prepare(`
       INSERT INTO call_event_targets (event_id, server, tool, count)
@@ -247,6 +310,15 @@ class EventStoreEngine {
       INSERT INTO forwarded_header_usage (
         event_id, ts_ms, ts, server, tool, session_id, principal, header_name
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    this.insertResearchQuery = this.db.prepare(`
+      INSERT OR IGNORE INTO research_queries (event_id, provider, query)
+      VALUES (?, ?, ?)
+    `);
+    this.insertWebPageObservation = this.db.prepare(`
+      INSERT OR IGNORE INTO web_page_observations (
+        event_id, provider, url, canonical_url, domain, path, relation, title, source_query
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     this.pruneAgeStmt = this.db.prepare("DELETE FROM call_events WHERE ts_ms < ?");
     this.pruneRowsStmt = this.db.prepare(`
@@ -355,6 +427,7 @@ class EventStoreEngine {
       ORDER BY calls DESC, lastSeenAt DESC
       LIMIT ?
     `);
+    this.backfillResearchObservations();
   }
 
   /** `CREATE TABLE IF NOT EXISTS` doesn't add columns to a table that already existed on disk. */
@@ -366,6 +439,15 @@ class EventStoreEngine {
     }
     if (!names.has("arguments_json")) {
       this.db.exec("ALTER TABLE call_events ADD COLUMN arguments_json TEXT");
+    }
+    if (!names.has("agent_signature")) {
+      this.db.exec("ALTER TABLE call_events ADD COLUMN agent_signature TEXT");
+    }
+    if (!names.has("project_name")) {
+      this.db.exec("ALTER TABLE call_events ADD COLUMN project_name TEXT");
+    }
+    if (!names.has("project_path")) {
+      this.db.exec("ALTER TABLE call_events ADD COLUMN project_path TEXT");
     }
     // Builds before 0.24.2 classified downstream tool failures separately but
     // accidentally persisted them as ok=1. Repair historical rows on open so
@@ -395,52 +477,122 @@ class EventStoreEngine {
   }
 
   private insertCall(sample: EventStoreCallSample): void {
-      const tsMs = sample.timestampMs ?? this.now();
-      const ts = new Date(tsMs).toISOString();
-      const targets = this.normalizeTargets(sample);
-      const forwardedHeaders = [...new Set((sample.forwardedHeaders ?? []).map((h) => h.toLowerCase()))]
-        .filter(Boolean)
-        .sort();
-      const result = this.insertEvent.run(
-        tsMs,
-        ts,
-        sample.server ?? null,
-        sample.tool,
-        serializeArguments(sample.arguments),
-        sample.targetTool ?? null,
-        sample.sessionId ?? null,
-        sample.principal ?? null,
-        sample.transport ?? null,
-        integerOr(sample.durationMs),
-        sample.ok ? 1 : 0,
-        sample.status ?? null,
-        sample.errorClass ?? null,
-        integerOr(sample.bytesIn),
-        integerOr(sample.bytesOut),
-        sample.cacheHit ? 1 : 0,
-        sample.toolKind ?? null,
-        sample.operation ?? null,
-        integerOr(sample.downstreamCalls)
+    const tsMs = sample.timestampMs ?? this.now();
+    const ts = new Date(tsMs).toISOString();
+    const targets = this.normalizeTargets(sample);
+    const forwardedHeaders = [...new Set((sample.forwardedHeaders ?? []).map((h) => h.toLowerCase()))]
+      .filter(Boolean)
+      .sort();
+    const result = this.insertEvent.run(
+      tsMs,
+      ts,
+      sample.server ?? null,
+      sample.tool,
+      serializeArguments(sample.arguments),
+      sample.targetTool ?? null,
+      sample.sessionId ?? null,
+      sample.agentSignature ?? null,
+      sample.projectName ?? null,
+      sample.projectPath ?? null,
+      sample.principal ?? null,
+      sample.transport ?? null,
+      integerOr(sample.durationMs),
+      sample.ok ? 1 : 0,
+      sample.status ?? null,
+      sample.errorClass ?? null,
+      integerOr(sample.bytesIn),
+      integerOr(sample.bytesOut),
+      sample.cacheHit ? 1 : 0,
+      sample.toolKind ?? null,
+      sample.operation ?? null,
+      integerOr(sample.downstreamCalls)
+    );
+    const eventId = Number(result.lastInsertRowid);
+    for (const target of targets) {
+      this.insertTarget.run(eventId, target.server ?? null, target.tool, integerOr(target.count, 1));
+    }
+    for (const target of targets) {
+      if (!target.server) continue;
+      for (const header of forwardedHeaders) {
+        this.insertForwardedHeader.run(
+          eventId,
+          tsMs,
+          ts,
+          target.server,
+          target.tool,
+          sample.sessionId ?? null,
+          sample.principal ?? null,
+          header
+        );
+      }
+    }
+    this.insertResearchObservations(eventId, sample.research ?? {
+      queries: [],
+      pages: [],
+    });
+  }
+
+  private insertResearchObservations(
+    eventId: number,
+    observations: ResearchObservations
+  ): void {
+    for (const observation of observations.queries) {
+      this.insertResearchQuery.run(
+        eventId,
+        observation.provider,
+        observation.query
       );
-      const eventId = Number(result.lastInsertRowid);
-      for (const target of targets) {
-        this.insertTarget.run(eventId, target.server ?? null, target.tool, integerOr(target.count, 1));
-      }
-      for (const target of targets) {
-        if (!target.server) continue;
-        for (const header of forwardedHeaders) {
-          this.insertForwardedHeader.run(
-            eventId,
-            tsMs,
-            ts,
-            target.server,
-            target.tool,
-            sample.sessionId ?? null,
-            sample.principal ?? null,
-            header
-          );
+    }
+    for (const observation of observations.pages) {
+      this.insertWebPageObservation.run(
+        eventId,
+        observation.provider,
+        observation.url,
+        observation.canonicalUrl,
+        observation.domain,
+        observation.path,
+        observation.relation,
+        observation.title ?? null,
+        observation.query ?? ""
+      );
+    }
+  }
+
+  /** Populate the index from pre-index call arguments without inventing search-result visits. */
+  private backfillResearchObservations(): void {
+    const rows = this.db.prepare(`
+      SELECT e.id, e.tool, e.arguments_json
+      FROM call_events e
+      WHERE e.ok = 1
+        AND e.arguments_json IS NOT NULL
+        AND (
+          e.tool LIKE '%web_search_exa'
+          OR e.tool LIKE '%web_fetch_exa'
+          OR e.tool LIKE '%web_search_sogou'
+          OR e.tool LIKE '%web_fetch_sogou'
+          OR e.tool LIKE '%batch_research_sogou'
+          OR e.tool IN ('callmux_call', 'callmux_parallel', 'callmux_batch', 'callmux_pipeline')
+        )
+    `).all();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const row of rows) {
+        let args: unknown;
+        try {
+          args = JSON.parse(textOr(row.arguments_json, "null"));
+        } catch {
+          continue;
         }
+        this.insertResearchObservations(
+          numberOr(row.id),
+          extractResearchObservations(textOr(row.tool), args)
+        );
       }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   queryDrilldown(options: {
@@ -474,6 +626,127 @@ class EventStoreEngine {
         lastSeenAt: textOr(row.lastSeenAt),
       })),
     };
+  }
+
+  queryResearchIndex(options: {
+    fromMs?: number;
+    toMs?: number;
+    limit?: number;
+    project?: string;
+    signature?: string;
+  } = {}): EventStoreResearchIndex {
+    const toMs = options.toMs ?? this.now();
+    const fromMs = options.fromMs ?? 0;
+    const limit = Math.max(1, Math.min(500, Math.round(options.limit ?? 100)));
+    const project = options.project?.trim() ?? "";
+    const signature = options.signature?.trim() ?? "";
+    const queryRows = this.db.prepare(`
+      SELECT
+        q.provider AS provider,
+        q.query AS query,
+        COUNT(DISTINCT q.event_id) AS calls,
+        MIN(e.ts) AS firstSeenAt,
+        MAX(e.ts) AS lastSeenAt,
+        COALESCE(
+          json_group_array(DISTINCT e.agent_signature)
+            FILTER (WHERE e.agent_signature IS NOT NULL AND e.agent_signature <> ''),
+          '[]'
+        ) AS signaturesJson,
+        COALESCE(
+          json_group_array(DISTINCT json_object('name', e.project_name, 'path', e.project_path))
+            FILTER (WHERE e.project_name IS NOT NULL AND e.project_path IS NOT NULL),
+          '[]'
+        ) AS projectsJson
+      FROM research_queries q
+      JOIN call_events e ON e.id = q.event_id
+      WHERE e.ts_ms >= ? AND e.ts_ms <= ?
+        AND (? = '' OR e.agent_signature = ?)
+        AND (? = '' OR e.project_name = ? OR e.project_path = ?)
+      GROUP BY q.provider, q.query
+    `).all(fromMs, toMs, signature, signature, project, project, project).map((row) => ({
+      provider: textOr(row.provider) as "exa" | "sogou",
+      query: textOr(row.query),
+      calls: numberOr(row.calls),
+      firstSeenAt: textOr(row.firstSeenAt),
+      lastSeenAt: textOr(row.lastSeenAt),
+      signatures: jsonArray(row.signaturesJson).map(String).sort(),
+      projects: projectArray(row.projectsJson),
+    }));
+
+    const aggregates = new Map<string, {
+      provider: "exa" | "sogou";
+      url: string;
+      canonicalUrl: string;
+      domain: string;
+      path: string;
+      title?: string;
+      discoveries: number;
+      fetches: number;
+      queries: Set<string>;
+      signatures: Set<string>;
+      projects: Map<string, { name: string; path: string }>;
+      firstSeenAt: string;
+      lastSeenAt: string;
+    }>();
+    const pageRows = this.db.prepare(`
+      SELECT
+        p.provider, p.url, p.canonical_url, p.domain, p.path,
+        p.relation, p.title, p.source_query, e.ts,
+        e.agent_signature, e.project_name, e.project_path
+      FROM web_page_observations p
+      JOIN call_events e ON e.id = p.event_id
+      WHERE e.ts_ms >= ? AND e.ts_ms <= ?
+        AND (? = '' OR e.agent_signature = ?)
+        AND (? = '' OR e.project_name = ? OR e.project_path = ?)
+      ORDER BY e.ts ASC, p.id ASC
+    `).all(fromMs, toMs, signature, signature, project, project, project);
+    for (const row of pageRows) {
+      const provider = textOr(row.provider) as "exa" | "sogou";
+      const canonicalUrl = textOr(row.canonical_url);
+      const key = `${provider}\0${canonicalUrl}`;
+      let aggregate = aggregates.get(key);
+      if (!aggregate) {
+        aggregate = {
+          provider,
+          url: textOr(row.url),
+          canonicalUrl,
+          domain: textOr(row.domain),
+          path: textOr(row.path, "/"),
+          discoveries: 0,
+          fetches: 0,
+          queries: new Set(),
+          signatures: new Set(),
+          projects: new Map(),
+          firstSeenAt: textOr(row.ts),
+          lastSeenAt: textOr(row.ts),
+        };
+        aggregates.set(key, aggregate);
+      }
+      aggregate.url = textOr(row.url, aggregate.url);
+      if (textOr(row.title)) aggregate.title = textOr(row.title);
+      if (textOr(row.source_query)) aggregate.queries.add(textOr(row.source_query));
+      if (textOr(row.agent_signature)) aggregate.signatures.add(textOr(row.agent_signature));
+      if (textOr(row.project_name) && textOr(row.project_path)) {
+        aggregate.projects.set(textOr(row.project_path), {
+          name: textOr(row.project_name),
+          path: textOr(row.project_path),
+        });
+      }
+      if (textOr(row.relation) === "discovered") aggregate.discoveries += 1;
+      if (textOr(row.relation) === "fetched") aggregate.fetches += 1;
+      aggregate.lastSeenAt = textOr(row.ts, aggregate.lastSeenAt);
+    }
+
+    return buildResearchIndex(
+      queryRows,
+      [...aggregates.values()].map((row) => ({
+        ...row,
+        queries: [...row.queries].sort(),
+        signatures: [...row.signatures].sort(),
+        projects: [...row.projects.values()].sort((left, right) => left.name.localeCompare(right.name)),
+      })),
+      limit
+    );
   }
 
   prune(now: number = this.now()): void {
@@ -536,6 +809,7 @@ const EVENT_STORE_MAX_PENDING_SAMPLES = 10_000;
 type WorkerCommand =
   | { id: number; type: "record"; samples: EventStoreCallSample[] }
   | { id: number; type: "query"; options: { fromMs?: number; toMs?: number; limit?: number } }
+  | { id: number; type: "research-index"; options: { fromMs?: number; toMs?: number; limit?: number; project?: string; signature?: string } }
   | { id: number; type: "close" };
 
 type WorkerReply =
@@ -652,6 +926,21 @@ export class EventStore {
     return await this.request("query", { options: normalized }) as EventStoreDrilldown;
   }
 
+  async queryResearchIndex(options: {
+    fromMs?: number;
+    toMs?: number;
+    limit?: number;
+    project?: string;
+    signature?: string;
+  } = {}): Promise<EventStoreResearchIndex> {
+    await this.flush();
+    const normalized = {
+      ...options,
+      ...(options.toMs === undefined ? { toMs: this.now() } : {}),
+    };
+    return await this.request("research-index", { options: normalized }) as EventStoreResearchIndex;
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     try {
@@ -695,7 +984,7 @@ export class EventStore {
   }
 
   private request(
-    type: "record" | "query" | "close",
+    type: "record" | "query" | "research-index" | "close",
     payload: Record<string, unknown>
   ): Promise<unknown> {
     if (this.terminalError) return Promise.reject(this.terminalError);
@@ -781,6 +1070,12 @@ async function runEventStoreWorker(data: EventStoreWorkerData): Promise<void> {
             id: command.id,
             ok: true,
             result: engine.queryDrilldown(command.options),
+          } satisfies WorkerReply);
+        } else if (command.type === "research-index") {
+          port.postMessage({
+            id: command.id,
+            ok: true,
+            result: engine.queryResearchIndex(command.options),
           } satisfies WorkerReply);
         } else {
           engine.close();

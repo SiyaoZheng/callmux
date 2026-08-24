@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { AddressInfo } from "node:net";
-import { isAbsolute, dirname, join, resolve as resolvePath } from "node:path";
+import { basename, isAbsolute, dirname, join, resolve as resolvePath } from "node:path";
 import { homedir } from "node:os";
 import { readFile, writeFile, mkdir, rename } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -72,6 +72,7 @@ import {
   openEventStore,
   type EventStoreCallSample,
 } from "./event-store.js";
+import { extractResearchObservations } from "./research-index.js";
 import {
   applyManagementOverlay,
   assertServerConfig,
@@ -101,6 +102,8 @@ const METRICS_RANGES: MetricsRange[] = ["1h", "today", "yesterday", "7d", "30d"]
 const REQUEST_ID_HEADER = "x-request-id";
 const CWD_HEADER = "x-callmux-cwd";
 const CLIENT_HEADER = "x-callmux-client";
+const AGENT_HEADER = "x-callmux-agent";
+const THREAD_HEADER = "x-callmux-thread-id";
 const DEFAULT_LISTENER_SESSION_INACTIVITY_TTL_MS = 30 * 60_000;
 const DEFAULT_LISTENER_MAX_SESSIONS = 1_000;
 const SESSION_SWEEP_MAX_INTERVAL_MS = 60_000;
@@ -132,6 +135,7 @@ interface SessionEntry {
   cwdSource?: "header" | "meta" | "roots";
   forwardedHeaders?: Record<string, string>;
   clientKind?: "stdio-bridge" | "cli";
+  agentSignature?: string;
   rootsAttempted?: boolean;
   lastActivityMs: number;
   activeRequests: number;
@@ -428,6 +432,7 @@ export class CallmuxListener {
             ...(session.cwd ? { cwd: session.cwd } : {}),
             ...(session.cwdSource ? { cwdSource: session.cwdSource } : {}),
             ...(session.clientKind ? { clientKind: session.clientKind } : {}),
+            ...(session.agentSignature ? { agentSignature: session.agentSignature } : {}),
             ...(clientName ? { client: clientName } : {}),
             clientRoots,
             rootsAttempted: session.rootsAttempted === true,
@@ -739,7 +744,8 @@ export class CallmuxListener {
       path === this.dashboardChildPath(base, "data") ||
       path === this.dashboardChildPath(base, "events") ||
       path === this.dashboardChildPath(base, "series") ||
-      path === this.dashboardChildPath(base, "drilldown")
+      path === this.dashboardChildPath(base, "drilldown") ||
+      path === this.dashboardChildPath(base, "research-index")
     );
   }
 
@@ -761,7 +767,7 @@ export class CallmuxListener {
     if (this.dashboardConfig.enabled) {
       const base = this.dashboardConfig.path;
       if (this.isDashboardBasePath(path, base)) return base;
-      for (const child of ["data", "events", "series", "drilldown"]) {
+      for (const child of ["data", "events", "series", "drilldown", "research-index"]) {
         const route = this.dashboardChildPath(base, child);
         if (path === route) return route;
       }
@@ -1106,6 +1112,11 @@ export class CallmuxListener {
       return;
     }
 
+    if (path === this.dashboardChildPath(base, "research-index")) {
+      await this.handleDashboardResearchIndex(req, res, context);
+      return;
+    }
+
     this.writeJson(res, 404, context, { error: "Not found" });
   }
 
@@ -1210,6 +1221,34 @@ export class CallmuxListener {
       from: window.from,
       to: window.to,
       ...drilldown,
+    });
+  }
+
+  private async handleDashboardResearchIndex(
+    req: IncomingMessage,
+    res: ServerResponse,
+    context: RequestContext
+  ): Promise<void> {
+    if (!this.eventStore) {
+      this.writeJson(res, 200, context, {
+        enabled: false,
+        reason: "eventStore.enabled is false",
+      });
+      return;
+    }
+    const params = new URL(req.url ?? "/", "http://localhost").searchParams;
+    const rawLimit = Number(params.get("limit"));
+    const limit = Number.isInteger(rawLimit) && rawLimit > 0 ? rawLimit : 100;
+    const project = params.get("project")?.trim() || undefined;
+    const signature = params.get("signature")?.trim() || undefined;
+    const index = await this.eventStore.queryResearchIndex({
+      limit,
+      ...(project ? { project } : {}),
+      ...(signature ? { signature } : {}),
+    });
+    this.writeJson(res, 200, context, {
+      enabled: true,
+      ...index,
     });
   }
 
@@ -1836,13 +1875,24 @@ export class CallmuxListener {
 
   private sessionCwdFromHeader(
     req: IncomingMessage
-  ): Pick<SessionEntry, "cwd" | "cwdSource" | "clientKind"> {
+  ): Pick<SessionEntry, "cwd" | "cwdSource" | "clientKind" | "agentSignature"> {
     const cwd = this.normalizeSessionCwd(headerValue(req.headers[CWD_HEADER]));
     const clientKind = this.clientKindFromHeader(req);
+    const agentSignature = this.agentSignatureFromHeaders(req);
     return {
       ...(cwd ? { cwd, cwdSource: "header" as const } : {}),
       ...(clientKind ? { clientKind } : {}),
+      ...(agentSignature ? { agentSignature } : {}),
     };
+  }
+
+  private agentSignatureFromHeaders(req: IncomingMessage): string | undefined {
+    if (headerValue(req.headers[AGENT_HEADER]) !== "codex") return undefined;
+    const threadId = headerValue(req.headers[THREAD_HEADER])?.trim();
+    if (!threadId || threadId.length > 160 || !/^[A-Za-z0-9._:-]+$/.test(threadId)) {
+      return undefined;
+    }
+    return `Codex/${threadId}`;
   }
 
   private setSessionCwdFromHeader(session: SessionEntry, req: IncomingMessage): void {
@@ -1853,6 +1903,8 @@ export class CallmuxListener {
     }
     const clientKind = this.clientKindFromHeader(req);
     if (clientKind) session.clientKind = clientKind;
+    const agentSignature = this.agentSignatureFromHeaders(req);
+    if (agentSignature) session.agentSignature = agentSignature;
   }
 
   private configuredForwardHeaderNames(): Set<string> {
@@ -1935,6 +1987,11 @@ export class CallmuxListener {
       ...(extra.sessionId ? { sessionId: extra.sessionId } : {}),
       ...(session?.forwardedHeaders ? { forwardedHeaders: session.forwardedHeaders } : {}),
       transport: session?.clientKind === "cli" ? "cli" : "mcp",
+      ...(session?.agentSignature ? { agentSignature: session.agentSignature } : {}),
+      ...(session?.cwd ? {
+        projectPath: session.cwd,
+        projectName: basename(session.cwd) || session.cwd,
+      } : {}),
     };
 
     const metaCwd = this.cwdFromMeta(extra._meta);
@@ -1944,7 +2001,12 @@ export class CallmuxListener {
     }
 
     if (session?.cwd) {
-      return { ...context, cwd: session.cwd };
+      return {
+        ...context,
+        cwd: session.cwd,
+        projectPath: session.cwd,
+        projectName: basename(session.cwd) || session.cwd,
+      };
     }
 
     if (!session || session.rootsAttempted || !server.getClientCapabilities()?.roots) {
@@ -1961,7 +2023,12 @@ export class CallmuxListener {
       if (cwd) {
         session.cwd = cwd;
         session.cwdSource = "roots";
-        return { ...context, cwd };
+        return {
+          ...context,
+          cwd,
+          projectPath: cwd,
+          projectName: basename(cwd) || cwd,
+        };
       }
     } catch {}
 
@@ -1981,6 +2048,11 @@ export class CallmuxListener {
       ...(extra.sessionId ? { sessionId: extra.sessionId } : {}),
       ...(session?.forwardedHeaders ? { forwardedHeaders: session.forwardedHeaders } : {}),
       transport: session?.clientKind === "cli" ? "cli" : "mcp",
+      ...(session?.agentSignature ? { agentSignature: session.agentSignature } : {}),
+      ...(session?.cwd ? {
+        projectPath: session.cwd,
+        projectName: basename(session.cwd) || session.cwd,
+      } : {}),
     };
   }
 
@@ -2771,6 +2843,9 @@ export class CallmuxListener {
         ...(target?.server ? { server: target.server } : {}),
         ...(target?.tool ? { targetTool: target.tool } : {}),
         ...(toolContext?.sessionId ? { sessionId: toolContext.sessionId } : {}),
+        ...(toolContext?.agentSignature ? { agentSignature: toolContext.agentSignature } : {}),
+        ...(toolContext?.projectName ? { projectName: toolContext.projectName } : {}),
+        ...(toolContext?.projectPath ? { projectPath: toolContext.projectPath } : {}),
         ...(this.principalLabel(this.authzContext.getStore()) ? { principal: this.principalLabel(this.authzContext.getStore()) } : {}),
         transport: toolContext?.transport ?? "mcp",
         durationMs,
@@ -2785,6 +2860,7 @@ export class CallmuxListener {
         downstreamCalls: summary.totalDownstreamToolCalls,
         targets: summary.downstreamTargets,
         forwardedHeaders: this.forwardedHeaderNamesForEvent(summary, toolContext),
+        research: extractResearchObservations(tool, args, result),
       };
       try {
         this.eventStore.recordCall(event);

@@ -104,6 +104,65 @@ test("event store records call rows and drill-down breakdowns", async () => {
   }
 });
 
+test("event store backfills URL tree and query index from existing call arguments", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-research-index-"));
+  const path = join(dir, "events.sqlite");
+  const first = await openEventStore({ path, now: () => T0 });
+  try {
+    first.recordCall({
+      timestampMs: T0 - 1_000,
+      server: "exa",
+      tool: "web_search_exa",
+      agentSignature: "Codex/thread-a",
+      projectName: "CPED-OpenAleph",
+      projectPath: "/work/CPED-OpenAleph",
+      arguments: { query: "中国 政商关系" },
+      durationMs: 20,
+      ok: true,
+    });
+    first.recordCall({
+      timestampMs: T0,
+      server: "exa",
+      tool: "web_fetch_exa",
+      agentSignature: "Codex/thread-a",
+      projectName: "CPED-OpenAleph",
+      projectPath: "/work/CPED-OpenAleph",
+      arguments: {
+        urls: [
+          "https://example.com/research/a",
+          "https://example.com/research/b?utm_source=test",
+        ],
+      },
+      durationMs: 30,
+      ok: true,
+    });
+  } finally {
+    await first.close();
+  }
+
+  const reopened = await openEventStore({ path, now: () => T0 + 1_000 });
+  try {
+    const index = await reopened.queryResearchIndex();
+    assert.equal(index.totals.queries, 1);
+    assert.equal(index.totals.pages, 2);
+    assert.equal(index.totals.fetches, 2);
+    assert.equal(index.urlTree[0].segment, "example.com");
+    assert.deepEqual(index.urlTree[0].signatures, ["Codex/thread-a"]);
+    assert.deepEqual(index.urlTree[0].projects, [{
+      name: "CPED-OpenAleph",
+      path: "/work/CPED-OpenAleph",
+    }]);
+    assert.deepEqual(index.topQueries[0].signatures, ["Codex/thread-a"]);
+    assert.equal((await reopened.queryResearchIndex({ signature: "Codex/other" })).totals.pages, 0);
+    assert.equal((await reopened.queryResearchIndex({ project: "CPED-OpenAleph" })).totals.pages, 2);
+    assert.equal(index.urlTree[0].children[0].segment, "research");
+    assert.equal(index.pages.some((page) => page.canonicalUrl.endsWith("/research/b")), true);
+  } finally {
+    await reopened.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("event store prunes by max rows and age", async () => {
   const dir = await mkdtemp(join(tmpdir(), "callmux-event-prune-"));
   const store = await openEventStore({

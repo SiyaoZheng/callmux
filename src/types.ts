@@ -422,6 +422,11 @@ export interface ToolCallContext {
   timeoutMs?: number;
   /** How the calling client reached the listener: the `callmux` CLI verbs vs any MCP client */
   transport?: "cli" | "mcp";
+  /** Stable agent/task attribution supplied by a trusted local bridge. */
+  agentSignature?: string;
+  /** Project identity derived from the bridge/session working directory. */
+  projectName?: string;
+  projectPath?: string;
 }
 
 export interface ListenerRuntimeDiagnostics {
@@ -460,6 +465,7 @@ export interface ListenerRuntimeDiagnostics {
     cwd?: string;
     cwdSource?: "header" | "meta" | "roots";
     clientKind?: "stdio-bridge" | "cli";
+    agentSignature?: string;
     /** Reported MCP client name (clientInfo.name), when the client supplied one. */
     client?: string;
     /** Whether the client advertised the `roots` capability — the channel callmux uses to learn a session's cwd when no header/_meta is present. */

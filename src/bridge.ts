@@ -12,6 +12,8 @@ import { errorResult } from "./results.js";
 
 const BRIDGE_CWD_HEADER = "x-callmux-cwd";
 const BRIDGE_CLIENT_HEADER = "x-callmux-client";
+const BRIDGE_AGENT_HEADER = "x-callmux-agent";
+const BRIDGE_THREAD_HEADER = "x-callmux-thread-id";
 const META_TOOL_TIMEOUT_OVERHEAD_MS = 5_000;
 
 interface BridgeOptions {
@@ -47,10 +49,19 @@ function combineExecutionStates(
 }
 
 function bridgeHeaders(options: BridgeOptions): Record<string, string> {
+  const codexThreadId = (
+    process.env.CODEX_THREAD_ID ?? process.env.CODEX_SESSION_ID ?? ""
+  ).trim();
   return {
     ...(options.headers ?? {}),
     [BRIDGE_CWD_HEADER]: options.cwd,
     [BRIDGE_CLIENT_HEADER]: "stdio-bridge",
+    ...(process.env.CODEX_HOME && codexThreadId
+      ? {
+          [BRIDGE_AGENT_HEADER]: "codex",
+          [BRIDGE_THREAD_HEADER]: codexThreadId,
+        }
+      : {}),
   };
 }
 

@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import {
   fetchDrilldown,
+  fetchResearchIndex,
   fetchSeries,
   fetchSnapshot,
 } from '@/lib/api'
@@ -9,6 +10,7 @@ import type {
   DrilldownResponse,
   EventFilters,
   MetricsRange,
+  ResearchIndexResponse,
   SeriesResponse,
   ThemeName,
   ViewId,
@@ -20,7 +22,7 @@ const RANGE_KEY = 'callmux-dashboard-range'
 const TOKEN_KEY = 'callmux-management-token'
 
 const THEMES: ThemeName[] = ['light', 'dark', 'midnight', 'nord', 'ember', 'parchment']
-const VIEWS: ViewId[] = ['overview', 'servers', 'management', 'tools', 'diagrams', 'drilldown', 'events', 'runtime']
+const VIEWS: ViewId[] = ['overview', 'servers', 'management', 'tools', 'diagrams', 'drilldown', 'research', 'events', 'runtime']
 const RANGES: MetricsRange[] = ['1h', 'today', 'yesterday', '7d', '30d']
 
 function readStorage(key: string, fallback: string): string {
@@ -67,6 +69,8 @@ interface DashboardState {
   snapshot: DashboardSnapshot | null
   series: SeriesResponse | null
   drilldown: DrilldownResponse | null
+  researchIndex: ResearchIndexResponse | null
+  researchFilters: { project: string; signature: string }
   connected: boolean
   lastUpdated: number | null
 
@@ -88,6 +92,7 @@ interface DashboardState {
   setTheme: (theme: ThemeName) => void
   setRange: (range: MetricsRange) => void
   setFilter: (patch: Partial<EventFilters>) => void
+  setResearchFilters: (patch: Partial<{ project: string; signature: string }>) => void
   setHideAgentStatus: (value: boolean) => void
   setHideTransportHttp: (value: boolean) => void
   setHideSessionReinit: (value: boolean) => void
@@ -99,12 +104,15 @@ interface DashboardState {
   refresh: () => Promise<void>
   loadSeries: () => Promise<void>
   loadDrilldown: () => Promise<void>
+  loadResearchIndex: () => Promise<void>
 }
 
 export const useStore = create<DashboardState>((set, get) => ({
   snapshot: null,
   series: null,
   drilldown: null,
+  researchIndex: null,
+  researchFilters: { project: '', signature: '' },
   connected: false,
   lastUpdated: null,
 
@@ -127,6 +135,7 @@ export const useStore = create<DashboardState>((set, get) => ({
     set({ view })
     if (view === 'diagrams') void get().loadSeries()
     if (view === 'drilldown') void get().loadDrilldown()
+    if (view === 'research') void get().loadResearchIndex()
   },
   setTheme: (theme) => {
     writeStorage(THEME_KEY, theme)
@@ -141,6 +150,7 @@ export const useStore = create<DashboardState>((set, get) => ({
     if (view === 'drilldown') void get().loadDrilldown()
   },
   setFilter: (patch) => set((s) => ({ filters: { ...s.filters, ...patch } })),
+  setResearchFilters: (patch) => set((s) => ({ researchFilters: { ...s.researchFilters, ...patch } })),
   setHideAgentStatus: (value) => set({ hideAgentStatus: value }),
   setHideTransportHttp: (value) => set({ hideTransportHttp: value }),
   setHideSessionReinit: (value) => set({ hideSessionReinit: value }),
@@ -172,5 +182,13 @@ export const useStore = create<DashboardState>((set, get) => ({
   loadDrilldown: async () => {
     const drilldown = await fetchDrilldown(get().range)
     set({ drilldown })
+  },
+  loadResearchIndex: async () => {
+    const filters = get().researchFilters
+    const researchIndex = await fetchResearchIndex({
+      ...(filters.project.trim() ? { project: filters.project.trim() } : {}),
+      ...(filters.signature.trim() ? { signature: filters.signature.trim() } : {}),
+    })
+    set({ researchIndex })
   },
 }))

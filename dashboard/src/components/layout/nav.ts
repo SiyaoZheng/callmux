@@ -1,4 +1,4 @@
-import { Activity, Boxes, Braces, LayoutDashboard, ScrollText, Search, Server, SlidersHorizontal } from 'lucide-react'
+import { Activity, Boxes, Braces, FolderTree, LayoutDashboard, ScrollText, Search, Server, SlidersHorizontal } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import type { ViewId } from '@/types'
 
@@ -16,6 +16,7 @@ export const NAV_ITEMS: NavItem[] = [
   { id: 'tools', label: 'Tool Suites', short: 'Tools', icon: Boxes },
   { id: 'diagrams', label: 'Runtime Diagrams', short: 'Diagrams', icon: Activity },
   { id: 'drilldown', label: 'Drill-down', short: 'Drill-down', icon: Search },
+  { id: 'research', label: 'Research Index', short: 'Index', icon: FolderTree },
   { id: 'events', label: 'Recent Events', short: 'Events', icon: ScrollText },
   { id: 'runtime', label: 'Runtime', short: 'Runtime', icon: Braces },
 ]

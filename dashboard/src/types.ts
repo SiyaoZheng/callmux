@@ -218,6 +218,77 @@ export interface DrilldownResponse {
   forwardedHeaders?: ForwardedHeaderRow[]
 }
 
+export type ResearchProvider = 'exa' | 'sogou'
+
+export interface ResearchQueryRow {
+  provider: ResearchProvider
+  query: string
+  calls: number
+  firstSeenAt: string
+  lastSeenAt: string
+  signatures: string[]
+  projects: ResearchProject[]
+}
+
+export interface ResearchProject {
+  name: string
+  path: string
+}
+
+export interface ResearchTermRow {
+  provider: ResearchProvider
+  term: string
+  uses: number
+}
+
+export interface WebPageRow {
+  provider: ResearchProvider
+  url: string
+  canonicalUrl: string
+  domain: string
+  path: string
+  title?: string
+  discoveries: number
+  fetches: number
+  queries: string[]
+  firstSeenAt: string
+  lastSeenAt: string
+  signatures: string[]
+  projects: ResearchProject[]
+}
+
+export interface UrlTreeNode {
+  segment: string
+  kind: 'domain' | 'path'
+  prefix: string
+  depth: number
+  pages: number
+  discoveries: number
+  fetches: number
+  firstSeenAt: string
+  lastSeenAt: string
+  signatures: string[]
+  projects: ResearchProject[]
+  children: UrlTreeNode[]
+}
+
+export interface ResearchIndexResponse {
+  enabled: boolean
+  reason?: string
+  totals?: {
+    queries: number
+    uniqueQueries: number
+    pages: number
+    domains: number
+    discoveries: number
+    fetches: number
+  }
+  topQueries?: ResearchQueryRow[]
+  topTerms?: ResearchTermRow[]
+  pages?: WebPageRow[]
+  urlTree?: UrlTreeNode[]
+}
+
 export type ThemeName = 'light' | 'dark' | 'midnight' | 'nord' | 'ember' | 'parchment'
 
 export type ViewId =
@@ -227,6 +298,7 @@ export type ViewId =
   | 'tools'
   | 'diagrams'
   | 'drilldown'
+  | 'research'
   | 'events'
   | 'runtime'
 

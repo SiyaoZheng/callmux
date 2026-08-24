@@ -10,6 +10,7 @@ import { ManagementView } from '@/components/views/management'
 import { ToolsView } from '@/components/views/tools'
 import { DiagramsView } from '@/components/views/diagrams'
 import { DrilldownView } from '@/components/views/drilldown'
+import { ResearchIndexView } from '@/components/views/research-index'
 import { EventsView } from '@/components/views/events'
 import { RuntimeView } from '@/components/views/runtime'
 import type { ViewId } from '@/types'
@@ -21,6 +22,7 @@ const VIEWS: Record<ViewId, () => React.JSX.Element> = {
   tools: ToolsView,
   diagrams: DiagramsView,
   drilldown: DrilldownView,
+  research: ResearchIndexView,
   events: EventsView,
   runtime: RuntimeView,
 }
@@ -36,6 +38,7 @@ export function App() {
   const refresh = useStore((s) => s.refresh)
   const loadSeries = useStore((s) => s.loadSeries)
   const loadDrilldown = useStore((s) => s.loadDrilldown)
+  const loadResearchIndex = useStore((s) => s.loadResearchIndex)
 
   // Apply the persisted theme before first paint.
   useEffect(() => {
@@ -69,6 +72,7 @@ export function App() {
       const current = useStore.getState().view
       if (current === 'diagrams') void loadSeries()
       if (current === 'drilldown') void loadDrilldown()
+      if (current === 'research') void loadResearchIndex()
     }, 15000)
 
     return () => {
@@ -76,7 +80,7 @@ export function App() {
       window.clearInterval(interval)
       document.removeEventListener('selectionchange', onSelectionChange)
     }
-  }, [refresh, loadSeries, loadDrilldown])
+  }, [refresh, loadSeries, loadDrilldown, loadResearchIndex])
 
   const ActiveView = VIEWS[view]
 
