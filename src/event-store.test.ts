@@ -169,6 +169,17 @@ test("event store backfills URL tree and query index from existing call argument
     )), true);
     assert.equal((await reopened.queryResearchIndex({ signature: "Codex/other" })).totals.pages, 0);
     assert.equal((await reopened.queryResearchIndex({ project: "CPED-OpenAleph" })).totals.pages, 2);
+    const exaOnly = await reopened.queryResearchIndex({ mcp: "exa" });
+    assert.equal(exaOnly.totals.queries, 1);
+    assert.equal(exaOnly.totals.pages, 2);
+    assert.equal(exaOnly.topQueries.every((row) => row.provider === "exa"), true);
+    const qichachaOnly = await reopened.queryResearchIndex({ provider: "qichacha" });
+    assert.equal(qichachaOnly.totals.queries, 1);
+    assert.equal(qichachaOnly.totals.pages, 0);
+    assert.deepEqual(qichachaOnly.topQueries.map((row) => row.query), [
+      "企查查科技股份有限公司",
+    ]);
+    assert.equal((await reopened.queryResearchIndex({ mcp: "qcc_risk" })).totals.queries, 0);
     assert.equal(index.urlTree[0].children[0].segment, "research");
     assert.equal(index.pages.some((page) => page.canonicalUrl.endsWith("/research/b")), true);
   } finally {

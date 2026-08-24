@@ -35,7 +35,24 @@ With the default path, callmux serves:
 
 The dashboard's history charts use the aggregate RRD JSON metrics store. The Drill-down tab is additive and requires the optional [SQLite event store](observability.md); it shows per-server, per-tool, per-session, and forwarded-header audit breakdowns for the selected range.
 
-The Research Index tab is also backed by the SQLite event store. It extracts Exa, Sogou, and Qichacha query terms; records Exa/Sogou search-result URLs as discovered and explicit page reads as fetched; and groups canonical URLs into a `domain -> path segment` hierarchy. Qichacha contributes query terms and attribution but does not treat returned company data as web pages. Set `eventStore.includeArguments` to `true` so the index can be rebuilt from stored tool arguments. New Codex bridge calls attach their `Codex/<thread-id>` signature and current project name/path; the endpoint returns those attributions and accepts optional `project` and `signature` query parameters.
+The Research Index tab is also backed by the SQLite event store. It extracts Exa, Sogou, and Qichacha query terms; records Exa/Sogou search-result URLs as discovered and explicit page reads as fetched; and groups canonical URLs into a `domain -> path segment` hierarchy. Qichacha contributes query terms and attribution but does not treat returned company data as web pages. Set `eventStore.includeArguments` to `true` so the index can be rebuilt from stored tool arguments. New Codex bridge calls attach their `Codex/<thread-id>` signature and current project name/path; the endpoint returns those attributions.
+
+`GET /dashboard/research-index` accepts these optional query parameters:
+
+- `project` - exact project name or path
+- `signature` - exact agent signature such as `Codex/<thread-id>`
+- `mcp` - exact MCP server name such as `exa`, `sogou`, or `qcc_company`
+- `provider` - source family: `exa`, `sogou`, or `qichacha`
+- `limit` - maximum rows per result section, from 1 to 500
+
+For example:
+
+```bash
+curl -sG http://127.0.0.1:4860/dashboard/research-index \
+  --data-urlencode 'project=CPED-OpenAleph' \
+  --data-urlencode 'mcp=qcc_company' \
+  --data-urlencode 'limit=20'
+```
 
 If listener auth is configured, dashboard requests use the same authentication as `/mcp`.
 

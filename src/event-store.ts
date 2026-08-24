@@ -637,12 +637,16 @@ class EventStoreEngine {
     limit?: number;
     project?: string;
     signature?: string;
+    mcp?: string;
+    provider?: ResearchProvider;
   } = {}): EventStoreResearchIndex {
     const toMs = options.toMs ?? this.now();
     const fromMs = options.fromMs ?? 0;
     const limit = Math.max(1, Math.min(500, Math.round(options.limit ?? 100)));
     const project = options.project?.trim() ?? "";
     const signature = options.signature?.trim() ?? "";
+    const mcp = options.mcp?.trim() ?? "";
+    const provider = options.provider?.trim() ?? "";
     const queryRows = this.db.prepare(`
       SELECT
         q.provider AS provider,
@@ -665,8 +669,22 @@ class EventStoreEngine {
       WHERE e.ts_ms >= ? AND e.ts_ms <= ?
         AND (? = '' OR e.agent_signature = ?)
         AND (? = '' OR e.project_name = ? OR e.project_path = ?)
+        AND (? = '' OR e.server = ?)
+        AND (? = '' OR q.provider = ?)
       GROUP BY q.provider, q.query
-    `).all(fromMs, toMs, signature, signature, project, project, project).map((row) => ({
+    `).all(
+      fromMs,
+      toMs,
+      signature,
+      signature,
+      project,
+      project,
+      project,
+      mcp,
+      mcp,
+      provider,
+      provider
+    ).map((row) => ({
       provider: textOr(row.provider) as ResearchProvider,
       query: textOr(row.query),
       calls: numberOr(row.calls),
@@ -701,8 +719,22 @@ class EventStoreEngine {
       WHERE e.ts_ms >= ? AND e.ts_ms <= ?
         AND (? = '' OR e.agent_signature = ?)
         AND (? = '' OR e.project_name = ? OR e.project_path = ?)
+        AND (? = '' OR e.server = ?)
+        AND (? = '' OR p.provider = ?)
       ORDER BY e.ts ASC, p.id ASC
-    `).all(fromMs, toMs, signature, signature, project, project, project);
+    `).all(
+      fromMs,
+      toMs,
+      signature,
+      signature,
+      project,
+      project,
+      project,
+      mcp,
+      mcp,
+      provider,
+      provider
+    );
     for (const row of pageRows) {
       const provider = textOr(row.provider) as ResearchProvider;
       const canonicalUrl = textOr(row.canonical_url);
@@ -812,7 +844,19 @@ const EVENT_STORE_MAX_PENDING_SAMPLES = 10_000;
 type WorkerCommand =
   | { id: number; type: "record"; samples: EventStoreCallSample[] }
   | { id: number; type: "query"; options: { fromMs?: number; toMs?: number; limit?: number } }
-  | { id: number; type: "research-index"; options: { fromMs?: number; toMs?: number; limit?: number; project?: string; signature?: string } }
+  | {
+      id: number;
+      type: "research-index";
+      options: {
+        fromMs?: number;
+        toMs?: number;
+        limit?: number;
+        project?: string;
+        signature?: string;
+        mcp?: string;
+        provider?: ResearchProvider;
+      };
+    }
   | { id: number; type: "close" };
 
 type WorkerReply =
@@ -935,6 +979,8 @@ export class EventStore {
     limit?: number;
     project?: string;
     signature?: string;
+    mcp?: string;
+    provider?: ResearchProvider;
   } = {}): Promise<EventStoreResearchIndex> {
     await this.flush();
     const normalized = {

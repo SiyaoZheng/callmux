@@ -1241,10 +1241,24 @@ export class CallmuxListener {
     const limit = Number.isInteger(rawLimit) && rawLimit > 0 ? rawLimit : 100;
     const project = params.get("project")?.trim() || undefined;
     const signature = params.get("signature")?.trim() || undefined;
+    const mcp = params.get("mcp")?.trim() || undefined;
+    const rawProvider = params.get("provider")?.trim();
+    const provider =
+      rawProvider === "exa" || rawProvider === "sogou" || rawProvider === "qichacha"
+        ? rawProvider
+        : undefined;
+    if (rawProvider && !provider) {
+      this.writeJson(res, 400, context, {
+        error: 'provider must be one of "exa", "sogou", or "qichacha"',
+      });
+      return;
+    }
     const index = await this.eventStore.queryResearchIndex({
       limit,
       ...(project ? { project } : {}),
       ...(signature ? { signature } : {}),
+      ...(mcp ? { mcp } : {}),
+      ...(provider ? { provider } : {}),
     });
     this.writeJson(res, 200, context, {
       enabled: true,
