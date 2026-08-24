@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 
-"""Thin FastMCP facade over the installed sogou-weixin CLI."""
+"""Full-stack FastMCP server for public Sogou Weixin research."""
 
 from __future__ import annotations
 
+import asyncio
 import json
-import os
 import re
-import subprocess
+from argparse import Namespace
 from datetime import datetime
 from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo
@@ -18,17 +18,16 @@ from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+import sogou_weixin_backend as backend
 
-CLI = os.environ.get("SOGOU_WEIXIN_BIN", "sogou-weixin")
-TIMEOUT_SECONDS = 300
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 mcp = FastMCP(
     "sogou-weixin",
-    version="0.3.0",
+    version="1.0.0",
     instructions=(
-        "Search and fetch public WeChat articles. Results expose normalized fields "
-        "for agents and raw_cli for exact-result caching and audit."
+        "Search and fetch public WeChat articles in-process. Results expose "
+        "normalized fields for agents and raw_backend for exact-result caching."
     ),
 )
 READ_ONLY = ToolAnnotations(
@@ -39,42 +38,112 @@ READ_ONLY = ToolAnnotations(
 )
 
 
-def _call_cli(
-    command: str,
-    *arguments: str,
-    stdin: str | None = None,
+def _parse_args(command: str, *arguments: str) -> Namespace:
+    try:
+        return backend.build_parser().parse_args([command, *arguments])
+    except SystemExit as exc:
+        raise ToolError(f"Invalid {command} arguments") from exc
+
+
+def _invoke(command: str, function: Any, args: Namespace) -> dict[str, Any]:
+    try:
+        return backend.envelope(command, function(args))
+    except backend.CliError as exc:
+        raise ToolError(f"{exc.code}: {exc.message}") from exc
+
+
+def _search_backend(query: str, page: int, limit: int) -> dict[str, Any]:
+    args = _parse_args(
+        "search",
+        query,
+        "--page",
+        str(page),
+        "--limit",
+        str(limit),
+        "--no-cache",
+    )
+    return _invoke("search", backend.command_search, args)
+
+
+def _fetch_backend(result: str, format: str, max_chars: int) -> dict[str, Any]:
+    args = _parse_args(
+        "fetch",
+        result,
+        "--format",
+        format,
+        "--max-chars",
+        str(max_chars),
+        "--no-cache",
+    )
+    return _invoke("fetch", backend.command_fetch, args)
+
+
+def _batch_search_backend(
+    queries: list[str], page: int, limit: int
 ) -> dict[str, Any]:
-    try:
-        completed = subprocess.run(
-            [CLI, "--json", command, *arguments],
-            input=stdin,
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=TIMEOUT_SECONDS,
+    args = _parse_args(
+        "batch-search",
+        "-",
+        "--page",
+        str(page),
+        "--limit",
+        str(limit),
+        "--max-items",
+        str(len(queries)),
+        "--no-cache",
+    )
+    provider = backend.SharedProxyProvider(args)
+    values = [
+        json.dumps({"query": query, "page": page, "limit": limit}, ensure_ascii=False)
+        for query in queries
+    ]
+
+    def handle(index: int, raw: str) -> dict[str, Any]:
+        item_args = backend.parse_batch_search_item(raw, args)
+        return backend.command_search(
+            item_args,
+            provider,
+            proxy_offset=index,
         )
-    except FileNotFoundError as exc:
-        raise ToolError(f"sogou-weixin CLI not found: {CLI}") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise ToolError(f"sogou-weixin {command} timed out") from exc
 
-    try:
-        payload = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        detail = completed.stderr.strip() or "invalid or empty JSON"
-        raise ToolError(f"sogou-weixin {command}: {detail}") from exc
+    return backend.envelope(
+        "batch-search",
+        asyncio.run(backend.run_batch_items(values, args, handle)),
+    )
 
-    if not isinstance(payload, dict):
-        raise ToolError(f"sogou-weixin {command} returned non-object JSON")
-    if completed.returncode or payload.get("ok") is False:
-        error = payload.get("error", {})
-        if isinstance(error, dict):
-            raise ToolError(
-                f"{error.get('code', 'cli_error')}: "
-                f"{error.get('message', f'exit code {completed.returncode}')}"
-            )
-        raise ToolError(f"sogou-weixin {command} failed")
-    return payload
+
+def _batch_fetch_backend(
+    candidates: list[dict[str, Any]], max_chars: int
+) -> dict[str, Any]:
+    args = _parse_args(
+        "batch-fetch",
+        "-",
+        "--format",
+        "text",
+        "--max-chars",
+        str(max_chars),
+        "--max-items",
+        str(len(candidates)),
+        "--no-cache",
+    )
+    provider = backend.SharedProxyProvider(args)
+    values = [
+        json.dumps(candidate["search"], ensure_ascii=False) for candidate in candidates
+    ]
+
+    def handle(index: int, raw: str) -> dict[str, Any]:
+        item_args = Namespace(**vars(args))
+        item_args.result = raw
+        return backend.command_fetch(
+            item_args,
+            provider,
+            proxy_offset=index,
+        )
+
+    return backend.envelope(
+        "batch-fetch",
+        asyncio.run(backend.run_batch_items(values, args, handle)),
+    )
 
 
 def _data(payload: dict[str, Any]) -> dict[str, Any]:
@@ -170,7 +239,7 @@ def web_search_sogou(
 ) -> ToolResult:
     """Search WeChat articles and return normalized results with fetch_ref values."""
 
-    raw = _call_cli("search", query, "--page", str(page), "--limit", str(limit))
+    raw = _search_backend(query, page, limit)
     data = _data(raw)
     result = {
         "ok": True,
@@ -180,7 +249,7 @@ def web_search_sogou(
         "next_page": data.get("next_page"),
         "retrieval": data.get("retrieval", {}),
         "articles": _search_articles(data),
-        "raw_cli": raw,
+        "raw_backend": raw,
     }
     text = "\n".join(
         [
@@ -210,21 +279,14 @@ def web_fetch_sogou(
 ) -> ToolResult:
     """Fetch one article with flat metadata, a compact preview, and exact raw JSON."""
 
-    raw = _call_cli(
-        "fetch",
-        result,
-        "--format",
-        format,
-        "--max-chars",
-        str(max_chars),
-    )
+    raw = _fetch_backend(result, format, max_chars)
     data = _data(raw)
     article = _fetched_article(data, preview_chars)
     structured = {
         "ok": True,
         "article": article,
         "retrieval": data.get("retrieval", {}),
-        "raw_cli": raw,
+        "raw_backend": raw,
     }
     text = "\n".join(
         [
@@ -254,26 +316,13 @@ def batch_research_sogou(
     preview_chars: Annotated[int, Field(ge=1, le=20_000)] = 1_200,
     max_chars: Annotated[int, Field(ge=1, le=2_000_000)] = 200_000,
 ) -> ToolResult:
-    """Replace batch-search -> batch-fetch -> JS/JQ with one structured call."""
+    """Batch-search and fetch articles with bounded in-process concurrency."""
 
     queries = [query.strip() for query in queries]
     if any(not query for query in queries):
         raise ToolError("queries must contain only non-empty strings")
 
-    search_raw = _call_cli(
-        "batch-search",
-        "-",
-        "--page",
-        str(page),
-        "--limit",
-        str(limit),
-        "--max-items",
-        str(len(queries)),
-        stdin=json.dumps(
-            [{"query": query, "page": page, "limit": limit} for query in queries],
-            ensure_ascii=False,
-        ),
-    )
+    search_raw = _batch_search_backend(queries, page, limit)
     search_data = _data(search_raw)
     candidates: list[dict[str, Any]] = []
     search_errors: list[dict[str, Any]] = []
@@ -308,24 +357,14 @@ def batch_research_sogou(
             },
             "items": [],
             "search_errors": search_errors,
-            "raw_cli": {"batch_search": search_raw, "batch_fetch": None},
+            "raw_backend": {"batch_search": search_raw, "batch_fetch": None},
         }
         return ToolResult(
             content="批量搜索没有返回可抓取文章。",
             structured_content=structured,
         )
 
-    fetch_raw = _call_cli(
-        "batch-fetch",
-        "-",
-        "--format",
-        "text",
-        "--max-chars",
-        str(max_chars),
-        "--max-items",
-        str(len(candidates)),
-        stdin=json.dumps(search_raw, ensure_ascii=False),
-    )
+    fetch_raw = _batch_fetch_backend(candidates, max_chars)
     fetch_items = _data(fetch_raw).get("items", [])
     items: list[dict[str, Any]] = []
     for index, candidate in enumerate(candidates):
@@ -381,7 +420,7 @@ def batch_research_sogou(
         },
         "items": items,
         "search_errors": search_errors,
-        "raw_cli": {"batch_search": search_raw, "batch_fetch": fetch_raw},
+        "raw_backend": {"batch_search": search_raw, "batch_fetch": fetch_raw},
     }
     text = "\n\n".join(
         [
