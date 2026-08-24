@@ -8,6 +8,10 @@ import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { UpstreamManager } from "./upstream.js";
 import { CallCache } from "./cache.js";
+import {
+  defaultPersistentCachePath,
+  openSqliteCacheStore,
+} from "./cache-store.js";
 import { META_TOOLS } from "./meta-tools.js";
 import {
   handleParallel,
@@ -94,6 +98,15 @@ export class CallmuxProxy {
 
   constructor(private config: CallmuxConfig) {
     this.upstream = new UpstreamManager(config.callTimeoutMs ?? 180_000);
+    const maxCacheEntries = config.maxCacheEntries ?? 1000;
+    const maxCacheBytes = config.maxCacheBytes ?? 128 * 1024 * 1024;
+    const persistentStore = config.persistentCache?.enabled === true
+      ? openSqliteCacheStore({
+          path: config.persistentCache.path ?? defaultPersistentCachePath(),
+          maxEntries: maxCacheEntries,
+          maxTotalBytes: maxCacheBytes,
+        })
+      : undefined;
     this.cache = new CallCache(
       config.cacheTtlSeconds ?? 0,
       config.cachePolicy,
@@ -103,9 +116,10 @@ export class CallmuxProxy {
           server.cachePolicy,
         ])
       ),
-      config.maxCacheEntries ?? 1000,
+      maxCacheEntries,
       config.maxCacheEntryBytes,
-      config.maxCacheBytes
+      maxCacheBytes,
+      persistentStore
     );
     this.maxConcurrency = config.maxConcurrency ?? 20;
     this.connectTimeoutMs = config.connectTimeoutMs ?? 30_000;
@@ -492,8 +506,12 @@ export class CallmuxProxy {
   }
 
   async close(): Promise<void> {
-    await this.upstream.close();
-    await this.server.close();
+    try {
+      await this.upstream.close();
+      await this.server.close();
+    } finally {
+      this.cache.close();
+    }
   }
 }
 

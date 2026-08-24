@@ -1,5 +1,6 @@
 import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { CacheEntry, CachePolicyConfig } from "./types.js";
+import type { PersistentCacheStore } from "./cache-store.js";
 
 const DEFAULT_MAX_CACHE_ENTRY_BYTES = 8 * 1024 * 1024;
 const DEFAULT_MAX_CACHE_BYTES = 128 * 1024 * 1024;
@@ -145,6 +146,7 @@ export class CallCache {
   private nextPruneAt = 0;
   private globalPolicy?: CachePolicyConfig;
   private serverPolicies: Map<string, CachePolicyConfig>;
+  private persistentStore?: PersistentCacheStore;
 
   constructor(
     ttlSeconds: number,
@@ -152,12 +154,14 @@ export class CallCache {
     serverPolicies?: Record<string, CachePolicyConfig | undefined>,
     maxEntries = 1000,
     maxEntryBytes = DEFAULT_MAX_CACHE_ENTRY_BYTES,
-    maxTotalBytes = DEFAULT_MAX_CACHE_BYTES
+    maxTotalBytes = DEFAULT_MAX_CACHE_BYTES,
+    persistentStore?: PersistentCacheStore
   ) {
     this.ttlMs = ttlSeconds * 1000;
     this.maxEntries = maxEntries;
     this.maxEntryBytes = maxEntryBytes;
     this.maxTotalBytes = maxTotalBytes;
+    this.persistentStore = persistentStore;
     this.pruneIntervalMs = this.ttlMs > 0 ? Math.min(this.ttlMs, 1_000) : 0;
     this.globalPolicy = globalPolicy;
     this.serverPolicies = new Map(
@@ -276,11 +280,25 @@ export class CallCache {
     this.nextPruneAt = now + this.pruneIntervalMs;
   }
 
-  private deleteEntry(key: string): void {
+  private reportPersistenceError(operation: string, error: unknown): void {
+    process.stderr.write(
+      `[callmux] persistent cache ${operation} failed: ${(error as Error).message}\n`
+    );
+  }
+
+  private deleteEntry(key: string, persist = true): void {
     const entry = this.entries.get(key);
-    if (!entry) return;
-    this.entries.delete(key);
-    this.currentBytes = Math.max(0, this.currentBytes - entry.byteSize);
+    if (entry) {
+      this.entries.delete(key);
+      this.currentBytes = Math.max(0, this.currentBytes - entry.byteSize);
+    }
+    if (persist && this.persistentStore) {
+      try {
+        this.persistentStore.delete(key);
+      } catch (error) {
+        this.reportPersistenceError("delete", error);
+      }
+    }
   }
 
   private evictOldest(): void {
@@ -346,10 +364,40 @@ export class CallCache {
     this.maybePruneExpired(now);
 
     const key = this.key(tool, args, effectiveServer, scope);
-    const entry = this.entries.get(key);
+    let entry = this.entries.get(key);
     if (!entry) {
-      this.misses++;
-      return null;
+      try {
+        const persisted = this.persistentStore?.get(key, now);
+        if (persisted) {
+          if (
+            persisted.tool !== tool ||
+            persisted.server !== effectiveServer ||
+            persisted.scope !== scope ||
+            persisted.byteSize > this.maxEntryBytes ||
+            persisted.byteSize > this.maxTotalBytes
+          ) {
+            this.persistentStore?.delete(key);
+          } else {
+            entry = {
+              tool: persisted.tool,
+              ...(persisted.server ? { server: persisted.server } : {}),
+              result: persisted.result,
+              expiresAt: persisted.expiresAt,
+              byteSize: persisted.byteSize,
+            };
+            this.entries.set(key, entry);
+            this.currentBytes += entry.byteSize;
+            this.evictOldest();
+            entry = this.entries.get(key);
+          }
+        }
+      } catch (error) {
+        this.reportPersistenceError("read", error);
+      }
+      if (!entry) {
+        this.misses++;
+        return null;
+      }
     }
     if (now > entry.expiresAt) {
       this.deleteEntry(key);
@@ -359,6 +407,11 @@ export class CallCache {
 
     this.entries.delete(key);
     this.entries.set(key, entry);
+    try {
+      this.persistentStore?.touch(key, now);
+    } catch (error) {
+      this.reportPersistenceError("touch", error);
+    }
     this.hits++;
     return entry.result;
   }
@@ -401,6 +454,26 @@ export class CallCache {
     });
     this.currentBytes += byteSize;
     this.evictOldest();
+    if (this.entries.has(key) && this.persistentStore) {
+      try {
+        this.persistentStore.set({
+          key,
+          tool,
+          ...(args !== undefined ? { args } : {}),
+          ...(effectiveServer ? { server: effectiveServer } : {}),
+          ...(scope ? { scope } : {}),
+          result,
+          expiresAt: now + this.ttlMs,
+          byteSize,
+          createdAt: now,
+          accessedAt: now,
+          ...(annotations?.readOnlyHint === true ? { readOnlyHint: true } : {}),
+          ...(annotations?.idempotentHint === true ? { idempotentHint: true } : {}),
+        }, now);
+      } catch (error) {
+        this.reportPersistenceError("write", error);
+      }
+    }
   }
 
   async getOrLoad(
@@ -500,6 +573,11 @@ export class CallCache {
       if (!server) {
         this.entries.clear();
         this.currentBytes = 0;
+        try {
+          this.persistentStore?.invalidate();
+        } catch (error) {
+          this.reportPersistenceError("clear", error);
+        }
         return;
       }
 
@@ -508,6 +586,11 @@ export class CallCache {
           this.deleteEntry(key);
         }
       }
+      try {
+        this.persistentStore?.invalidate(undefined, server);
+      } catch (error) {
+        this.reportPersistenceError("clear", error);
+      }
       return;
     }
 
@@ -515,6 +598,11 @@ export class CallCache {
       if (entry.tool === tool && (server === undefined || entry.server === server)) {
         this.deleteEntry(key);
       }
+    }
+    try {
+      this.persistentStore?.invalidate(tool, server);
+    } catch (error) {
+      this.reportPersistenceError("clear", error);
     }
   }
 
@@ -540,9 +628,42 @@ export class CallCache {
     hits: number;
     misses: number;
     hitRate: number;
+    persistent: {
+      enabled: boolean;
+      path?: string;
+      entries: number;
+      storedBytes: number;
+    };
   } {
     this.pruneExpired();
     const lookups = this.hits + this.misses;
+    let persistent = {
+      enabled: false,
+      entries: 0,
+      storedBytes: 0,
+    } as {
+      enabled: boolean;
+      path?: string;
+      entries: number;
+      storedBytes: number;
+    };
+    if (this.persistentStore) {
+      try {
+        persistent = {
+          enabled: true,
+          path: this.persistentStore.path,
+          ...this.persistentStore.stats(),
+        };
+      } catch (error) {
+        this.reportPersistenceError("stats", error);
+        persistent = {
+          enabled: true,
+          path: this.persistentStore.path,
+          entries: 0,
+          storedBytes: 0,
+        };
+      }
+    }
     return {
       entries: this.entries.size,
       ttlSeconds: this.ttlMs / 1000,
@@ -556,6 +677,18 @@ export class CallCache {
       hits: this.hits,
       misses: this.misses,
       hitRate: lookups > 0 ? this.hits / lookups : 0,
+      persistent,
     };
+  }
+
+  close(): void {
+    if (!this.persistentStore) return;
+    try {
+      this.persistentStore.close();
+    } catch (error) {
+      this.reportPersistenceError("close", error);
+    } finally {
+      this.persistentStore = undefined;
+    }
   }
 }

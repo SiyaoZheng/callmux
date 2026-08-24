@@ -246,7 +246,7 @@ function isDashboardRuntimeError(event: RuntimeEvent): boolean {
   }
   if (event.type === "tool_call_lifecycle") return event.success === false;
   if (event.type === "tool_call") {
-    return event.status === "error" || (event.status === undefined && !event.success);
+    return event.status === undefined ? !event.success : event.status !== "ok";
   }
   if (event.type === "config_reload") return !event.success;
   return false;

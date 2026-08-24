@@ -282,6 +282,13 @@ export interface EventStoreConfig {
   pruneEvery?: number;
 }
 
+export interface PersistentCacheConfig {
+  /** Persist successful cache entries in SQLite so they survive daemon restarts. */
+  enabled?: boolean;
+  /** SQLite database path. Defaults to callmux-cache.sqlite beside the config file. */
+  path?: string;
+}
+
 export interface ManagementConfig {
   /** Enable the standalone listener management API. Disabled by default. */
   enabled?: boolean;
@@ -381,6 +388,8 @@ export interface CallmuxConfig {
   dashboard?: DashboardConfig;
   /** Optional node:sqlite call event history store */
   eventStore?: EventStoreConfig;
+  /** Optional SQLite backing store for successful cache results */
+  persistentCache?: PersistentCacheConfig;
   /** Optional standalone listener management API configuration */
   management?: ManagementConfig;
   /** Allow insecure remote listener (non-loopback host) without auth */

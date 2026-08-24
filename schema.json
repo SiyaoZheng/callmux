@@ -52,6 +52,7 @@
       "description": "Cache TTL in seconds for read operations (0 = disabled)"
     },
     "cachePolicy": { "$ref": "#/$defs/cachePolicy" },
+    "persistentCache": { "$ref": "#/$defs/persistentCacheConfig" },
     "maxConcurrency": {
       "type": "integer",
       "minimum": 1,
@@ -549,6 +550,23 @@
           "minimum": 1,
           "default": 500,
           "description": "Maximum runtime events kept in memory"
+        }
+      },
+      "additionalProperties": false
+    },
+    "persistentCacheConfig": {
+      "type": "object",
+      "description": "Optional SQLite backing store for successful cache results. Disabled by default.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Persist eligible successful cache results across daemon restarts"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "SQLite database path (default: callmux-cache.sqlite beside the config file)"
         }
       },
       "additionalProperties": false

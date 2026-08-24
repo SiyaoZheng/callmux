@@ -1392,6 +1392,59 @@ test("loadConfig rejects a non-boolean event store includeArguments option", asy
   }
 });
 
+test("loadConfig enables persistent cache with a config-relative SQLite path", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-persistent-cache-config-"));
+  const path = join(dir, "config.json");
+  try {
+    await writeFile(path, JSON.stringify({
+      servers: { demo: { command: "node", args: ["server.js"] } },
+      persistentCache: { enabled: true, path: "state/cache.sqlite" },
+    }));
+    const config = await loadConfig(path);
+    assert.deepEqual(config.persistentCache, {
+      enabled: true,
+      path: join(dir, "state", "cache.sqlite"),
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig defaults an enabled persistent cache beside the config", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-persistent-cache-default-"));
+  const path = join(dir, "config.json");
+  try {
+    await writeFile(path, JSON.stringify({
+      servers: { demo: { command: "node", args: ["server.js"] } },
+      persistentCache: { enabled: true },
+    }));
+    const config = await loadConfig(path);
+    assert.deepEqual(config.persistentCache, {
+      enabled: true,
+      path: join(dir, "callmux-cache.sqlite"),
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig rejects invalid persistent cache options", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-persistent-cache-invalid-"));
+  const path = join(dir, "config.json");
+  try {
+    await writeFile(path, JSON.stringify({
+      servers: { demo: { command: "node", args: ["server.js"] } },
+      persistentCache: { enabled: "yes" },
+    }));
+    await assert.rejects(
+      loadConfig(path),
+      /persistentCache\.enabled must be a boolean/
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("configFromArgs parses request body limit flags", () => {
   const config = configFromArgs([
     "--request-body-max-bytes",
@@ -12543,7 +12596,7 @@ test("dashboard classifies downstream tool errors separately from callmux errors
   );
 });
 
-test("RuntimeEventStore recent errors ignores downstream tool result failures", () => {
+test("RuntimeEventStore recent errors counts downstream tool result failures", () => {
   const store = new RuntimeEventStore(10);
   store.append({
     type: "tool_call",
@@ -12556,7 +12609,7 @@ test("RuntimeEventStore recent errors ignores downstream tool result failures", 
     downstreamTargets: [{ server: "tokenlean", tool: "tl_run", count: 1 }],
     durationMs: 1,
     status: "downstream_error",
-    success: true,
+    success: false,
     error: "npm test failed",
   });
   store.append({
@@ -12574,7 +12627,7 @@ test("RuntimeEventStore recent errors ignores downstream tool result failures", 
     error: "timed out",
   });
 
-  assert.equal(store.stats().recentErrors, 1);
+  assert.equal(store.stats().recentErrors, 2);
 });
 
 test("RuntimeEventStore recent errors counter decrements as errors are evicted", () => {
@@ -12680,16 +12733,22 @@ test("RuntimeEventStore recent errors ignores session re-init 404s (#42)", () =>
   assert.equal(store.stats().recentErrors, 1);
 });
 
-test("listener dashboard records downstream tool failures without callmux error status", () => {
+test("listener records downstream tool failures as unsuccessful everywhere", () => {
   const listener = new CallmuxListener({
     port: 0,
     host: "127.0.0.1",
-    config: { servers: {} },
+    config: { servers: {}, dashboard: { enabled: true } },
     upstream: new UpstreamManager(),
     cache: new CallCache(0, undefined, {}, 100),
     allTools: [],
     maxConcurrency: 10,
   });
+  const persisted: Array<{ ok: boolean; status?: string }> = [];
+  (listener as any).eventStore = {
+    recordCall(sample: { ok: boolean; status?: string }) {
+      persisted.push(sample);
+    },
+  };
 
   (listener as any).recordToolCallEvent(
     "tokenlean__tl_run",
@@ -12707,13 +12766,17 @@ test("listener dashboard records downstream tool failures without callmux error 
     error?: string;
   }>;
   assert.equal(events[0].status, "downstream_error");
-  assert.equal(events[0].success, true);
+  assert.equal(events[0].success, false);
   assert.equal(events[0].error, "npm test failed");
   assert.equal((events[0] as any).passthroughToolCalls, 1);
   assert.equal((events[0] as any).callmuxMetaToolCalls, 0);
   assert.equal((events[0] as any).callmuxDownstreamToolCalls, 0);
   assert.equal((events[0] as any).totalDownstreamToolCalls, 1);
-  assert.equal((listener as any).runtimeEvents.stats().recentErrors, 0);
+  assert.equal((listener as any).runtimeEvents.stats().recentErrors, 1);
+  assert.equal((listener as any).metricsStore.totals().errors, 1);
+  assert.equal(persisted.length, 1);
+  assert.equal(persisted[0].ok, false);
+  assert.equal(persisted[0].status, "downstream_error");
 });
 
 test("loadDashboardHtml returns a self-contained HTML document", () => {

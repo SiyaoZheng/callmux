@@ -367,6 +367,14 @@ class EventStoreEngine {
     if (!names.has("arguments_json")) {
       this.db.exec("ALTER TABLE call_events ADD COLUMN arguments_json TEXT");
     }
+    // Builds before 0.24.2 classified downstream tool failures separately but
+    // accidentally persisted them as ok=1. Repair historical rows on open so
+    // drill-down totals and the raw database agree with current semantics.
+    this.db.prepare(`
+      UPDATE call_events
+      SET ok = 0
+      WHERE status = 'downstream_error' AND ok <> 0
+    `).run();
   }
 
   recordCalls(samples: EventStoreCallSample[]): void {

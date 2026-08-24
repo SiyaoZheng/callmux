@@ -37,6 +37,7 @@ callmux also accepts MCP-compatible format (`{ "mcpServers": { ... } }`) so you 
 | `servers` | object | *(required)* | Map of server name -> server config |
 | `recipes` | object | - | Named reusable callmux workflows ([details](recipes.md)) |
 | `cacheTtlSeconds` | integer | `0` | Cache TTL in seconds (0 = disabled) |
+| `persistentCache` | object | disabled | SQLite backing store for eligible successful cache results |
 | `cachePolicy` | object | - | Global cache allow/deny rules (see [Caching](#caching)) |
 | `maxConcurrency` | integer | `20` | Service-wide max concurrent downstream calls across direct and meta-tool requests |
 | `connectTimeoutMs` | integer | `30000` | Timeout for downstream startup connect + list-tools |
@@ -197,6 +198,10 @@ Enable with `cacheTtlSeconds` or `--cache <seconds>`. Error results are never ca
 ```json
 {
   "cacheTtlSeconds": 60,
+  "persistentCache": {
+    "enabled": true,
+    "path": "./callmux-cache.sqlite"
+  },
   "maxCacheEntries": 1000,
   "maxCacheEntryBytes": 8388608,
   "maxCacheBytes": 134217728,
@@ -219,6 +224,13 @@ Enable with `cacheTtlSeconds` or `--cache <seconds>`. Error results are never ca
   shared invocation is cancelled when its last waiter leaves, and rejected
   calls are removed from the in-flight map
 - `callmux_cache_clear` invalidates manually
+- `persistentCache.enabled` stores the complete MCP `CallToolResult` and cache
+  key metadata in SQLite. Relative paths resolve beside the config file. The
+  original expiry time, LRU entry limit, per-entry byte limit, and aggregate
+  byte limit continue to apply across restarts.
+- Persistent caching requires Node 24 or newer. It never stores error results,
+  tools excluded by cache policy, or forwarded authorization header values
+  (credential-derived cache scopes contain SHA-256 digests only).
 
 ---
 

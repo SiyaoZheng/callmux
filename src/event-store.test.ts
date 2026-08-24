@@ -181,7 +181,7 @@ test("event store migrates an existing database that predates optional call colu
       "bearer:ops",
       10,
       1,
-      "ok",
+      "downstream_error",
       null,
       10,
       20,
@@ -205,6 +205,7 @@ test("event store migrates an existing database that predates optional call colu
 
     const drilldown = await store.queryDrilldown({ fromMs: T0 - 60_000, toMs: T0 + 1 });
     assert.equal(drilldown.totals.calls, 2);
+    assert.equal(drilldown.totals.errors, 1);
     // Pre-migration rows have no transport recorded; they group under "mcp".
     assert.equal(drilldown.byTransport.find((row) => row.name === "mcp")?.calls, 1);
     assert.equal(drilldown.byTransport.find((row) => row.name === "cli")?.calls, 1);
@@ -212,9 +213,13 @@ test("event store migrates an existing database that predates optional call colu
     const migratedDb = new sqlite.DatabaseSync(path);
     try {
       const row = migratedDb
-        .prepare("SELECT arguments_json FROM call_events WHERE tool = ?")
+        .prepare("SELECT arguments_json, ok FROM call_events WHERE tool = ?")
         .get("new_tool");
       assert.equal(row?.arguments_json, JSON.stringify({ query: "after migration" }));
+      const legacyRow = migratedDb
+        .prepare("SELECT ok FROM call_events WHERE tool = ?")
+        .get("github__issue_read");
+      assert.equal(legacyRow?.ok, 0);
     } finally {
       migratedDb.close();
     }

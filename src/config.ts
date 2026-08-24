@@ -13,6 +13,7 @@ import type {
   CallmuxConfig,
   ConfigFormat,
   EventStoreConfig,
+  PersistentCacheConfig,
   MetricsConfig,
   DashboardConfig,
   ManagementConfig,
@@ -684,6 +685,40 @@ function parseEventStoreConfig(
     ...(maxRows !== undefined ? { maxRows } : {}),
     ...(retentionDays !== undefined ? { retentionDays } : {}),
     ...(pruneEvery !== undefined ? { pruneEvery } : {}),
+  };
+}
+
+function parsePersistentCacheConfig(
+  value: unknown,
+  optionName: string,
+  configBaseDir?: string
+): PersistentCacheConfig | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) {
+    throw new Error(`${optionName} must be an object`);
+  }
+
+  const enabled = parseBooleanOption(value.enabled, `${optionName}.enabled`);
+  const configuredPath =
+    value.path === undefined
+      ? undefined
+      : typeof value.path === "string" && value.path.trim().length > 0
+        ? value.path.trim()
+        : (() => {
+            throw new Error(`${optionName}.path must be a non-empty string`);
+          })();
+
+  if (enabled === undefined && configuredPath === undefined) return undefined;
+
+  const path = configuredPath
+    ? resolve(configBaseDir ?? process.cwd(), configuredPath)
+    : enabled === true
+      ? join(configBaseDir ?? join(homedir(), ".config", "callmux"), "callmux-cache.sqlite")
+      : undefined;
+
+  return {
+    ...(enabled !== undefined ? { enabled } : {}),
+    ...(path ? { path } : {}),
   };
 }
 
@@ -1448,6 +1483,11 @@ async function parseConfigDocument(
     const metrics = parseMetricsConfig(parsed.metrics, "metrics");
     const dashboard = parseDashboardConfig(parsed.dashboard, "dashboard");
     const eventStore = parseEventStoreConfig(parsed.eventStore, "eventStore");
+    const persistentCache = parsePersistentCacheConfig(
+      parsed.persistentCache,
+      "persistentCache",
+      configBaseDir
+    );
     const management = await parseManagementConfig(
       parsed.management,
       "management",
@@ -1627,6 +1667,7 @@ async function parseConfigDocument(
       ...(metrics ? { metrics } : {}),
       ...(dashboard ? { dashboard } : {}),
       ...(eventStore ? { eventStore } : {}),
+      ...(persistentCache ? { persistentCache } : {}),
       ...(management ? { management } : {}),
       ...(recipes ? { recipes } : {}),
       ...(parsed.allowInsecureRemoteListener !== undefined

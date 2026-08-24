@@ -2734,6 +2734,7 @@ export class CallmuxListener {
     const durationMs = Date.now() - startedAt;
     const bytesIn = jsonByteLength(args);
     const bytesOut = jsonByteLength(result);
+    const failed = status !== "ok";
     this.runtimeEvents.append({
       type: "tool_call",
       timestamp: new Date().toISOString(),
@@ -2743,7 +2744,7 @@ export class CallmuxListener {
       ...summary,
       durationMs,
       status,
-      success: status !== "error",
+      success: !failed,
       ...(cacheHit ? { cacheHit } : {}),
       ...(format ? { outputFormat: format } : {}),
       ...(result.isError ? { error: extractToolError(result) } : {}),
@@ -2755,7 +2756,7 @@ export class CallmuxListener {
         meta: isMeta,
         downstreamCalls: summary.totalDownstreamToolCalls,
         cacheHit: Boolean(cacheHit),
-        error: status === "error",
+        error: failed,
         bytesIn,
         bytesOut,
         durationMs,
@@ -2773,7 +2774,7 @@ export class CallmuxListener {
         ...(this.principalLabel(this.authzContext.getStore()) ? { principal: this.principalLabel(this.authzContext.getStore()) } : {}),
         transport: toolContext?.transport ?? "mcp",
         durationMs,
-        ok: status !== "error",
+        ok: !failed,
         status,
         ...(result.isError ? { errorClass: this.extractEventErrorClass(result) } : {}),
         bytesIn,
