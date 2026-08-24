@@ -18,6 +18,7 @@ The SQLite store is additive. Enabling it does not replace or disable the existi
   },
   "eventStore": {
     "enabled": true,
+    "includeArguments": false,
     "path": "/var/lib/callmux/callmux-events.sqlite",
     "maxRows": 100000,
     "retentionDays": 14,
@@ -39,10 +40,11 @@ Each completed top-level tool call records:
 - duration, status, error class, cache hit
 - approximate JSON bytes in and out
 - call kind and downstream fan-out count
+- original top-level tool arguments as JSON, when `eventStore.includeArguments` is explicitly `true`
 
 CLI and MCP traffic share the same authentication, authorization, and event-store recording path — a `callmux call` against an auth'd daemon carries the same principal an equivalent MCP tool call would. The `transport` tag is the only thing that tells them apart; use it to see whether a team is offloading long-tail tool usage to the CLI as intended.
 
-Tool arguments and raw tool results are not stored in the event store.
+Tool arguments are not stored by default. Set `eventStore.includeArguments` to `true` to persist them in the `call_events.arguments_json` column. Raw tool results are not stored.
 
 ## Forwarded-Header Audit
 

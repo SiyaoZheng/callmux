@@ -644,6 +644,10 @@ function parseEventStoreConfig(
   }
 
   const enabled = parseBooleanOption(value.enabled, `${optionName}.enabled`);
+  const includeArguments = parseBooleanOption(
+    value.includeArguments,
+    `${optionName}.includeArguments`
+  );
   const path =
     value.path === undefined
       ? undefined
@@ -664,6 +668,7 @@ function parseEventStoreConfig(
 
   if (
     enabled === undefined &&
+    includeArguments === undefined &&
     path === undefined &&
     maxRows === undefined &&
     retentionDays === undefined &&
@@ -674,6 +679,7 @@ function parseEventStoreConfig(
 
   return {
     ...(enabled !== undefined ? { enabled } : {}),
+    ...(includeArguments !== undefined ? { includeArguments } : {}),
     ...(path ? { path } : {}),
     ...(maxRows !== undefined ? { maxRows } : {}),
     ...(retentionDays !== undefined ? { retentionDays } : {}),

@@ -270,6 +270,8 @@ export interface DashboardConfig {
 export interface EventStoreConfig {
   /** Enable node:sqlite call event history. Disabled by default. */
   enabled?: boolean;
+  /** Persist original top-level tool arguments as JSON. Disabled by default. */
+  includeArguments?: boolean;
   /** SQLite database path. Defaults to callmux-events.sqlite beside the config file. */
   path?: string;
   /** Maximum retained call event rows (default: 100000; 0 = age-only retention). */

@@ -1357,6 +1357,7 @@ test("loadConfig parses event store configuration", async () => {
       },
       eventStore: {
         enabled: true,
+        includeArguments: true,
         path: join(dir, "events.sqlite"),
         maxRows: 500,
         retentionDays: 3,
@@ -1366,11 +1367,26 @@ test("loadConfig parses event store configuration", async () => {
     const config = await loadConfig(path);
     assert.deepEqual(config.eventStore, {
       enabled: true,
+      includeArguments: true,
       path: join(dir, "events.sqlite"),
       maxRows: 500,
       retentionDays: 3,
       pruneEvery: 10,
     });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig rejects a non-boolean event store includeArguments option", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "callmux-event-store-arguments-config-"));
+  const path = join(dir, "config.json");
+  try {
+    await writeFile(path, JSON.stringify({
+      servers: { demo: { command: "node", args: ["server.js"] } },
+      eventStore: { enabled: true, includeArguments: "yes" },
+    }));
+    await assert.rejects(loadConfig(path), /eventStore\.includeArguments must be a boolean/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -15362,7 +15378,14 @@ test("listener forwards configured headers to remote downstream per session with
       config: {
         servers: { remote: remoteConfig },
         dashboard: { enabled: true },
-        eventStore: { enabled: true, path: eventPath, maxRows: 1000, retentionDays: 7, pruneEvery: 1 },
+        eventStore: {
+          enabled: true,
+          includeArguments: true,
+          path: eventPath,
+          maxRows: 1000,
+          retentionDays: 7,
+          pruneEvery: 1,
+        },
       },
       upstream,
       cache,
@@ -15460,6 +15483,17 @@ test("listener forwards configured headers to remote downstream per session with
 
     await listener.close();
     listener = undefined;
+    const sqlite = await import("node:sqlite");
+    const eventDb = new sqlite.DatabaseSync(eventPath);
+    try {
+      const argumentRows = eventDb
+        .prepare("SELECT arguments_json FROM call_events ORDER BY id")
+        .all()
+        .map((row) => row.arguments_json);
+      assert.deepEqual(argumentRows, [JSON.stringify({ id: 1 }), JSON.stringify({ id: 1 })]);
+    } finally {
+      eventDb.close();
+    }
     const dbBytes = await readFile(eventPath);
     assert.equal(dbBytes.toString("utf8").includes("SESSION_A_TOKEN"), false);
     assert.equal(dbBytes.toString("utf8").includes("SESSION_B_TOKEN"), false);
@@ -17322,6 +17356,7 @@ test("a CLI call flows into the audit event store tagged transport cli, carrying
       const { code, stdout } = await runCallmuxCli([
         "call",
         "fake__get_item",
+        JSON.stringify({ query: "not persisted by default" }),
         "--url",
         listener.mcpUrl,
         "--token",
@@ -17348,6 +17383,14 @@ test("a CLI call flows into the audit event store tagged transport cli, carrying
     }
 
     // Same principal an MCP client authenticating with this bearer token would carry.
+    const sqlite = await import("node:sqlite");
+    const eventDb = new sqlite.DatabaseSync(eventPath);
+    try {
+      const row = eventDb.prepare("SELECT arguments_json FROM call_events").get();
+      assert.equal(row?.arguments_json, null);
+    } finally {
+      eventDb.close();
+    }
     const dbBytes = await readFile(eventPath);
     assert.equal(dbBytes.toString("utf8").includes("bearer:agent"), true);
   } finally {

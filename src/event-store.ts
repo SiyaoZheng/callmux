@@ -47,6 +47,7 @@ export interface EventStoreCallSample {
   timestampMs?: number;
   server?: string;
   tool: string;
+  arguments?: unknown;
   targetTool?: string;
   sessionId?: string;
   principal?: string;
@@ -112,6 +113,7 @@ CREATE TABLE IF NOT EXISTS call_events (
   ts TEXT NOT NULL,
   server TEXT,
   tool TEXT NOT NULL,
+  arguments_json TEXT,
   target_tool TEXT,
   session_id TEXT,
   principal TEXT,
@@ -180,6 +182,15 @@ function textOr(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
 }
 
+function serializeArguments(value: unknown): string | null {
+  if (value === undefined) return null;
+  try {
+    return JSON.stringify(value) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function rowToBreakdown(row: Record<string, unknown>): EventStoreBreakdownRow {
   return {
     name: textOr(row.name, "(unknown)"),
@@ -220,13 +231,13 @@ class EventStoreEngine {
     this.now = options.now ?? Date.now;
     this.db = new Database(options.path);
     this.db.exec(SCHEMA_SQL);
-    this.migrateTransportColumn();
+    this.migrateCallEventColumns();
     this.insertEvent = this.db.prepare(`
       INSERT INTO call_events (
-        ts_ms, ts, server, tool, target_tool, session_id, principal, transport, duration_ms,
+        ts_ms, ts, server, tool, arguments_json, target_tool, session_id, principal, transport, duration_ms,
         ok, status, error_class, bytes_in, bytes_out, cache_hit, tool_kind,
         operation, downstream_calls
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     this.insertTarget = this.db.prepare(`
       INSERT INTO call_event_targets (event_id, server, tool, count)
@@ -347,11 +358,14 @@ class EventStoreEngine {
   }
 
   /** `CREATE TABLE IF NOT EXISTS` doesn't add columns to a table that already existed on disk. */
-  private migrateTransportColumn(): void {
+  private migrateCallEventColumns(): void {
     const columns = this.db.prepare("PRAGMA table_info(call_events)").all();
-    const hasTransport = columns.some((column) => column.name === "transport");
-    if (!hasTransport) {
+    const names = new Set(columns.map((column) => String(column.name)));
+    if (!names.has("transport")) {
       this.db.exec("ALTER TABLE call_events ADD COLUMN transport TEXT");
+    }
+    if (!names.has("arguments_json")) {
+      this.db.exec("ALTER TABLE call_events ADD COLUMN arguments_json TEXT");
     }
   }
 
@@ -384,6 +398,7 @@ class EventStoreEngine {
         ts,
         sample.server ?? null,
         sample.tool,
+        serializeArguments(sample.arguments),
         sample.targetTool ?? null,
         sample.sessionId ?? null,
         sample.principal ?? null,

@@ -359,6 +359,7 @@ When auth is configured, dashboard requests use the same listener authentication
 {
   "eventStore": {
     "enabled": true,
+    "includeArguments": false,
     "path": "/var/lib/callmux/callmux-events.sqlite",
     "maxRows": 100000,
     "retentionDays": 14,
@@ -370,6 +371,7 @@ When auth is configured, dashboard requests use the same listener authentication
 | Field | Type | Default | Description |
 |:------|:-----|:--------|:------------|
 | `enabled` | boolean | `false` | Enable SQLite-backed per-call event history |
+| `includeArguments` | boolean | `false` | Persist original top-level tool arguments as JSON |
 | `path` | string | `callmux-events.sqlite` beside the config file | SQLite database path |
 | `maxRows` | integer | `100000` | Maximum retained call event rows (`0` = age-only retention) |
 | `retentionDays` | integer | `14` | Maximum retained event age (`0` = row-count-only retention) |

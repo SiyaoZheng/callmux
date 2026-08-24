@@ -9,8 +9,9 @@ const T0 = Date.UTC(2026, 5, 23, 12, 0, 0);
 
 test("event store records call rows and drill-down breakdowns", async () => {
   const dir = await mkdtemp(join(tmpdir(), "callmux-event-store-"));
+  const path = join(dir, "events.sqlite");
   const store = await openEventStore({
-    path: join(dir, "events.sqlite"),
+    path,
     now: () => T0,
   });
   try {
@@ -18,6 +19,7 @@ test("event store records call rows and drill-down breakdowns", async () => {
       timestampMs: T0 - 1_000,
       server: "github",
       tool: "github__issue_read",
+      arguments: { query: "中文 test", nested: { limit: 5 }, flags: [true, false] },
       targetTool: "issue_read",
       sessionId: "session-a",
       principal: "bearer:ops",
@@ -74,6 +76,28 @@ test("event store records call rows and drill-down breakdowns", async () => {
       calls: 1,
       lastSeenAt: new Date(T0 - 1_000).toISOString(),
     }]);
+    await store.flush();
+    const sqlite = await import("node:sqlite");
+    const db = new sqlite.DatabaseSync(path);
+    try {
+      const rows = db
+        .prepare("SELECT tool, arguments_json FROM call_events ORDER BY id")
+        .all()
+        .map((row) => ({ tool: row.tool, arguments_json: row.arguments_json }));
+      assert.deepEqual(rows, [
+        {
+          tool: "github__issue_read",
+          arguments_json: JSON.stringify({
+            query: "中文 test",
+            nested: { limit: 5 },
+            flags: [true, false],
+          }),
+        },
+        { tool: "github__issue_write", arguments_json: null },
+      ]);
+    } finally {
+      db.close();
+    }
   } finally {
     await store.close();
     await rm(dir, { recursive: true, force: true });
@@ -111,7 +135,7 @@ test("event store prunes by max rows and age", async () => {
   }
 });
 
-test("event store migrates an existing database that predates the transport column", async () => {
+test("event store migrates an existing database that predates optional call columns", async () => {
   const dir = await mkdtemp(join(tmpdir(), "callmux-event-migrate-"));
   const path = join(dir, "events.sqlite");
 
@@ -170,13 +194,30 @@ test("event store migrates an existing database that predates the transport colu
 
   const store = await openEventStore({ path, now: () => T0 });
   try {
-    store.recordCall({ timestampMs: T0, tool: "new_tool", transport: "cli", durationMs: 5, ok: true });
+    store.recordCall({
+      timestampMs: T0,
+      tool: "new_tool",
+      arguments: { query: "after migration" },
+      transport: "cli",
+      durationMs: 5,
+      ok: true,
+    });
 
     const drilldown = await store.queryDrilldown({ fromMs: T0 - 60_000, toMs: T0 + 1 });
     assert.equal(drilldown.totals.calls, 2);
     // Pre-migration rows have no transport recorded; they group under "mcp".
     assert.equal(drilldown.byTransport.find((row) => row.name === "mcp")?.calls, 1);
     assert.equal(drilldown.byTransport.find((row) => row.name === "cli")?.calls, 1);
+    await store.flush();
+    const migratedDb = new sqlite.DatabaseSync(path);
+    try {
+      const row = migratedDb
+        .prepare("SELECT arguments_json FROM call_events WHERE tool = ?")
+        .get("new_tool");
+      assert.equal(row?.arguments_json, JSON.stringify({ query: "after migration" }));
+    } finally {
+      migratedDb.close();
+    }
   } finally {
     await store.close();
     await rm(dir, { recursive: true, force: true });

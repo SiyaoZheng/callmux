@@ -562,6 +562,11 @@
           "default": false,
           "description": "Enable SQLite-backed per-call event history"
         },
+        "includeArguments": {
+          "type": "boolean",
+          "default": false,
+          "description": "Persist original top-level tool arguments in the event store as JSON"
+        },
         "path": {
           "type": "string",
           "minLength": 1,

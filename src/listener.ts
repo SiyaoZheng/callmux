@@ -2766,6 +2766,7 @@ export class CallmuxListener {
     if (this.eventStore) {
       const event: EventStoreCallSample = {
         tool,
+        ...(this.options.config.eventStore?.includeArguments === true ? { arguments: args } : {}),
         ...(target?.server ? { server: target.server } : {}),
         ...(target?.tool ? { targetTool: target.tool } : {}),
         ...(toolContext?.sessionId ? { sessionId: toolContext.sessionId } : {}),
