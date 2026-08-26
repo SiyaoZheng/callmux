@@ -18,6 +18,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import type { UpstreamManager } from "./upstream.js";
 import type { CallCache } from "./cache.js";
+import { decodeCwdHeader } from "./cwd-header.js";
 import {
   handleParallel,
   handleBatch,
@@ -1890,7 +1891,9 @@ export class CallmuxListener {
   private sessionCwdFromHeader(
     req: IncomingMessage
   ): Pick<SessionEntry, "cwd" | "cwdSource" | "clientKind" | "agentSignature"> {
-    const cwd = this.normalizeSessionCwd(headerValue(req.headers[CWD_HEADER]));
+    const cwd = this.normalizeSessionCwd(
+      decodeCwdHeader(headerValue(req.headers[CWD_HEADER]))
+    );
     const clientKind = this.clientKindFromHeader(req);
     const agentSignature = this.agentSignatureFromHeaders(req);
     return {
@@ -1910,7 +1913,9 @@ export class CallmuxListener {
   }
 
   private setSessionCwdFromHeader(session: SessionEntry, req: IncomingMessage): void {
-    const cwd = this.normalizeSessionCwd(headerValue(req.headers[CWD_HEADER]));
+    const cwd = this.normalizeSessionCwd(
+      decodeCwdHeader(headerValue(req.headers[CWD_HEADER]))
+    );
     if (cwd) {
       session.cwd = cwd;
       session.cwdSource = "header";

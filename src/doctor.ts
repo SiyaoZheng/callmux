@@ -1,6 +1,7 @@
 import { access } from "node:fs/promises";
 import { constants } from "node:fs";
 import { delimiter, isAbsolute, join, resolve } from "node:path";
+import { encodeCwdHeader } from "./cwd-header.js";
 import { UpstreamManager } from "./upstream.js";
 import { formatCommandForDisplay, redactUrl } from "./redact.js";
 import { isHttpServerConfig } from "./types.js";
@@ -348,7 +349,7 @@ export async function runListenerDoctor(
     ...baseHeaders,
     "Content-Type": "application/json",
     Accept: MCP_ACCEPT_HEADER,
-    ...(options.cwd ? { "x-callmux-cwd": options.cwd } : {}),
+    ...(options.cwd ? { "x-callmux-cwd": encodeCwdHeader(options.cwd) } : {}),
   };
 
   let health: ListenerDoctorReport["health"];

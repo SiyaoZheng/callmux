@@ -8,6 +8,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { encodeCwdHeader } from "./cwd-header.js";
 import { errorResult } from "./results.js";
 
 const BRIDGE_CWD_HEADER = "x-callmux-cwd";
@@ -54,7 +55,7 @@ function bridgeHeaders(options: BridgeOptions): Record<string, string> {
   ).trim();
   return {
     ...(options.headers ?? {}),
-    [BRIDGE_CWD_HEADER]: options.cwd,
+    [BRIDGE_CWD_HEADER]: encodeCwdHeader(options.cwd),
     [BRIDGE_CLIENT_HEADER]: "stdio-bridge",
     ...(process.env.CODEX_HOME && codexThreadId
       ? {

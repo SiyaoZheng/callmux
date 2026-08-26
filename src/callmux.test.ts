@@ -100,10 +100,22 @@ import {
   saveManagementOverlay,
 } from "./management.js";
 import { ManagementClient } from "./management-client.js";
+import { decodeCwdHeader, encodeCwdHeader } from "./cwd-header.js";
 
 function textResult(text: string): CallToolResult {
   return { content: [{ type: "text", text }] };
 }
+
+test("cwd header codec preserves Unicode paths and legacy ASCII values", () => {
+  const unicodePath = "/Users/adrian/噜Wiki/教材/研究";
+  const encoded = encodeCwdHeader(unicodePath);
+
+  assert.match(encoded, /^utf8b64:[A-Za-z0-9_-]+$/);
+  assert.equal(decodeCwdHeader(encoded), unicodePath);
+  assert.equal(encodeCwdHeader("/Users/adrian/project"), "/Users/adrian/project");
+  assert.equal(decodeCwdHeader("/Users/adrian/project"), "/Users/adrian/project");
+  assert.equal(decodeCwdHeader("utf8b64:not+base64url"), undefined);
+});
 
 function fakeMcpServer(
   name: string,
@@ -13608,6 +13620,8 @@ test("listener scopes stdio downstream cwd per MCP session", async () => {
   const upstream = new UpstreamManager();
   const rootA = await mkdtemp(join(tmpdir(), "callmux-cwd-a-"));
   const rootB = await mkdtemp(join(tmpdir(), "callmux-cwd-b-"));
+  const realRootA = await realpath(rootA);
+  const realRootB = await realpath(rootB);
   const cache = new CallCache(60, undefined, {}, 100);
   let listener: CallmuxListener | undefined;
 
@@ -13720,8 +13734,8 @@ test("listener scopes stdio downstream cwd per MCP session", async () => {
     const payloadB = await callGetItem(sessionB, 4);
     const status = await callStatus(sessionA);
 
-    assert.equal(payloadA.cwd, rootA);
-    assert.equal(payloadB.cwd, rootB);
+    assert.equal(payloadA.cwd, realRootA);
+    assert.equal(payloadB.cwd, realRootB);
     assert.deepEqual(payloadA.arguments, { id: 7 });
     assert.deepEqual(payloadB.arguments, { id: 7 });
     assert.equal(status.listener.activeSessions, 2);
@@ -13749,7 +13763,10 @@ test("listener scopes stdio downstream cwd per MCP session", async () => {
 
 test("stdio bridge forwards calls to shared listener with cwd header", async () => {
   const upstream = new UpstreamManager();
-  const root = await mkdtemp(join(tmpdir(), "callmux-bridge-cwd-"));
+  const rootParent = await mkdtemp(join(tmpdir(), "callmux-bridge-cwd-"));
+  const root = join(rootParent, "噜Wiki-教材-研究");
+  await mkdir(root);
+  const realRoot = await realpath(root);
   const cache = new CallCache(0, undefined, {}, 100);
   let listener: CallmuxListener | undefined;
   let bridgeClient: Client | undefined;
@@ -13810,7 +13827,7 @@ test("stdio bridge forwards calls to shared listener with cwd header", async () 
       cwd: string;
       arguments: { id: number };
     };
-    assert.equal(payload.cwd, root);
+    assert.equal(payload.cwd, realRoot);
     assert.deepEqual(payload.arguments, { id: 99 });
     const diagnostics = (listener as any).getRuntimeDiagnostics() as {
       sessions: Array<{ clientKind?: string; cwd?: string }>;
@@ -13834,7 +13851,7 @@ test("stdio bridge forwards calls to shared listener with cwd header", async () 
       cwd: string;
       arguments: { id: number };
     };
-    assert.equal(restartedPayload.cwd, root);
+    assert.equal(restartedPayload.cwd, realRoot);
     assert.deepEqual(restartedPayload.arguments, { id: 100 });
 
     await bridgeClient.close();
@@ -13854,7 +13871,7 @@ test("stdio bridge forwards calls to shared listener with cwd header", async () 
     await bridgeTransport?.close();
     await listener?.close();
     await upstream.close();
-    await rm(root, { recursive: true, force: true });
+    await rm(rootParent, { recursive: true, force: true });
   }
 });
 
@@ -14196,6 +14213,7 @@ test("stdio bridge preserves per-call cwd metadata for shared listener", async (
   const upstream = new UpstreamManager();
   const rootA = await mkdtemp(join(tmpdir(), "callmux-bridge-meta-a-"));
   const rootB = await mkdtemp(join(tmpdir(), "callmux-bridge-meta-b-"));
+  const realRootB = await realpath(rootB);
   const cache = new CallCache(0, undefined, {}, 100);
   let listener: CallmuxListener | undefined;
   let bridgeClient: Client | undefined;
@@ -14254,7 +14272,7 @@ test("stdio bridge preserves per-call cwd metadata for shared listener", async (
       cwd: string;
       arguments: { id: number };
     };
-    assert.equal(payload.cwd, rootB);
+    assert.equal(payload.cwd, realRootB);
     assert.deepEqual(payload.arguments, { id: 101 });
 
     const diagnostics = (listener as any).getRuntimeDiagnostics() as {

@@ -1,4 +1,5 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { encodeCwdHeader } from "./cwd-header.js";
 import { listenerUrls, parseHttpBody } from "./doctor.js";
 
 const MCP_ACCEPT_HEADER = "application/json, text/event-stream";
@@ -76,7 +77,7 @@ export async function listenerRequest(
     "Content-Type": "application/json",
     Accept: MCP_ACCEPT_HEADER,
     [CLIENT_HEADER]: "cli",
-    ...(options.cwd ? { [CWD_HEADER]: options.cwd } : {}),
+    ...(options.cwd ? { [CWD_HEADER]: encodeCwdHeader(options.cwd) } : {}),
   };
   const signal = options.timeoutMs !== undefined ? AbortSignal.timeout(options.timeoutMs) : undefined;
 
